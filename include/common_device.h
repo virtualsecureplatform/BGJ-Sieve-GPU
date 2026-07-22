@@ -28,9 +28,14 @@ struct utils_t {
         return ret;
     }
     static __device__ __forceinline__ unsigned int _warp_id() {
-        unsigned int ret; 
-        asm volatile ("mov.u32 %0, %warpid;" : "=r"(ret));
-        return ret;
+        // NOTE: must return the *logical* (block-relative) warp index, not the
+        // PTX %warpid special register. %warpid is the physical warp slot on the
+        // SM (0..maxWarpsPerSM-1) and is only equal to the block-relative index
+        // at low occupancy. dim_lose_kernel uses this to index a per-warp shared
+        // buffer (warp_vec = vec + wid*16*vec_nbytes); with %warpid, high occupancy
+        // (large pools, CSD>=~70) makes wid exceed the 8 warps/block and writes
+        // out of bounds -> CUDA error 700. Blocks here are 1-D (blockThreads=256).
+        return threadIdx.x >> 5;
     }
     static __device__ __forceinline__ unsigned int _thread_id() {
         unsigned int ret; 
