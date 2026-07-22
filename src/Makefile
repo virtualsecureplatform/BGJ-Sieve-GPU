@@ -1,7 +1,7 @@
 OBJ = $(patsubst %.cpp,%.o, $(wildcard *.cpp))
 CUOBJ = $(patsubst %.cu,%.o, $(wildcard *.cu))
 HEADER = $(wildcard ../include/*.h*)
-CUARCH = -gencode arch=compute_89,code=sm_89
+CUARCH = -gencode arch=compute_80,code=sm_80
 SURP = -diag-suppress 549,550,815,20281
 
 CXX = g++
@@ -9,7 +9,7 @@ CFLAGS = -O3 -g -fopenmp -march=native -pthread
 INC_DIR =
 
 NVCC = nvcc
-NVCCFLAGS = -Xcompiler "$(CFLAGS)" $(CUARCH) -O3 $(SURP)
+NVCCFLAGS = -Xcompiler "$(CFLAGS)" $(CUARCH) -O3 $(SURP) -static-global-template-stub=false
 
 all: libllib.a
 

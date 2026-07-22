@@ -10,8 +10,8 @@ struct hw {
     static inline const char *ssd_name(int chunk_id) {
         return (chunk_id & 1) ? "1" : "0";
     }
-    static constexpr int gpu_num = 8;
-    static constexpr const int gpu_id_list[gpu_num] = {0, 1, 2, 3, 4, 5, 6, 7};
+    static constexpr int gpu_num = 2;
+    static constexpr const int gpu_id_list[gpu_num] = {0, 1};
     static inline int gpu_ptr(int tid, int num_threads) {
         return (tid * gpu_num) / num_threads;
     }
@@ -50,7 +50,7 @@ struct hw {
 #define PWC_DEFAULT_LOADING_THREADS     6
 #define PWC_DEFAULT_SYNCING_THREADS     6
 #define PWC_SSD_SLIMIT                  (10000ULL << 30)
-#define PWC_DRAM_SLIMIT                 (8ULL << 30)
+#define PWC_DRAM_SLIMIT                 (48ULL << 30)
 #define PWC_DEFAULT_MAX_CACHED_CHUNKS   (PWC_DRAM_SLIMIT / 8192ULL / 190ULL)
 #define PWC_MAX_PARALLEL_SYNC_CHUNKS    5
 
@@ -58,8 +58,8 @@ struct hw {
 ///////////////// bwc config /////////////////
 #define BWC_DEFAULT_LOADING_THREADS     8
 #define BWC_DEFAULT_SYNCING_THREADS     6
-#define BWC_SSD_SLIMIT                  (15000ULL << 30)
-#define BWC_DRAM_SLIMIT                 (262ULL << 30)
+#define BWC_SSD_SLIMIT                  (32ULL << 30)
+#define BWC_DRAM_SLIMIT                 (36ULL << 30)
 #define BWC_DEFAULT_MAX_CACHED_CHUNKS   (BWC_DRAM_SLIMIT / 8192ULL / 190ULL)
 #define BWC_MAX_PARALLEL_SYNC_CHUNKS    5
 #define BWC_MAX_BUCKETS                 4192
@@ -69,7 +69,7 @@ struct hw {
 #define SWC_DEFAULT_LOADING_THREADS     5
 #define SWC_DEFAULT_SYNCING_THREADS     3
 #define SWC_SSD_SLIMIT                  (5000ULL << 30)
-#define SWC_DRAM_SLIMIT                 (36ULL << 30)
+#define SWC_DRAM_SLIMIT                 (8ULL << 30)
 #define SWC_DEFAULT_MAX_CACHED_CHUNKS   (SWC_DRAM_SLIMIT / 8192ULL / 190ULL)
 #define SWC_MAX_PARALLEL_SYNC_CHUNKS    5
 
