@@ -369,15 +369,25 @@ int task_config_t::parse_args(int argc, char **argv) {
 #include <sys/stat.h>
 
 int _sieve(Pool_hd_t *p) {
+    // Strategy crossover dims are overridable via environment for A/B tuning.
+    // Defaults reproduce the original hardcoded schedule exactly:
+    //   CSD < bgj2_min           -> bgj1  (1-level bucketing)
+    //   bgj2_min <= CSD < bgj3_min -> bgj2 (2-level)
+    //   CSD >= bgj3_min          -> bgj3l or bgj3 (3-level; l = disk-streaming)
+    static int bgj2_min = -1, bgj3_min = -1, use_bgj3l = -1;
+    if (bgj2_min < 0) {
+        const char *e;
+        bgj2_min  = (e = getenv("HD_BGJ2_MIN_CSD")) ? atoi(e) : 112;
+        bgj3_min  = (e = getenv("HD_BGJ3_MIN_CSD")) ? atoi(e) : 144;
+        use_bgj3l = (e = getenv("HD_USE_BGJ3L"))    ? atoi(e) : 1;
+    }
     int ret = 0;
-    if (p->CSD < 112) {
-        ret = p->bgj1_Sieve_hd();
-    } else if (p->CSD < 135) {
-        ret = p->bgj2_Sieve_hd();
-    } else if (p->CSD <= 143) {
+    if (p->CSD >= bgj3_min) {
+        ret = use_bgj3l ? p->bgj3l_Sieve_hd() : p->bgj3_Sieve_hd();
+    } else if (p->CSD >= bgj2_min) {
         ret = p->bgj2_Sieve_hd();
     } else {
-        ret = p->bgj3l_Sieve_hd();
+        ret = p->bgj1_Sieve_hd();
     }
     return ret;
 }
