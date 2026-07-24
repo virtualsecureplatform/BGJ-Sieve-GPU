@@ -1,3 +1,6 @@
 src/*.o
 src/libllib.a
 app/hd_sieve
+app/hd_sieve_*
+app/bin_hd_sieve_dbg.cu
+app/hd_sieve_dbg
