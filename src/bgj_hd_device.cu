@@ -1379,7 +1379,13 @@ int Bucketer_t::auto_bgj_params_set(int bgj) {
     }
     if (_dram_slimit == 0) this->_dram_slimit = BWC_DRAM_SLIMIT;
     if (_gram_slimit == 0) this->_gram_slimit = BUC_GRAM_SLIMIT;
-    if (_size_ratio == .0) this->_size_ratio  = BGJ_SIZE_RATIO;
+    if (_size_ratio == .0) {
+        // HD_SIZE_RATIO overrides the pool size = _size_ratio * (4/3)^(CSD/2).
+        // Smaller pool -> less bucketer full-pool H2D and less reducer O(N^2),
+        // at the cost of saturation margin. Default preserves BGJ_SIZE_RATIO (3.2).
+        const char *e = getenv("HD_SIZE_RATIO");
+        this->_size_ratio = e ? atof(e) : BGJ_SIZE_RATIO;
+    }
 
     /// max_batch0
     const int cache_for_prefetch = bwc_manager_t::bwc_auto_prefetch_for_read * 
