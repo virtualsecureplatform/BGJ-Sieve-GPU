@@ -603,11 +603,11 @@ void vec_collect(int8_t *dst, int8_t **src_list, int n, int CSD, int CSD16) {
     const __mmask64 m1 = CSD >= 128 ? 0xffffffffffffffffULL : CSD > 64 ? (1ULL << (CSD - 64)) - 1 : 0;
     const __mmask64 m2 = CSD > 128 ? (1ULL << (CSD - 128)) - 1 : 0;
     
-    #if BGJL_HOST_UPK
+    // needed in both BGJL_HOST_UPK settings: referenced (possibly in dead
+    // ternary branches) below
     const __mmask64 wm0 = CSD16 > 64 ?  0xffffffffffffffffULL : (1ULL << CSD16) - 1;
     const __mmask64 wm1 = CSD16 >= 128 ? 0xffffffffffffffffULL : CSD16 > 64 ? (1ULL << (CSD16 - 64)) - 1 : 0;
     const __mmask64 wm2 = CSD16 > 128 ? (1ULL << (CSD16 - 128)) - 1 : 0;
-    #endif
 
     #pragma unroll
     for (int j = 0; j < n; j++) {
