@@ -46,6 +46,10 @@ struct hw {
 
 
 ///////////////// pwc config /////////////////
+// DRAM cache profiles for a 125GB host (PWC/BWC/SWC _DRAM_SLIMIT):
+//   SVP-120 profile: 14/24/4 GB (committed default)
+//   SVP-130 profile: 16/50/12 GB — solution working set needs ~12GB by
+//   CSD 116, buckets ~48GB by CSD 120; run with HD_LAZY_SYNC=1
 #define ONE_TIME_IO                     1
 #define PWC_DEFAULT_LOADING_THREADS     6
 #define PWC_DEFAULT_SYNCING_THREADS     6
