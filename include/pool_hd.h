@@ -642,6 +642,9 @@ struct pwc_manager_tmpl {
     /// @brief wait until all tasks are done
     int wait_work();
 
+    /// @brief write out all lazily-deferred dirty chunks (no-op unless HD_LAZY_SYNC)
+    int flush();
+
     #if ENABLE_PROFILING
     logger_t *logger;
     std::atomic<uint64_t> ev_pwc_fetch{0};
@@ -692,6 +695,17 @@ struct pwc_manager_tmpl {
     std::atomic<int32_t> _num_syncing_chunks;
     std::queue<int32_t> _to_sync_chunks;
     pthread_spinlock_t _to_sync_chunks_lock;
+
+    // HD_LAZY_SYNC=1: don't write dirty chunks to SSD on every release; keep
+    // them cached (unevictable via _ck_to_sync) and only write on cache
+    // pressure or explicit flush (wait_work/store). On single-SSD hosts the
+    // per-release write-through saturates the disk and stalls every fetch.
+    static bool __lazy_sync_env() {
+        const char *e = getenv("HD_LAZY_SYNC");
+        return e && atoi(e);
+    }
+    bool _lazy_sync = __lazy_sync_env();
+    void __drain_sync_queue();
 
     void __load_chunk(long chunk_id);
     void __sync_chunk(long chunk_id);
@@ -937,8 +951,11 @@ template <class logger_t> int pwc_manager_tmpl<logger_t>::set_max_cached_chunks(
         cond_lg_exit(logger->construcion_done());
         return 0;
     }
+    // shrinking evicts until enough slots are free; lazy-dirty chunks are
+    // unevictable, so they must be written out first
+    if (_lazy_sync && max_cached_chunks < this->_max_cached_chunks) __drain_sync_queue();
 
-    constexpr chunk_status_t _ck_busy = _ck_loading | _ck_syncing | 
+    constexpr chunk_status_t _ck_busy = _ck_loading | _ck_syncing |
                                           _ck_reading | _ck_writing | _ck_to_sync;
     volatile chunk_status_t *_chunk_status_vol = reinterpret_cast<volatile chunk_status_t *>(_chunk_status);
     volatile chunk_t *_cached_chunks_vol = reinterpret_cast<volatile chunk_t *>(_cached_chunks);
@@ -1061,8 +1078,16 @@ template <class logger_t> int32_t pwc_manager_tmpl<logger_t>::__fetch_cache_for(
     volatile chunk_status_t *_chunk_status_vol = reinterpret_cast<volatile chunk_status_t*>(_chunk_status);
     volatile chunk_t *_cached_chunks_vol = reinterpret_cast<volatile chunk_t*>(_cached_chunks);
 
+    long scanned = 0;
     for (int32_t cache_id = _last_cache + 1;; cache_id++) {
         if (cache_id >= _max_cached_chunks) cache_id %= _max_cached_chunks;
+        // lazy mode can leave every cached chunk dirty (= unevictable); a
+        // full fruitless scan means we must write some out to make progress
+        if (_lazy_sync && ++scanned >= 2 * _max_cached_chunks) {
+            scanned = 0;
+            __signal_sync_done();
+            usleep(500);
+        }
 
         int32_t old_chunk_id = _cached_chunks[cache_id].id;
         if (old_chunk_id >= 0) {
@@ -1367,7 +1392,8 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__signal_sync_done() 
 
 template <class logger_t> void pwc_manager_tmpl<logger_t>::__free_all() {
     lg_init();
-    constexpr chunk_status_t _ck_busy = _ck_loading | _ck_syncing | 
+    if (_lazy_sync) __drain_sync_queue();
+    constexpr chunk_status_t _ck_busy = _ck_loading | _ck_syncing |
                                           _ck_reading | _ck_writing | _ck_to_sync;
     volatile chunk_status_t *_chunk_status_vol = reinterpret_cast<volatile chunk_status_t *>(_chunk_status);
     volatile chunk_t *_cached_chunks_vol = reinterpret_cast<volatile chunk_t *>(_cached_chunks);
@@ -1679,6 +1705,18 @@ template <class logger_t> int pwc_manager_tmpl<logger_t>::release_sync(long chun
         return 0;
     }
 
+    if (_lazy_sync) {
+        // defer the SSD write: mark dirty and queue only. If dirty chunks
+        // ever pin the whole cache, __fetch_cache_for pumps the queue.
+        pthread_spin_lock(&_to_sync_chunks_lock);
+        _chunk_status[chunk_id] |= _ck_to_sync;
+        _to_sync_chunks.push(chunk_id);
+        _chunk_status[chunk_id] &= ~(_ck_writing | _ck_reading);
+        pthread_spin_unlock(&_to_sync_chunks_lock);
+        lg_exit();
+        return 0;
+    }
+
     pthread_spin_lock(&_to_sync_chunks_lock);
     if (_num_syncing_chunks.load() < pwc_max_parallel_sync_chunks) {
         chunk_status_t new_status = _chunk_status[chunk_id];
@@ -1775,13 +1813,29 @@ template <class logger_t> int pwc_manager_tmpl<logger_t>::release_del(long chunk
     return 0;
 }
 
+template <class logger_t> void pwc_manager_tmpl<logger_t>::__drain_sync_queue() {
+    for (;;) {
+        pthread_spin_lock(&_to_sync_chunks_lock);
+        bool empty = _to_sync_chunks.empty();
+        pthread_spin_unlock(&_to_sync_chunks_lock);
+        if (empty && _num_syncing_chunks.load() == 0) break;
+        __signal_sync_done();
+        usleep(2000);
+    }
+}
+
+template <class logger_t> int pwc_manager_tmpl<logger_t>::flush() {
+    if (_lazy_sync) __drain_sync_queue();
+    return 0;
+}
+
 template <class logger_t> int pwc_manager_tmpl<logger_t>::wait_work() {
     lg_init();
     _syncing_pool.wait_work();
     _loading_pool.wait_work();
 
     long queue_size = _to_sync_chunks.size();
-    if (queue_size) lg_warn("%d chunks to sync after wait done?", queue_size);
+    if (queue_size && !_lazy_sync) lg_warn("%d chunks to sync after wait done?", queue_size);
 
     if (_num_loading_chunks.load() || _num_syncing_chunks.load()) {
         lg_warn("wait_work: %d loading and %d syncing after wait done?", 

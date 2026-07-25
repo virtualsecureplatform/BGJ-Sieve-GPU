@@ -743,6 +743,7 @@ int Pool_hd_t::shrink(long N) {
 }
 
 int Pool_hd_t::store() {
+    pwc_manager->flush();
     pwc_manager->wait_work();
     return 0;
 }
