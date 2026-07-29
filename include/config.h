@@ -46,12 +46,17 @@ struct hw {
 
 
 ///////////////// pwc config /////////////////
-// Host cache slot layout: a vec's real payload is (14 + CSD) bytes, but
-// slots are fixed at (POOL_VEC_MAX_DIM + 14) so any CSD fits. Profiles
-// with TSD well below 176 can lower POOL_VEC_MAX_DIM (>= TSD + margin)
-// for ~20% more cache slots per GB and smaller per-chunk SSD writes.
+// Host cache slot layout: slots are (POOL_VEC_MAX_DIM + 14) bytes per vec.
+// Lowering this for low-TSD profiles would give ~20% more slots per GB,
+// BUT the value doubles as the device CSD16 kernel tier: bgj/dh kernels
+// hardcode <...,176> dispatch and buffer strides, so any other value
+// silently corrupts vectors (verified: bucket-cache corruption + SIGSEGV).
+// Changing it requires adding a matching CSD16 kernel tier first.
 #define POOL_VEC_MAX_DIM                176
 #define POOL_VEC_SLOT_NBYTES            (POOL_VEC_MAX_DIM + 14ULL)
+#if POOL_VEC_MAX_DIM != 176
+#error "POOL_VEC_MAX_DIM != 176 needs a matching CSD16 kernel tier (bgj/dh kernels hardcode 176)"
+#endif
 // DRAM cache profiles for a 125GB host (PWC/BWC/SWC _DRAM_SLIMIT):
 //   SVP-120 profile: 14/24/4 GB (committed default)
 //   SVP-130 profile: 16/50/12 GB — solution working set needs ~12GB by
