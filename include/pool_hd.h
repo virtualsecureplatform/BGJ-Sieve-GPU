@@ -696,13 +696,15 @@ struct pwc_manager_tmpl {
     std::queue<int32_t> _to_sync_chunks;
     pthread_spinlock_t _to_sync_chunks_lock;
 
-    // HD_LAZY_SYNC=1: don't write dirty chunks to SSD on every release; keep
-    // them cached (unevictable via _ck_to_sync) and only write on cache
-    // pressure or explicit flush (wait_work/store). On single-SSD hosts the
-    // per-release write-through saturates the disk and stalls every fetch.
+    // Lazy sync (default ON, HD_LAZY_SYNC=0 restores write-through): don't
+    // write dirty chunks to SSD on every release; keep them cached
+    // (unevictable via _ck_to_sync) and only write on cache pressure or
+    // explicit flush (wait_work/store). On single-SSD hosts the per-release
+    // write-through saturates the disk and stalls every fetch; write-through
+    // only buys mid-dim crash resume (store() still persists at dim ends).
     static bool __lazy_sync_env() {
         const char *e = getenv("HD_LAZY_SYNC");
-        return e && atoi(e);
+        return e ? (atoi(e) != 0) : true;
     }
     bool _lazy_sync = __lazy_sync_env();
     void __drain_sync_queue();

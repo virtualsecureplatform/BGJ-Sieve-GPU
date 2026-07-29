@@ -60,14 +60,17 @@ struct hw {
 // DRAM cache profiles for a 125GB host (PWC/BWC/SWC _DRAM_SLIMIT):
 //   SVP-120 profile: 14/24/4 GB (committed default)
 //   SVP-130 profile: 16/50/12 GB — solution working set needs ~12GB by
-//   CSD 116, buckets ~48GB by CSD 120; run with HD_LAZY_SYNC=1
+//   CSD 116, buckets ~48GB by CSD 120
 //   SVP-140 profile: 51/32/12 GB — caps bind in SLOTS (SLIMIT/8192/190):
 //   pool must stay slot-resident or full-pool scans thrash the SSD; PWC51
 //   = 35.2K slots covers the CSD127 pool (33.6K chunks). BWC below 32GB
 //   thrashes buckets from CSD ~115 (2.4-3.4x per-dim, measured). The
 //   process needs ~24GB non-pinned at CSD127, so PWC58 (= CSD128 cover,
 //   38.8K chunks) cannot fit next to BWC32 on a 125GB host — peak CSD127
-//   is this box's ceiling with healthy caches. Run with HD_LAZY_SYNC=1.
+//   is this box's ceiling with healthy caches.
+// Fast persistence behavior is the DEFAULT (single-SSD tuning): lazy sync
+// on, pool persisted every 6th dim, no between-sieve pwc borrow. Restore
+// stock behavior with HD_LAZY_SYNC=0 HD_SYNC_EVERY=1 HD_PWC_NO_GROW=0.
 #define ONE_TIME_IO                     1
 #define PWC_DEFAULT_LOADING_THREADS     6
 #define PWC_DEFAULT_SYNCING_THREADS     6

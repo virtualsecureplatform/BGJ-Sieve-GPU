@@ -1043,13 +1043,14 @@ int Pool_hd_t::stream_stat_template(int num_devices, cudaDeviceProp device_props
 // pool stays cached during extend_left/min_lift at CSD > 120. The borrow is
 // repaid by a positional shrink at the next sieve start, which first writes
 // out every lazy-dirty chunk; when the base cap already holds the whole pool
-// the borrow buys nothing and that drain dominates per-dim SSD writes —
-// HD_PWC_NO_GROW=1 skips the borrow.
+// the borrow buys nothing and that drain dominates per-dim SSD writes. The
+// borrow is skipped by default (profiles here size PWC to hold the pool);
+// HD_PWC_NO_GROW=0 restores it for runs whose pool exceeds the base cap.
 static long __pwc_between_sieve_target() {
     static long no_grow = -1;
     if (no_grow < 0) {
         const char *e = getenv("HD_PWC_NO_GROW");
-        no_grow = (e && atoi(e)) ? 1 : 0;
+        no_grow = e ? (atoi(e) ? 1 : 0) : 1;
     }
     if (no_grow) return PWC_DEFAULT_MAX_CACHED_CHUNKS;
     return PWC_DEFAULT_MAX_CACHED_CHUNKS +
