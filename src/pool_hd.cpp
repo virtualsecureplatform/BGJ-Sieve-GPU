@@ -743,7 +743,17 @@ int Pool_hd_t::shrink(long N) {
 }
 
 int Pool_hd_t::store() {
-    pwc_manager->flush();
+    // HD_SYNC_EVERY=K persists the pool only on every K-th store; skipped
+    // dims leave the SSD copy stale, so crash-resume rolls back up to K-1
+    // dims of sieving
+    static long num_stores = 0;
+    static long sync_every = 0;
+    if (sync_every == 0) {
+        const char *e = getenv("HD_SYNC_EVERY");
+        sync_every = e ? atoi(e) : 1;
+        if (sync_every < 1) sync_every = 1;
+    }
+    if ((++num_stores % sync_every) == 0) pwc_manager->flush();
     pwc_manager->wait_work();
     return 0;
 }

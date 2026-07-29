@@ -46,6 +46,12 @@ struct hw {
 
 
 ///////////////// pwc config /////////////////
+// Host cache slot layout: a vec's real payload is (14 + CSD) bytes, but
+// slots are fixed at (POOL_VEC_MAX_DIM + 14) so any CSD fits. Profiles
+// with TSD well below 176 can lower POOL_VEC_MAX_DIM (>= TSD + margin)
+// for ~20% more cache slots per GB and smaller per-chunk SSD writes.
+#define POOL_VEC_MAX_DIM                176
+#define POOL_VEC_SLOT_NBYTES            (POOL_VEC_MAX_DIM + 14ULL)
 // DRAM cache profiles for a 125GB host (PWC/BWC/SWC _DRAM_SLIMIT):
 //   SVP-120 profile: 14/24/4 GB (committed default)
 //   SVP-130 profile: 16/50/12 GB — solution working set needs ~12GB by
@@ -62,7 +68,7 @@ struct hw {
 #define PWC_DEFAULT_SYNCING_THREADS     6
 #define PWC_SSD_SLIMIT                  (10000ULL << 30)
 #define PWC_DRAM_SLIMIT                 (14ULL << 30)
-#define PWC_DEFAULT_MAX_CACHED_CHUNKS   (PWC_DRAM_SLIMIT / 8192ULL / 190ULL)
+#define PWC_DEFAULT_MAX_CACHED_CHUNKS   (PWC_DRAM_SLIMIT / 8192ULL / POOL_VEC_SLOT_NBYTES)
 #define PWC_MAX_PARALLEL_SYNC_CHUNKS    5
 
 
@@ -71,7 +77,7 @@ struct hw {
 #define BWC_DEFAULT_SYNCING_THREADS     6
 #define BWC_SSD_SLIMIT                  (32ULL << 30)
 #define BWC_DRAM_SLIMIT                 (24ULL << 30)
-#define BWC_DEFAULT_MAX_CACHED_CHUNKS   (BWC_DRAM_SLIMIT / 8192ULL / 190ULL)
+#define BWC_DEFAULT_MAX_CACHED_CHUNKS   (BWC_DRAM_SLIMIT / 8192ULL / POOL_VEC_SLOT_NBYTES)
 #define BWC_MAX_PARALLEL_SYNC_CHUNKS    5
 #define BWC_MAX_BUCKETS                 4192
 
@@ -81,7 +87,7 @@ struct hw {
 #define SWC_DEFAULT_SYNCING_THREADS     3
 #define SWC_SSD_SLIMIT                  (5000ULL << 30)
 #define SWC_DRAM_SLIMIT                 (4ULL << 30)
-#define SWC_DEFAULT_MAX_CACHED_CHUNKS   (SWC_DRAM_SLIMIT / 8192ULL / 190ULL)
+#define SWC_DEFAULT_MAX_CACHED_CHUNKS   (SWC_DRAM_SLIMIT / 8192ULL / POOL_VEC_SLOT_NBYTES)
 #define SWC_MAX_PARALLEL_SYNC_CHUNKS    5
 
 
@@ -164,7 +170,7 @@ struct hw {
 #define UT_DEFAULT_NUM_THREADS          16
 #define UT_TABLE_DRAM_SLIMIT            (1500ULL << 30)
 #define UT_BUFFER_DRAM_SLIMIT           (300ULL << 30)
-#define UT_DEFAULT_MAX_CHUNKS           (UT_BUFFER_DRAM_SLIMIT / 8192ULL / 190ULL)
+#define UT_DEFAULT_MAX_CHUNKS           (UT_BUFFER_DRAM_SLIMIT / 8192ULL / POOL_VEC_SLOT_NBYTES)
 #define UT_DEFAULT_MAX_UIDS             (UT_BUFFER_DRAM_SLIMIT / 8192ULL / 32ULL)
 #define UT_DEFAULT_BATCH_RATIO          0.01
 

@@ -72,9 +72,9 @@ struct chunk_allocator_t {
         pthread_spin_init(&cache_lock, PTHREAD_PROCESS_SHARED);
 
         #if ONE_TIME_IO
-        long chunk_nbytes = Pool_hd_t::chunk_max_nvecs * (long)(176 + 8 + 4 + 2) + 4096;
+        long chunk_nbytes = Pool_hd_t::chunk_max_nvecs * (Pool_hd_t::vec_nbytes + 8 + 4 + 2) + 4096;
         #else
-        long chunk_nbytes = Pool_hd_t::chunk_max_nvecs * (long)(176 + 8 + 4 + 2);
+        long chunk_nbytes = Pool_hd_t::chunk_max_nvecs * (Pool_hd_t::vec_nbytes + 8 + 4 + 2);
         #endif
 
         #if USE_HUGE_PAGE
@@ -1039,6 +1039,24 @@ int Pool_hd_t::stream_stat_template(int num_devices, cudaDeviceProp device_props
     return 0;
 }
 
+// Between sieves pwc may borrow the idle bwc/swc arena slots so more of the
+// pool stays cached during extend_left/min_lift at CSD > 120. The borrow is
+// repaid by a positional shrink at the next sieve start, which first writes
+// out every lazy-dirty chunk; when the base cap already holds the whole pool
+// the borrow buys nothing and that drain dominates per-dim SSD writes —
+// HD_PWC_NO_GROW=1 skips the borrow.
+static long __pwc_between_sieve_target() {
+    static long no_grow = -1;
+    if (no_grow < 0) {
+        const char *e = getenv("HD_PWC_NO_GROW");
+        no_grow = (e && atoi(e)) ? 1 : 0;
+    }
+    if (no_grow) return PWC_DEFAULT_MAX_CACHED_CHUNKS;
+    return PWC_DEFAULT_MAX_CACHED_CHUNKS +
+           BWC_DEFAULT_MAX_CACHED_CHUNKS +
+           SWC_DEFAULT_MAX_CACHED_CHUNKS;
+}
+
 int Pool_hd_t::extend_left() {
     lg_init();
     if (this->index_l == 0) {
@@ -1049,9 +1067,7 @@ int Pool_hd_t::extend_left() {
 
     pwc_manager->wait_work();
     if (CSD > 120) {
-        long target_cached_chunks = PWC_DEFAULT_MAX_CACHED_CHUNKS + 
-                                    BWC_DEFAULT_MAX_CACHED_CHUNKS +
-                                    SWC_DEFAULT_MAX_CACHED_CHUNKS;
+        long target_cached_chunks = __pwc_between_sieve_target();
         if (pwc_manager->max_cached_chunks() != target_cached_chunks) {
             pwc_manager->set_max_cached_chunks(target_cached_chunks);
         }
@@ -1081,9 +1097,7 @@ int Pool_hd_t::shrink_left() {
 
     pwc_manager->wait_work();
     if (CSD > 120) {
-        long target_cached_chunks = PWC_DEFAULT_MAX_CACHED_CHUNKS + 
-                                    BWC_DEFAULT_MAX_CACHED_CHUNKS +
-                                    SWC_DEFAULT_MAX_CACHED_CHUNKS;
+        long target_cached_chunks = __pwc_between_sieve_target();
         if (pwc_manager->max_cached_chunks() != target_cached_chunks) {
             pwc_manager->set_max_cached_chunks(target_cached_chunks);
         }
@@ -1238,9 +1252,7 @@ int Pool_hd_t::insert(long index, double eta, long *pos, long auto_lll) {
 
     pwc_manager->wait_work();
     if (CSD > 120) {
-        long target_cached_chunks = PWC_DEFAULT_MAX_CACHED_CHUNKS + 
-                                    BWC_DEFAULT_MAX_CACHED_CHUNKS +
-                                    SWC_DEFAULT_MAX_CACHED_CHUNKS;
+        long target_cached_chunks = __pwc_between_sieve_target();
         if (pwc_manager->max_cached_chunks() != target_cached_chunks) {
             pwc_manager->set_max_cached_chunks(target_cached_chunks);
         }
@@ -1881,9 +1893,7 @@ int Pool_hd_t::load(long log_level) {
 
     pwc_manager->wait_work();
     if (CSD > 120) {
-        long target_cached_chunks = PWC_DEFAULT_MAX_CACHED_CHUNKS + 
-                                    BWC_DEFAULT_MAX_CACHED_CHUNKS +
-                                    SWC_DEFAULT_MAX_CACHED_CHUNKS;
+        long target_cached_chunks = __pwc_between_sieve_target();
         if (pwc_manager->max_cached_chunks() != target_cached_chunks) {
             pwc_manager->set_max_cached_chunks(target_cached_chunks);
         }

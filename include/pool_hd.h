@@ -365,7 +365,7 @@ struct pwc_logger_t : public generic_logger_t {
 struct Pool_hd_t {
     public:
     // static configurations
-    static constexpr long vec_nbytes = 176;
+    static constexpr long vec_nbytes = POOL_VEC_MAX_DIM;
     static constexpr long chunk_max_nvecs = 8192;
 
     // construction and distructions
