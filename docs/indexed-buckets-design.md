@@ -71,7 +71,30 @@ pairs → convergence craters. This also explains *why* AMX uses epoch-deferred
 insertion — it is REQUIRED for indexed buckets, not incidental. Only Option A
 remains.
 
-## Two designs
+## SAFE PARTIAL COMPRESSION — INT4 bucket coordinates (measured, PASSES)
+
+Staleness only kills *index-into-pool*. Shrinking the copied coordinates is safe
+(self-contained, no staleness). But bucket chunks reuse the pool's fixed
+`chunk_t` (one `chunk_allocator`, one `chunk_nbytes`), so real size reduction
+needs a *separate compact bucket format* — dropping a field or INT4-packing both
+require it (not an env-tweak). Coordinates are ~90% of the entry and the only
+field the reduce kernel consumes (`bgjs_h2d` sends vec+norm only; u/score never
+cross to GPU). INT4-packing them (copy, 8→4 bit) ≈ **45% smaller buckets**, zero
+staleness, pool untouched — far smaller scope than item-1 (whole-pool INT4).
+
+PRECISION MEASUREMENT (2026-07-31, SVP-130, `HD_MEASURE_INT4=1`, sampled 1/97
+buckets, per-vector symmetric int4 max→±7 round-to-nearest, threshold =
+"sum/diff shorter than shorter parent"): **int4 recall 85.4%** of int8-reducing
+pairs, **false-positive ~0.001%** (near zero). Correctness unaffected (solved
+true min). Verdict: PASSES — int4 loses ~15% at matched threshold, but the
+near-zero false-pos rate leaves huge room to *relax the int4 threshold* (per
+idea.md, "thresholds relaxed slightly, candidates verified after") to recover
+most of the 15% at trivial false-pos cost. Two measurement bugs found+fixed en
+route (units mismatch → 0 pairs; truncating quantization → 0 recall) — proxy
+caveats: my threshold/quantization ≠ the eventual kernel's, so a tuned build
+could do better or need threshold work. First item-2 variant NOT dead on arrival.
+
+## Two designs (for indexed buckets — superseded by INT4 path above for the safe win)
 
 - **Option B (lightweight, index + staleness check).** Posting =
   `(chunk_id:24, pos:13, sign:1, norm:16)` = 8 B (vs ~150 B). At gather, skip if

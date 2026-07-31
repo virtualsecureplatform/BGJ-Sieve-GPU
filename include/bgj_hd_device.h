@@ -640,6 +640,14 @@ struct Reducer_t {
     pthread_spinlock_t traffic_ctrl_lock;
     volatile int32_t ld_bk0_tids = 0;
 
+    /// HD_MEASURE_INT4=1: debug-only precision probe for INT4 bucket
+    /// coordinates (docs/indexed-buckets-design.md, "safe partial compression").
+    /// On sampled buckets, compares int8 vs per-vector-scaled int4 reduce
+    /// decisions to get recall (int4 finds the int8-reducing pairs) + false-pos.
+    /// Read-only, host-side, sampled. Zero cost when off.
+    long _measure_int4 = 0;
+    std::atomic<long> _i4_pairs{0}, _i4_red8{0}, _i4_agree{0}, _i4_fpos{0}, _i4_bkts{0};
+
     /// runtime functions
     int _reduce(int tid);
     int _red_out_2_swc(int tid, int sid = -1);

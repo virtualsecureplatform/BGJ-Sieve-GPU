@@ -3854,8 +3854,67 @@ int Reducer_t::auto_bgj_params_set(int bgj) {
     return ret;
 }
 
+// HD_MEASURE_INT4 helper: on one sampled bucket chunk, compare int8 vs
+// per-vector-scaled int4 reduce decisions over the first k vectors. A pair
+// (i,j) reduces iff min_sign ||v_i ∓ v_j||² = norm_i+norm_j-2|dot| < goal_norm.
+// Accumulates recall (int4 agrees on int8-reducing pairs) + false positives.
+static void __int4_probe(Reducer_t *R, chunk_t *ck, int CSD) {
+    const int kk = ck->size < 128 ? ck->size : 128;
+    if (kk < 2) return;
+    int8_t *V = ck->vec;
+    int32_t nrm[128]; float scale[128]; int idx[128]; int k = 0;
+    for (int i = 0; i < kk; i++) {
+        int8_t *vi = V + (long)i * CSD;
+        int32_t s = 0, mx = 0;
+        for (int c = 0; c < CSD; c++) { int a = vi[c]; s += a * a; int m = a < 0 ? -a : a; if (m > mx) mx = m; }
+        if (s == 0) continue;               // skip empty slots
+        nrm[k] = s;
+        scale[k] = (mx < 1 ? 1 : mx) / 7.0f; // per-vector int4 scale, max coord -> ±7
+        idx[k] = i;
+        k++;
+    }
+    if (k < 2) return;
+    long pairs = 0, red8 = 0, agree = 0, fpos = 0;
+    // self-contained, unit-free threshold (all quantities in int8-coord² units):
+    // a pair "reduces" if ||v_i ∓ v_j||² = nrm_i+nrm_j-2|dot| is shorter than the
+    // shorter parent. Compares int8 dot vs per-vector-scaled int4 dot only.
+    for (int i = 0; i < k; i++) {
+        int8_t *vi = V + (long)idx[i] * CSD;
+        for (int j = i + 1; j < k; j++) {
+            int8_t *vj = V + (long)idx[j] * CSD;
+            long d8 = 0, d4 = 0;
+            float si = scale[i], sj = scale[j];
+            for (int c = 0; c < CSD; c++) {
+                int a = vi[c], b = vj[c];
+                d8 += (long)a * b;
+                int qa = (int)rintf(a / si); if (qa > 7) qa = 7; else if (qa < -8) qa = -8;
+                int qb = (int)rintf(b / sj); if (qb > 7) qb = 7; else if (qb < -8) qb = -8;
+                d4 += (long)qa * qb;
+            }
+            long ad8 = d8 < 0 ? -d8 : d8;
+            long ad4 = (long)llrintf((d4 < 0 ? -d4 : d4) * si * sj);
+            long nsum = (long)nrm[i] + nrm[j];
+            long thr = nrm[i] < nrm[j] ? nrm[i] : nrm[j];
+            long m8 = nsum - 2 * ad8;
+            long m4 = nsum - 2 * ad4;
+            pairs++;
+            int r8 = m8 < thr, r4 = m4 < thr;
+            if (r8) { red8++; if (r4) agree++; }
+            else if (r4) fpos++;
+        }
+    }
+    R->_i4_pairs += pairs; R->_i4_red8 += red8; R->_i4_agree += agree;
+    R->_i4_fpos += fpos;   R->_i4_bkts++;
+}
+
 int Reducer_t::run() {
     int ret = 0;
+
+    {
+        const char *e = getenv("HD_MEASURE_INT4");
+        _measure_int4 = e ? atol(e) : 0;
+        _i4_pairs = 0; _i4_red8 = 0; _i4_agree = 0; _i4_fpos = 0; _i4_bkts = 0;
+    }
 
     if (_red_buf) delete _red_buf;
     _red_buf = new red_buffer_holder_t(this);
@@ -3927,6 +3986,13 @@ int Reducer_t::run() {
     }
 
     lg_report();
+
+    if (_measure_int4 && _i4_pairs.load() > 0) {
+        long p = _i4_pairs, r8 = _i4_red8, ag = _i4_agree, fp = _i4_fpos, bk = _i4_bkts;
+        printf("[INT4] CSD %ld: buckets %ld, pairs %ld, int8-reduce %ld, int4-recall %.3f%%, int4-falsepos/pair %.4f%%\n",
+               _pool->CSD, bk, p, r8, r8 ? 100.0 * ag / r8 : 0.0, p ? 100.0 * fp / p : 0.0);
+        fflush(stdout);
+    }
 
     delete _red_buf;
     _red_buf = NULL;
@@ -4168,6 +4234,9 @@ int Reducer_t::_ld_sbuc(int tid, int bucket_id) {
     logger->ev_ld_stall_us += (fetch_end.tv_sec - fetch_start.tv_sec) * 1000000 + fetch_end.tv_usec - fetch_start.tv_usec;
     logger->ev_ld_chunks++;
     #endif
+    // sampled INT4 precision probe (1 in ~97 buckets), before the chunk is
+    // consumed/normalized further; read-only on curr_chunk->vec.
+    if (_measure_int4 && curr_chunk && (bucket_id % 97) == 0) __int4_probe(this, curr_chunk, _pool->CSD);
     int used = 0;
     for (;;) {
         int task_vecs = 0;
