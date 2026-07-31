@@ -1444,6 +1444,20 @@ int Bucketer_t::run() {
     buc_iter = new buc_iterator_t(this);
     pthread_spin_init(&score_stat_lock, PTHREAD_PROCESS_SHARED);
 
+    // HD_MEASURE_STALE: allocate the per-slot last-bucketed-batch array (debug)
+    {
+        const char *e = getenv("HD_MEASURE_STALE");
+        _measure_stale = e ? atol(e) : 0;
+        _cur_batch = 0;
+        for (int t = 0; t < BUC_DEFAULT_NUM_THREADS; t++) { _stale_hits_t[t] = 0; _stale_ow_t[t] = 0; }
+        if (_stale_slot_batch) { free(_stale_slot_batch); _stale_slot_batch = NULL; }
+        if (_measure_stale) {
+            _stale_slot_capacity = (long)_pwc->num_chunks() * Pool_hd_t::chunk_max_nvecs;
+            _stale_slot_batch = (uint8_t *) calloc(_stale_slot_capacity, 1);
+            if (!_stale_slot_batch) { _measure_stale = 0; _stale_slot_capacity = 0; }
+        }
+    }
+
     for (int tid = 0; tid < _num_threads; tid++) {
         _buc_pool[tid]->push([this, tid] { _buc_buf->device_init(tid); });
     }
@@ -1517,7 +1531,8 @@ int Bucketer_t::run() {
         }
 
         buc_iter->reset();
-        
+        if (_measure_stale) _cur_batch++;
+
         for (int tid = 0; tid < _num_threads; tid++) {
             _buc_pool[tid]->push([this, tid, replace_th, batch0] { _batch(tid, replace_th, batch0); });
         }
@@ -1597,6 +1612,17 @@ int Bucketer_t::run() {
 
     delete _buc_buf;
     _buc_buf = NULL;
+
+    if (_measure_stale) {
+        long hits = 0, ow = 0;
+        for (int t = 0; t < BUC_DEFAULT_NUM_THREADS; t++) { hits += _stale_hits_t[t]; ow += _stale_ow_t[t]; }
+        printf("[STALE] CSD %ld: batches %d, overwrites %ld, stale-next-batch %ld (%.4f%%)\n",
+               _pool->CSD, _cur_batch, ow, hits, ow ? 100.0 * hits / ow : 0.0);
+        fflush(stdout);
+        free(_stale_slot_batch);
+        _stale_slot_batch = NULL;
+        _stale_slot_capacity = 0;
+    }
 
     lg_report();
 
@@ -1678,6 +1704,15 @@ int Bucketer_t::_batch(int tid, int replace_th, int batch0) {
                     old_score_sum += dst->score[dst_pos];
                     new_score_sum += src->score[src->size - 1];
                     #endif
+                    if (_measure_stale) {
+                        long gs = (long)dst->id * Pool_hd_t::chunk_max_nvecs + dst_pos;
+                        if (gs >= 0 && gs < _stale_slot_capacity) {
+                            _stale_ow_t[tid]++;
+                            // bucketed in the immediately preceding batch => a
+                            // posting for this slot would still be in flight
+                            if (_stale_slot_batch[gs] == (uint8_t)(_cur_batch - 1)) _stale_hits_t[tid]++;
+                        }
+                    }
                     to_remove_uid[num_to_remove_uid++] = dst->u[dst_pos];
                     local_score_stat[dst->score[dst_pos]]--;
                     local_score_stat[src->score[--src->size]]++;
@@ -1763,6 +1798,10 @@ int Bucketer_t::_batch(int tid, int replace_th, int batch0) {
                             working_chunk_id++;
                         }
                         chunk_t *_src = working_chunk[working_chunk_id];
+                        if (_measure_stale) {
+                            long gs = (long)_src->id * Pool_hd_t::chunk_max_nvecs + pos;
+                            if (gs >= 0 && gs < _stale_slot_capacity) _stale_slot_batch[gs] = (uint8_t)_cur_batch;
+                        }
                         _dst->u[_dst->size + j] = sign ? -_src->u[pos] : _src->u[pos];
                         _dst->score[_dst->size + j] = _src->score[pos];
                         _dst->norm[_dst->size + j] = _src->norm[pos];

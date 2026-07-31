@@ -541,6 +541,19 @@ struct Bucketer_t {
     pthread_spinlock_t score_stat_lock;
     int8_t *ctr_record = NULL;
 
+    /// HD_MEASURE_STALE=1: debug-only staleness measurement for the indexed-
+    /// bucket design (docs/indexed-buckets-design.md). Per pool slot, the batch
+    /// # it was last bucketed in (mod 256); at each insertion overwrite, count
+    /// whether that slot was bucketed in the immediately preceding batch (a
+    /// posting that would still be in flight) => upper bound on posting
+    /// staleness. Zero cost when off.
+    long      _measure_stale = 0;
+    uint8_t   *_stale_slot_batch = NULL;
+    long      _stale_slot_capacity = 0;
+    int       _cur_batch = 0;
+    long      _stale_hits_t[BUC_DEFAULT_NUM_THREADS] = {};
+    long      _stale_ow_t[BUC_DEFAULT_NUM_THREADS] = {};
+
     /// runtime functions
     int _batch(int tid, int replace_th, int batch0);
     int _update_goal();

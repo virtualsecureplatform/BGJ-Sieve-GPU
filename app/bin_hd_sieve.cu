@@ -622,6 +622,21 @@ int task_config_t::_run_final_sieve() {
             }
         }
         if (pool.CSD >= min_lifting_dim) pool.show_min_lift(pool.index_l <= 40 ? 0 : pool.index_l - 40);
+        // HD_DH_CSD: also run the dual-hash lift once CSD >= this (env, default
+        // off). Stronger than the Babai min_lift; pays only when a deep sieving
+        // dim costs more than one dh pass (large n). Same lift target as
+        // show_min_lift above.
+        {
+            const char *e_dh = getenv("HD_DH_CSD");
+            if (e_dh && pool.CSD >= atol(e_dh)) {
+                const char *e_eta = getenv("HD_DH_ETA");
+                const char *e_mt  = getenv("HD_DH_MAXTIME");
+                long dh_pos = -1;
+                pool.dh_insert(pool.index_l <= 40 ? 0 : pool.index_l - 40,
+                               e_eta ? atof(e_eta) : 1.2,
+                               e_mt ? atof(e_mt) : 0.0, &dh_pos);
+            }
+        }
         if (pool.CSD < target_sieving_dim) pool.extend_left();
         else break;
     }
