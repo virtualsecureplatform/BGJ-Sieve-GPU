@@ -28,6 +28,14 @@ struct UidTable {
     uint64_t size();
     uint64_t hold();
 
+    // approximate resident bytes: sum of phmap capacities × (8B key + 1 ctrl).
+    // Used by HD_MEASURE_UT to size the item-3 (UID-free) payoff.
+    uint64_t footprint() {
+        uint64_t cap = 0;
+        for (long i = 0; i < ut_split; i++) if (_tables[i]) cap += _tables[i]->capacity();
+        return cap * 9ULL;
+    }
+
     int insert(uint64_t uid);
     int erase(uint64_t uid);
     int check(uint64_t uid);

@@ -622,6 +622,14 @@ int task_config_t::_run_final_sieve() {
             }
         }
         if (pool.CSD >= min_lifting_dim) pool.show_min_lift(pool.index_l <= 40 ? 0 : pool.index_l - 40);
+        // HD_MEASURE_UT: report UidTable footprint vs pool size (item-3 payoff sizing)
+        if (getenv("HD_MEASURE_UT")) {
+            long nv = pool.pwc_manager->num_vec();
+            uint64_t ut = pool.uid_table->footprint();
+            printf("[UT] CSD %ld: pool_vec %ld, uidtable %.3f GB (%.1f B/vec), pool_field_u %.3f GB\n",
+                   pool.CSD, nv, ut / 1e9, nv > 0 ? (double)ut / nv : 0.0, nv * 8.0 / 1e9);
+            fflush(stdout);
+        }
         // HD_DH_CSD: also run the dual-hash lift once CSD >= this (env, default
         // off). Stronger than the Babai min_lift; pays only when a deep sieving
         // dim costs more than one dh pass (large n). Same lift target as
