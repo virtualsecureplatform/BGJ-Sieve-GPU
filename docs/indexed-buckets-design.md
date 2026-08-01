@@ -94,7 +94,28 @@ route (units mismatch → 0 pairs; truncating quantization → 0 recall) — pro
 caveats: my threshold/quantization ≠ the eventual kernel's, so a tuned build
 could do better or need threshold work. First item-2 variant NOT dead on arrival.
 
-## Two designs (for indexed buckets — superseded by INT4 path above for the safe win)
+## LIVE VERDICT (2026-08-01) — lossy bucket coords BREAK the sieve; item 2 has no cheap path
+
+The offline probe measured only the coords' FILTER role. Live test
+(`HD_INT4_BUCKETS=bits`, round-trip int8→intN→int8 at scatter) on SVP-130:
+- 8-bit (≈identity control): solves true min, 826 s — a 2.5× slowdown that is the
+  host round-trip's CPU cost (float div+rint+mul per coord in the CPU-bound
+  bucketer), a measurement artifact, not precision. So compare to 826 s, not the
+  335 s baseline.
+- 6-bit: solves, 1347 s (slower even vs the 826 control; some is CSD-lottery).
+- 4-bit (the 45%-saving target): **NO solve in 2400 s, stuck at CSD 103** (baseline
+  116). Convergence broken.
+
+⇒ Precision floor is ~8-bit: int4 breaks the sieve, int6 saves only 25% for extra
+work — net negative. Root cause: bucket coords are not just a filter; they compute
+the child vectors and scores, and saturation is acutely sensitive to that
+precision. The 85% offline recall tested the wrong role. **Lossy bucket-coord
+compression is dead.** The only precision-preserving compression is AMX indexed
+buckets (full precision via pool index) + epoch-deferred insertion (Option A) —
+the heavy refactor, uncertain net payoff. No safe/cheap bucket-size reduction
+exists. For the spill bottleneck, the 2nd NVMe (0 code) remains the best ROI.
+
+## Two designs (for indexed buckets — both compression routes now exhausted)
 
 - **Option B (lightweight, index + staleness check).** Posting =
   `(chunk_id:24, pos:13, sign:1, norm:16)` = 8 B (vs ~150 B). At gather, skip if

@@ -1433,6 +1433,23 @@ int Bucketer_t::auto_bgj_params_set(int bgj) {
     return ret;
 }
 
+// INT4 bucket coords (step 1): quantize a CSD-vector to signed int4 (per-vector
+// scale, max coord -> ±7, round-to-nearest) and dequantize back in place, so the
+// stored bucket vector carries only int4 information while staying int8-typed for
+// the unchanged reduce kernel. Matches the HD_MEASURE_INT4 probe's quantization.
+static inline void __int4_roundtrip(int8_t *v, int CSD, int bits) {
+    int mx = 0;
+    for (int c = 0; c < CSD; c++) { int a = v[c]; int m = a < 0 ? -a : a; if (m > mx) mx = m; }
+    if (mx < 1) return;
+    int pos = (1 << (bits - 1)) - 1, neg = -(1 << (bits - 1));  // bits=4 -> [-8,7]
+    float s = (float)mx / pos;
+    for (int c = 0; c < CSD; c++) {
+        int q = (int)rintf(v[c] / s); if (q > pos) q = pos; else if (q < neg) q = neg;
+        int d = (int)rintf(q * s);    if (d > 127) d = 127; else if (d < -128) d = -128;
+        v[c] = (int8_t)d;
+    }
+}
+
 int Bucketer_t::run() {
     if (_buc_buf) delete _buc_buf;
     _buc_buf = new buc_buffer_holder_t(this);
@@ -1444,6 +1461,7 @@ int Bucketer_t::run() {
     buc_iter = new buc_iterator_t(this);
     pthread_spin_init(&score_stat_lock, PTHREAD_PROCESS_SHARED);
 
+    { const char *e = getenv("HD_INT4_BUCKETS"); _int4_buckets = e ? atol(e) : 0; }
     // HD_MEASURE_STALE: allocate the per-slot last-bucketed-batch array (debug)
     {
         const char *e = getenv("HD_MEASURE_STALE");
@@ -1806,6 +1824,7 @@ int Bucketer_t::_batch(int tid, int replace_th, int batch0) {
                         _dst->score[_dst->size + j] = _src->score[pos];
                         _dst->norm[_dst->size + j] = _src->norm[pos];
                         traits::l0_sign_copy_epi8(_dst->vec + CSD * (_dst->size + j), _src->vec + CSD * pos, CSD, sign);
+                        if (_int4_buckets) __int4_roundtrip(_dst->vec + CSD * (_dst->size + j), CSD, _int4_buckets);
                     }
                     to_add -= to_move;
                     _dst->size += to_move;

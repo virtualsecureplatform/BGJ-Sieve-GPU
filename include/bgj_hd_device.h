@@ -554,6 +554,11 @@ struct Bucketer_t {
     long      _stale_hits_t[BUC_DEFAULT_NUM_THREADS] = {};
     long      _stale_ow_t[BUC_DEFAULT_NUM_THREADS] = {};
 
+    /// HD_INT4_BUCKETS=1: store bucket coordinates at INT4 precision (packed
+    /// design step 1 — round-trip int8->int4->int8 in place at scatter to
+    /// validate live convergence; storage/transfer savings come in later steps).
+    long      _int4_buckets = 0;
+
     /// runtime functions
     int _batch(int tid, int replace_th, int batch0);
     int _update_goal();
