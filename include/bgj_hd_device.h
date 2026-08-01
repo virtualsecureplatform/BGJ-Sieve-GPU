@@ -364,8 +364,10 @@ struct red_buffer_holder_t {
     int bgjm_out(int tid, int sid, int *size, int8_t **h_vec, int32_t **h_norm, uint16_t **h_score, uint64_t **h_u);
     int bgjs_out(int tid, int *size, int8_t **h_vec, int32_t **h_norm, uint16_t **h_score, uint64_t **h_u);
     int bgjs_h2d(int tid, chunk_t *chunk, int &used);
-    int bgjs_upk(int tid);
-    int bgjm_upk(int tid);
+    int bgjs_d2d(int tid, const int8_t *d_vec, const int32_t *d_src_norm,
+                 int size, int &used);
+    int bgjs_upk(int tid, bool norm_on_device = false);
+    int bgjm_upk(int tid, bool norm_on_device = false);
 
     int bgj1_run(int tid);
     int bgj2_run(int tid);
@@ -657,6 +659,7 @@ struct Reducer_t {
     int _reduce(int tid);
     int _red_out_2_swc(int tid, int sid = -1);
     int _ld_sbuc(int tid, int bucket_id);
+    int _ld_hbm_sbuc(int tid, int bucket_id);
     int _ld_lbuc(int tid, int bucket_id, int &num_chunks, chunk_t **&working_chunks);
     int _red_lbuc(int tid, chunk_t **&working_chunks);
     int _signal_bucket_done();

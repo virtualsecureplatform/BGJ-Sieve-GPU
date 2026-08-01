@@ -3,6 +3,14 @@
 
 #include "./pool_hd.h"
 
+// CUDA-runtime shims implemented in a .cu translation unit, allowing the
+// host-only bucket manager to manage an optional device arena without making
+// every C++ source depend on CUDA headers.
+int _cuda_device_mem_info(int device_ptr, size_t *free_nbytes, size_t *total_nbytes);
+int _cuda_device_malloc(int device_ptr, void **ptr, size_t nbytes);
+int _cuda_device_free(int device_ptr, void *ptr);
+int _cuda_device_h2d(int device_ptr, void *dst, const void *src, size_t nbytes);
+
 #if ENABLE_PROFILING
 struct bwc_logger_t : public pwc_logger_t {
     inline int log_level() override { return _ll; }
@@ -57,7 +65,7 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
     // create an empty bucket, return bucket id
     long push_bucket();
     // get a bucket from ready list, return bucket id, return -1 if no bucket is ready 
-    long pop_bucket();
+    long pop_bucket(int device_ptr = -1);
     // tell the manager that all write/read to the bucket is done so it's ready for use/del
     void bucket_finalize(long bucket_id);
     // return the number of buckets that are ready
@@ -73,6 +81,16 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
     // when the bucket is empty, delete automatically
     void read_done(chunk_t *chunk, long bucket_id);
     long bucket_num_chunks(long bucket_id);
+
+    // Exact ready-bucket cache in device memory.  Configuration happens after
+    // the reducer strategy is known; a zero/failed allocation leaves the
+    // existing host/NVMe path unchanged.
+    void configure_hbm_cache(bool enable);
+    bool bucket_in_hbm(long bucket_id);
+    bool fetch_hbm_for_read(long bucket_id, int device_ptr, int *size,
+                            const int32_t **d_norm, const int8_t **d_vec,
+                            int *slot_id);
+    void hbm_read_done(int device_ptr, int slot_id);
 
     #if ENABLE_PROFILING
     using pwc_manager_tmpl<logger_t>::logger;
@@ -92,24 +110,30 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
         static constexpr uint32_t _bk_ready     = 0x40000000;
         static constexpr uint32_t _bk_reading   = 0x20000000;
         static constexpr uint32_t _bk_caching   = 0x10000000;
+        static constexpr uint32_t _bk_hbm       = 0x08000000;
         
         uint32_t status = 0;
         int32_t num_chunks = 0;
         int32_t *chunk_ids = NULL;
+        int16_t *hbm_sizes = NULL;
         chunk_t *writing_chunk = NULL;
+        int16_t hbm_device = -1;
 
         inline int init() {
             int ret = 0;
             if (chunk_ids == NULL) {
                 chunk_ids = (int32_t *) malloc(l0_bucket_t::init_alloc_chunks * sizeof(int32_t));
-                if (chunk_ids == NULL) {
+                hbm_sizes = (int16_t *) malloc(l0_bucket_t::init_alloc_chunks * sizeof(int16_t));
+                if (chunk_ids == NULL || hbm_sizes == NULL) {
                     ret = -1;
                     fprintf(stderr, "[Error] l0_bucket_t::init: allocation fail\n");
+                    abort();
                 }
             }
             status = _bk_writing;
             num_chunks = 0;
             writing_chunk = NULL;
+            hbm_device = -1;
             alloc_size = l0_bucket_t::init_alloc_chunks;
             return ret;
         }
@@ -117,9 +141,10 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
         inline int add_chunk(int32_t chunk_id) {
             if (num_chunks == alloc_size) {
                 chunk_ids = (int32_t *)realloc(chunk_ids, sizeof(int32_t) * alloc_size * 2);
-                if (chunk_ids == NULL) {
+                hbm_sizes = (int16_t *)realloc(hbm_sizes, sizeof(int16_t) * alloc_size * 2);
+                if (chunk_ids == NULL || hbm_sizes == NULL) {
                     fprintf(stderr, "[Error] bwc_manager_t::l0_bucket_t::add_chunk: realloc failed\n");
-                    return -1;
+                    abort();
                 }
                 alloc_size *= 2;
             }
@@ -145,6 +170,23 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
     int32_t _ready_bucket_id[bwc_max_buckets];
     int32_t _prefetched_bucket_id[bwc_auto_prefetch_for_read];
     pthread_spinlock_t _bwc_lock;
+
+    struct hbm_arena_t {
+        int8_t *base = NULL;
+        size_t slot_nbytes = 0;
+        int32_t num_slots = 0;
+        int32_t num_free = 0;
+        int32_t *free_slots = NULL;
+        pthread_spinlock_t lock;
+        bool lock_initialized = false;
+    };
+    hbm_arena_t _hbm[MAX_NUM_DEVICE];
+    bool _hbm_enabled = false;
+    void __destroy_hbm_cache();
+    int __hbm_alloc(int device_ptr);
+    void __hbm_release(int device_ptr, int slot_id);
+    int8_t *__hbm_slot(int device_ptr, int slot_id);
+    bool __stage_bucket_to_hbm(int32_t bucket_id);
 
     void __prefetch_for_writing();
     void __prefetch_for_reading(int32_t bucket_id);

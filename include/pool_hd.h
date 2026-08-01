@@ -366,6 +366,7 @@ struct Pool_hd_t {
     public:
     // static configurations
     static constexpr long vec_nbytes = POOL_VEC_MAX_DIM;
+    static constexpr long host_vec_nbytes = POOL_HOST_VEC_MAX_DIM;
     static constexpr long chunk_max_nvecs = 8192;
 
     // construction and distructions
@@ -491,6 +492,11 @@ struct chunk_t {
     int8_t *vec;
 };
 
+void _free_chunk(chunk_t *chunk);
+void _malloc_chunk(chunk_t *chunk);
+void _free_bucket_chunk(chunk_t *chunk);
+void _malloc_bucket_chunk(chunk_t *chunk);
+
 struct boost_data_t {
     static constexpr int max_boost_dim = 48;
 
@@ -605,7 +611,8 @@ struct pwc_manager_tmpl {
     static constexpr long pwc_max_parallel_sync_chunks = PWC_MAX_PARALLEL_SYNC_CHUNKS;
 
     pwc_manager_tmpl();
-    pwc_manager_tmpl(long loading_threads, long syncing_threads, long max_cached_chunks);
+    pwc_manager_tmpl(long loading_threads, long syncing_threads, long max_cached_chunks,
+                     bool compact_vec_norm = false);
     ~pwc_manager_tmpl();
 
     long num_vec() const;
@@ -707,6 +714,17 @@ struct pwc_manager_tmpl {
         return e ? (atoi(e) != 0) : true;
     }
     bool _lazy_sync = __lazy_sync_env();
+    // Bucket chunks contain only exact int8 vectors and int32 norms.  Pool and
+    // solution chunks retain score/u as well.
+    bool _compact_vec_norm;
+    inline void __malloc_chunk(chunk_t *chunk) {
+        if (_compact_vec_norm) _malloc_bucket_chunk(chunk);
+        else _malloc_chunk(chunk);
+    }
+    inline void __free_chunk(chunk_t *chunk) {
+        if (_compact_vec_norm) _free_bucket_chunk(chunk);
+        else _free_chunk(chunk);
+    }
     void __drain_sync_queue();
 
     void __load_chunk(long chunk_id);
@@ -923,8 +941,6 @@ inline void pool_logger_t::report(const char *keyfunc) {
 #include <unistd.h>
 #include <fcntl.h>
 
-void _free_chunk(chunk_t *chunk);
-void _malloc_chunk(chunk_t *chunk);
 int _normalize_chunk(chunk_t *chunk, int CSD);
 
 template <class logger_t> int pwc_manager_tmpl<logger_t>::set_num_threads(long loading_threads, long syncing_threads) {
@@ -970,8 +986,8 @@ template <class logger_t> int pwc_manager_tmpl<logger_t>::set_max_cached_chunks(
             if (_ck_id_vol == -1) {                                 \
                 _ck_id = -2;                                        \
                 pthread_spin_unlock(&_cached_chunks_lock);          \
-                if (_cached_chunks[ptr].score) {                    \
-                    _free_chunk(&_cached_chunks[ptr]);              \
+                if (_cached_chunks[ptr].vec) {                      \
+                    __free_chunk(&_cached_chunks[ptr]);             \
                 }                                                   \
                 continue;                                           \
             }                                                       \
@@ -991,8 +1007,8 @@ template <class logger_t> int pwc_manager_tmpl<logger_t>::set_max_cached_chunks(
                     _tmp |= _cached_chunks[ptr].size;               \
                     _tmp &= (~_ck_busy) & (~_ck_caching);           \
                     _chunk_status[_id] = _tmp;                      \
-                    if (_cached_chunks[ptr].score) {                \
-                        _free_chunk(&_cached_chunks[ptr]);          \
+                    if (_cached_chunks[ptr].vec) {                  \
+                        __free_chunk(&_cached_chunks[ptr]);         \
                     }                                               \
                     continue;                                       \
                 } else {                                            \
@@ -1105,7 +1121,7 @@ template <class logger_t> int32_t pwc_manager_tmpl<logger_t>::__fetch_cache_for(
                 
                 _cached_chunks[cache_id].size = _chunk_status[chunk_id] & _ck_size_mask;
                 if (_cached_chunks[cache_id].vec) { lg_exit(); return cache_id; }
-                _malloc_chunk(&_cached_chunks[cache_id]);
+                __malloc_chunk(&_cached_chunks[cache_id]);
                 lg_exit();
                 return cache_id;
             }
@@ -1163,15 +1179,18 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__load_chunk(long chu
     #endif
 
     #if ONE_TIME_IO
-    char *meta_data = ((char *)dst_chunk->score) - 12;
+    char *meta_data = (char *)(_compact_vec_norm ? (void *)dst_chunk->norm
+                                                   : (void *)dst_chunk->score) - 12;
     #else
     char meta_data[12];
     #endif
+    const int stored_fields_nbytes = _compact_vec_norm ? 4 : (2 + 4 + 8);
 
     if ((_chunk_status[chunk_id] & _ck_size_mask) == 0) {
         dst_chunk->size = 0;
-        memset(dst_chunk->score, 0, Pool_hd_t::chunk_max_nvecs * sizeof(uint16_t));
         memset(dst_chunk->norm, 0, Pool_hd_t::chunk_max_nvecs * sizeof(int32_t));
+        if (!_compact_vec_norm)
+            memset(dst_chunk->score, 0, Pool_hd_t::chunk_max_nvecs * sizeof(uint16_t));
     } else {
         int fd = open(chunk_filename, O_RDONLY | (ONE_TIME_IO ? O_DIRECT : 0));
 
@@ -1179,24 +1198,27 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__load_chunk(long chu
             if (errno != ENOENT) lg_err("open %s failed, %s, treat as empty chunk", chunk_filename, strerror(errno));
             dst_chunk->size = 0;
             memset(dst_chunk->norm, 0, Pool_hd_t::chunk_max_nvecs * sizeof(int32_t));
-            memset(dst_chunk->score, 0, Pool_hd_t::chunk_max_nvecs * sizeof(uint16_t));
+            if (!_compact_vec_norm)
+                memset(dst_chunk->score, 0, Pool_hd_t::chunk_max_nvecs * sizeof(uint16_t));
         } else {
             int read_bytes = 0;
             #if ONE_TIME_IO
-            read_bytes += read(fd, meta_data, 4096 + Pool_hd_t::chunk_max_nvecs * (2 + 4 + 8 + _pool->CSD));
+            read_bytes += read(fd, meta_data, 4096 + Pool_hd_t::chunk_max_nvecs *
+                                               (stored_fields_nbytes + _pool->CSD));
             #else
             read_bytes += read(fd, meta_data, 12);
-            read_bytes += read(fd, dst_chunk->score, sizeof(uint16_t) * Pool_hd_t::chunk_max_nvecs);
+            if (!_compact_vec_norm)
+                read_bytes += read(fd, dst_chunk->score, sizeof(uint16_t) * Pool_hd_t::chunk_max_nvecs);
             read_bytes += read(fd, dst_chunk->norm, sizeof(int32_t) * Pool_hd_t::chunk_max_nvecs);
-            read_bytes += read(fd, dst_chunk->u, sizeof(uint64_t) * Pool_hd_t::chunk_max_nvecs);
+            if (!_compact_vec_norm)
+                read_bytes += read(fd, dst_chunk->u, sizeof(uint64_t) * Pool_hd_t::chunk_max_nvecs);
             #endif
-            if (read_bytes < sizeof(uint16_t) * Pool_hd_t::chunk_max_nvecs + 
-                            sizeof(int32_t) * Pool_hd_t::chunk_max_nvecs + 
-                            sizeof(uint64_t) * Pool_hd_t::chunk_max_nvecs + 12) {
+            if (read_bytes < stored_fields_nbytes * Pool_hd_t::chunk_max_nvecs + 12) {
                 lg_err("chunk %lx corrupted, treat as empty chunk", chunk_id);
                 dst_chunk->size = 0;
                 memset(dst_chunk->norm, 0, Pool_hd_t::chunk_max_nvecs * sizeof(int32_t));
-                memset(dst_chunk->score, 0, Pool_hd_t::chunk_max_nvecs * sizeof(uint16_t));
+                if (!_compact_vec_norm)
+                    memset(dst_chunk->score, 0, Pool_hd_t::chunk_max_nvecs * sizeof(uint16_t));
             } else {
                 uint16_t read_size = *((uint16_t *)(&meta_data[0]));
                 uint64_t read_hash = *((uint64_t *)(&meta_data[2]));
@@ -1210,24 +1232,30 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__load_chunk(long chu
                 if (read_hash != _pool->basis_hash) {
                     lg_err("chunk %lx basis hash validation failed, treat as empty chunk", chunk_id);
                     memset(dst_chunk->norm, 0, Pool_hd_t::chunk_max_nvecs * sizeof(int32_t));
-                    memset(dst_chunk->score, 0, Pool_hd_t::chunk_max_nvecs * sizeof(uint16_t));
+                    if (_compact_vec_norm) dst_chunk->size = 0;
+                    else memset(dst_chunk->score, 0, Pool_hd_t::chunk_max_nvecs * sizeof(uint16_t));
                 }
                 if (abs(read_l - _pool->index_l) > 1 || abs(read_r - _pool->index_r) > 1) {
                     lg_err("chunk %lx sieving context validation failed, cache [%ld, %ld], "
                         "disk [%d, %d], treat as empty chunk", chunk_id, _pool->index_l, 
                         _pool->index_r, read_l, read_r);
                     memset(dst_chunk->norm, 0, Pool_hd_t::chunk_max_nvecs * sizeof(int32_t));
-                    memset(dst_chunk->score, 0, Pool_hd_t::chunk_max_nvecs * sizeof(uint16_t));
+                    if (_compact_vec_norm) dst_chunk->size = 0;
+                    else memset(dst_chunk->score, 0, Pool_hd_t::chunk_max_nvecs * sizeof(uint16_t));
                 }
                 #if ONE_TIME_IO
-                int read_vecs = (read_bytes - 12 - Pool_hd_t::chunk_max_nvecs * (2 + 4 + 8)) / _pool->CSD;
+                int read_vecs = (read_bytes - 12 - Pool_hd_t::chunk_max_nvecs *
+                                                   stored_fields_nbytes) / _pool->CSD;
                 if (read_vecs > Pool_hd_t::chunk_max_nvecs) read_vecs = Pool_hd_t::chunk_max_nvecs;
+                if (read_vecs < 0) read_vecs = 0;
                 #else
                 read_bytes = read(fd, dst_chunk->vec, _pool->CSD * Pool_hd_t::chunk_max_nvecs);
                 int read_vecs = read_bytes / _pool->CSD;
                 #endif
                 memset(dst_chunk->norm + read_vecs, 0, (Pool_hd_t::chunk_max_nvecs - read_vecs) * sizeof(int32_t));
-                memset(dst_chunk->score + read_vecs, 0, (Pool_hd_t::chunk_max_nvecs - read_vecs) * sizeof(uint16_t));
+                if (!_compact_vec_norm)
+                    memset(dst_chunk->score + read_vecs, 0,
+                           (Pool_hd_t::chunk_max_nvecs - read_vecs) * sizeof(uint16_t));
             }
 
             close(fd);
@@ -1263,10 +1291,12 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__sync_chunk(long chu
     #endif
 
     #if ONE_TIME_IO
-    char *meta_data = ((char *)src_chunk->score) - 12;
+    char *meta_data = (char *)(_compact_vec_norm ? (void *)src_chunk->norm
+                                                   : (void *)src_chunk->score) - 12;
     #else
     char meta_data[12];
     #endif
+    const int stored_fields_nbytes = _compact_vec_norm ? 4 : (2 + 4 + 8);
     *((uint16_t *)(&meta_data[0])) = (uint16_t) src_chunk->size;
     *((uint64_t *)(&meta_data[2])) = _pool->basis_hash;
     *((uint8_t *)(&meta_data[10])) = (uint8_t) (_pool->index_l);
@@ -1278,17 +1308,18 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__sync_chunk(long chu
     } else {
         int write_bytes = 0;
         #if ONE_TIME_IO
-        write_bytes += write(fd, meta_data, 4096 + Pool_hd_t::chunk_max_nvecs * (2 + 4 + 8 + _pool->CSD));
+        write_bytes += write(fd, meta_data, 4096 + Pool_hd_t::chunk_max_nvecs *
+                                                (stored_fields_nbytes + _pool->CSD));
         #else
         write_bytes += write(fd, meta_data, 12);
-        write_bytes += write(fd, src_chunk->score, sizeof(uint16_t) * Pool_hd_t::chunk_max_nvecs);
+        if (!_compact_vec_norm)
+            write_bytes += write(fd, src_chunk->score, sizeof(uint16_t) * Pool_hd_t::chunk_max_nvecs);
         write_bytes += write(fd, src_chunk->norm, sizeof(int32_t) * Pool_hd_t::chunk_max_nvecs);
-        write_bytes += write(fd, src_chunk->u, sizeof(uint64_t) * Pool_hd_t::chunk_max_nvecs);
+        if (!_compact_vec_norm)
+            write_bytes += write(fd, src_chunk->u, sizeof(uint64_t) * Pool_hd_t::chunk_max_nvecs);
         write_bytes += write(fd, src_chunk->vec, _pool->CSD * Pool_hd_t::chunk_max_nvecs);
         #endif
-        if (write_bytes < sizeof(uint16_t) * Pool_hd_t::chunk_max_nvecs +
-                          sizeof(int32_t) * Pool_hd_t::chunk_max_nvecs + 
-                          sizeof(uint64_t) * Pool_hd_t::chunk_max_nvecs + 
+        if (write_bytes < stored_fields_nbytes * Pool_hd_t::chunk_max_nvecs +
                           _pool->CSD * Pool_hd_t::chunk_max_nvecs + (ONE_TIME_IO ? 4096 : 12)) {
             lg_err("bytes write to chunk %lx less than expect, ignored", chunk_id);
         }
@@ -1426,7 +1457,10 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__free_all() {
     #undef TRY_LOCK_THEN_FREE_CHUNK
 }
 
-template <class logger_t> pwc_manager_tmpl<logger_t>::pwc_manager_tmpl(long loading_threads, long syncing_threads, long max_cached_chunks) {
+template <class logger_t> pwc_manager_tmpl<logger_t>::pwc_manager_tmpl(long loading_threads,
+                                                                       long syncing_threads,
+                                                                       long max_cached_chunks,
+                                                                       bool compact_vec_norm) {
     #if ENABLE_PROFILING
     this->logger = new logger_t();
     #endif
@@ -1437,6 +1471,7 @@ template <class logger_t> pwc_manager_tmpl<logger_t>::pwc_manager_tmpl(long load
     pthread_spin_init(&this->_cached_chunks_lock, PTHREAD_PROCESS_SHARED);
     pthread_spin_init(&this->_to_sync_chunks_lock, PTHREAD_PROCESS_SHARED);
 
+    _compact_vec_norm = compact_vec_norm;
     _num_chunks = 0;
     _max_cached_chunks = 0;
     _cached_chunks = (chunk_t *) malloc((_ck_cache_id_mask + 1) * sizeof(chunk_t));

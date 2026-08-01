@@ -6,7 +6,10 @@
 #include <omp.h>
 
 template <class logger_t> bwc_manager_tmpl<logger_t>::bwc_manager_tmpl(Pool_hd_t *p) : 
-                          pwc_manager_tmpl<logger_t>(bwc_default_loading_threads, bwc_default_syncing_threads, bwc_default_max_cached_chunks) {
+                          pwc_manager_tmpl<logger_t>(bwc_default_loading_threads,
+                                                     bwc_default_syncing_threads,
+                                                     bwc_default_max_cached_chunks,
+                                                     true) {
     _num_buckets = 0;
     _num_deleted_buckets = 0;
     _num_wl = 0;
@@ -28,6 +31,220 @@ template <class logger_t> bwc_manager_tmpl<logger_t>::bwc_manager_tmpl(Pool_hd_t
             _loading_threads, _syncing_threads, _max_cached_chunks);
 }
 
+template <class logger_t> void bwc_manager_tmpl<logger_t>::configure_hbm_cache(bool enable) {
+    if (!enable) {
+        __destroy_hbm_cache();
+        return;
+    }
+    if (_hbm_enabled) return;
+
+    const char *env_gb = getenv("HD_HBM_BWC_GB");
+    const double requested_gb = env_gb ? atof(env_gb) : 12.0;
+    if (requested_gb <= 0.0 || hw::gpu_num <= 0) return;
+
+    const size_t gib = 1ULL << 30;
+    const size_t reserve_nbytes = 24ULL * gib;
+    const size_t raw_slot_nbytes = Pool_hd_t::chunk_max_nvecs *
+                                   (sizeof(int32_t) + this->_pool->CSD);
+    const size_t slot_nbytes = (raw_slot_nbytes + 255) & ~(size_t)255;
+    int enabled_devices = 0;
+
+    for (int device_ptr = 0; device_ptr < hw::gpu_num; device_ptr++) {
+        size_t free_nbytes = 0, total_nbytes = 0;
+        if (_cuda_device_mem_info(device_ptr, &free_nbytes, &total_nbytes)) continue;
+        size_t target_nbytes = (size_t)(requested_gb * gib);
+        if (free_nbytes <= reserve_nbytes) target_nbytes = 0;
+        else if (target_nbytes > free_nbytes - reserve_nbytes)
+            target_nbytes = free_nbytes - reserve_nbytes;
+
+        int32_t num_slots = (int32_t)(target_nbytes / slot_nbytes);
+        int alloc_status = -1;
+        while (num_slots > 0) {
+            target_nbytes = (size_t)num_slots * slot_nbytes;
+            alloc_status = _cuda_device_malloc(device_ptr,
+                                                (void **)&_hbm[device_ptr].base,
+                                                target_nbytes);
+            if (alloc_status == 0) break;
+            num_slots /= 2;
+        }
+        if (alloc_status != 0 || num_slots == 0) {
+            _hbm[device_ptr].base = NULL;
+            continue;
+        }
+
+        _hbm[device_ptr].free_slots = (int32_t *)malloc(num_slots * sizeof(int32_t));
+        if (!_hbm[device_ptr].free_slots) {
+            _cuda_device_free(device_ptr, _hbm[device_ptr].base);
+            _hbm[device_ptr].base = NULL;
+            continue;
+        }
+        pthread_spin_init(&_hbm[device_ptr].lock, PTHREAD_PROCESS_PRIVATE);
+        _hbm[device_ptr].lock_initialized = true;
+        _hbm[device_ptr].slot_nbytes = slot_nbytes;
+        _hbm[device_ptr].num_slots = num_slots;
+        _hbm[device_ptr].num_free = num_slots;
+        for (int32_t i = 0; i < num_slots; i++)
+            _hbm[device_ptr].free_slots[i] = i;
+        enabled_devices++;
+        lg_info("GPU %d HBM bucket cache: %.2f GiB, %d exact chunks",
+                hw::gpu_id_list[device_ptr], target_nbytes / (double)gib, num_slots);
+    }
+    _hbm_enabled = enabled_devices > 0;
+}
+
+template <class logger_t> void bwc_manager_tmpl<logger_t>::__destroy_hbm_cache() {
+    for (int device_ptr = 0; device_ptr < hw::gpu_num; device_ptr++) {
+        hbm_arena_t &arena = _hbm[device_ptr];
+        if (arena.base) {
+            if (_cuda_device_free(device_ptr, arena.base))
+                fprintf(stderr, "[Warning] failed to free GPU %d HBM bucket cache\n",
+                        hw::gpu_id_list[device_ptr]);
+            arena.base = NULL;
+        }
+        if (arena.lock_initialized) {
+            pthread_spin_destroy(&arena.lock);
+            arena.lock_initialized = false;
+        }
+        free(arena.free_slots);
+        arena.free_slots = NULL;
+        arena.num_slots = arena.num_free = 0;
+        arena.slot_nbytes = 0;
+    }
+    _hbm_enabled = false;
+}
+
+template <class logger_t> int bwc_manager_tmpl<logger_t>::__hbm_alloc(int device_ptr) {
+    hbm_arena_t &arena = _hbm[device_ptr];
+    if (!arena.base) return -1;
+    pthread_spin_lock(&arena.lock);
+    int ret = arena.num_free ? arena.free_slots[--arena.num_free] : -1;
+    pthread_spin_unlock(&arena.lock);
+    return ret;
+}
+
+template <class logger_t> void bwc_manager_tmpl<logger_t>::__hbm_release(int device_ptr,
+                                                                         int slot_id) {
+    if (device_ptr < 0 || device_ptr >= hw::gpu_num || slot_id < 0) return;
+    hbm_arena_t &arena = _hbm[device_ptr];
+    if (!arena.base) return;
+    pthread_spin_lock(&arena.lock);
+    arena.free_slots[arena.num_free++] = slot_id;
+    pthread_spin_unlock(&arena.lock);
+}
+
+template <class logger_t> int8_t *bwc_manager_tmpl<logger_t>::__hbm_slot(int device_ptr,
+                                                                         int slot_id) {
+    return _hbm[device_ptr].base + (size_t)slot_id * _hbm[device_ptr].slot_nbytes;
+}
+
+template <class logger_t> bool bwc_manager_tmpl<logger_t>::__stage_bucket_to_hbm(
+        int32_t bucket_id) {
+    if (!_hbm_enabled || !this->_lazy_sync || _bucket[bucket_id].num_chunks <= 0)
+        return false;
+
+    const int32_t num_chunks = _bucket[bucket_id].num_chunks;
+    int device_ptr = -1;
+    for (int step = 0; step < hw::gpu_num; step++) {
+        int candidate = (bucket_id + step) % hw::gpu_num;
+        hbm_arena_t &arena = _hbm[candidate];
+        if (!arena.base) continue;
+        pthread_spin_lock(&arena.lock);
+        bool fits = arena.num_free >= num_chunks;
+        pthread_spin_unlock(&arena.lock);
+        if (fits) { device_ptr = candidate; break; }
+    }
+    if (device_ptr < 0) return false;
+
+    int32_t *slots = (int32_t *)malloc(num_chunks * sizeof(int32_t));
+    chunk_t **chunks = (chunk_t **)malloc(num_chunks * sizeof(chunk_t *));
+    if (!slots || !chunks) {
+        free(slots);
+        free(chunks);
+        return false;
+    }
+
+    int32_t reserved = 0;
+    for (; reserved < num_chunks; reserved++) {
+        slots[reserved] = __hbm_alloc(device_ptr);
+        if (slots[reserved] < 0) break;
+    }
+    if (reserved != num_chunks) {
+        for (int32_t i = 0; i < reserved; i++) __hbm_release(device_ptr, slots[i]);
+        free(slots);
+        free(chunks);
+        return false;
+    }
+
+    int32_t fetched = 0;
+    for (; fetched < num_chunks; fetched++) {
+        chunks[fetched] = pwc_manager_tmpl<logger_t>::fetch(_bucket[bucket_id].chunk_ids[fetched]);
+        if (!chunks[fetched]) break;
+    }
+    if (fetched != num_chunks) {
+        for (int32_t i = 0; i < fetched; i++)
+            pwc_manager_tmpl<logger_t>::release(chunks[i]->id);
+        for (int32_t i = 0; i < num_chunks; i++) __hbm_release(device_ptr, slots[i]);
+        free(slots);
+        free(chunks);
+        return false;
+    }
+
+    const size_t norm_capacity = Pool_hd_t::chunk_max_nvecs * sizeof(int32_t);
+    for (int32_t i = 0; i < num_chunks; i++) {
+        int8_t *slot = __hbm_slot(device_ptr, slots[i]);
+        if (_cuda_device_h2d(device_ptr, slot, chunks[i]->norm,
+                             chunks[i]->size * sizeof(int32_t)) ||
+            _cuda_device_h2d(device_ptr, slot + norm_capacity, chunks[i]->vec,
+                             (size_t)chunks[i]->size * this->_pool->CSD)) {
+            fprintf(stderr, "[Error] failed to stage bucket %d in GPU %d HBM\n",
+                    bucket_id, hw::gpu_id_list[device_ptr]);
+            abort();
+        }
+        _bucket[bucket_id].hbm_sizes[i] = chunks[i]->size;
+    }
+    for (int32_t i = 0; i < num_chunks; i++) {
+        release_del(chunks[i]->id);
+        _bucket[bucket_id].chunk_ids[i] = slots[i];
+    }
+    _bucket[bucket_id].hbm_device = device_ptr;
+    free(slots);
+    free(chunks);
+    return true;
+}
+
+template <class logger_t> bool bwc_manager_tmpl<logger_t>::bucket_in_hbm(long bucket_id) {
+    pthread_spin_lock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+    bool ret = (_bucket[bucket_id].status & l0_bucket_t::_bk_hbm) != 0;
+    pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+    return ret;
+}
+
+template <class logger_t> bool bwc_manager_tmpl<logger_t>::fetch_hbm_for_read(
+        long bucket_id, int device_ptr, int *size, const int32_t **d_norm,
+        const int8_t **d_vec, int *slot_id) {
+    pthread_spin_lock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+    if ((_bucket[bucket_id].status & (l0_bucket_t::_bk_reading | l0_bucket_t::_bk_hbm)) !=
+            (l0_bucket_t::_bk_reading | l0_bucket_t::_bk_hbm) ||
+        _bucket[bucket_id].hbm_device != device_ptr ||
+        _bucket[bucket_id].num_chunks == 0) {
+        pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+        return false;
+    }
+    const int32_t ptr = --_bucket[bucket_id].num_chunks;
+    *slot_id = _bucket[bucket_id].chunk_ids[ptr];
+    *size = _bucket[bucket_id].hbm_sizes[ptr];
+    int8_t *slot = __hbm_slot(device_ptr, *slot_id);
+    *d_norm = (const int32_t *)slot;
+    *d_vec = slot + Pool_hd_t::chunk_max_nvecs * sizeof(int32_t);
+    pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+    return true;
+}
+
+template <class logger_t> void bwc_manager_tmpl<logger_t>::hbm_read_done(int device_ptr,
+                                                                         int slot_id) {
+    __hbm_release(device_ptr, slot_id);
+}
+
 template <class logger_t> bwc_manager_tmpl<logger_t>::~bwc_manager_tmpl() {
     this->_syncing_pool.wait_work();
     this->_loading_pool.wait_work();
@@ -39,11 +256,17 @@ template <class logger_t> bwc_manager_tmpl<logger_t>::~bwc_manager_tmpl() {
 
     for (int32_t i = 0; i < _num_buckets; i++) {
         if (_bucket[i].status) {
-            for (int32_t j = 0; j < _bucket[i].num_chunks; j++) {
-                _chunk_status[_bucket[i].chunk_ids[j]] &= ~ (_ck_writing | _ck_reading | _ck_to_sync); 
+            if (_bucket[i].status & l0_bucket_t::_bk_hbm) {
+                for (int32_t j = 0; j < _bucket[i].num_chunks; j++)
+                    __hbm_release(_bucket[i].hbm_device, _bucket[i].chunk_ids[j]);
+            } else {
+                for (int32_t j = 0; j < _bucket[i].num_chunks; j++)
+                    _chunk_status[_bucket[i].chunk_ids[j]] &=
+                        ~(_ck_writing | _ck_reading | _ck_to_sync);
             }
         }
         if (_bucket[i].chunk_ids) free(_bucket[i].chunk_ids);
+        if (_bucket[i].hbm_sizes) free(_bucket[i].hbm_sizes);
         if (_bucket[i].writing_chunk && _bucket[i].writing_chunk != (chunk_t *) -1) release_del(_bucket[i].writing_chunk->id);
     }
 
@@ -65,6 +288,7 @@ template <class logger_t> bwc_manager_tmpl<logger_t>::~bwc_manager_tmpl() {
         #endif
         remove(chunk_filename);
     }
+    __destroy_hbm_cache();
 }
 
 template <class logger_t> void bwc_manager_tmpl<logger_t>::__prefetch_for_writing() {
@@ -119,6 +343,10 @@ template <class logger_t> void bwc_manager_tmpl<logger_t>::__prefetch_for_writin
 
 template <class logger_t> void bwc_manager_tmpl<logger_t>::__prefetch_for_reading(int32_t bucket_id) {
     lg_init();
+    if (_bucket[bucket_id].status & l0_bucket_t::_bk_hbm) {
+        lg_exit();
+        return;
+    }
     volatile uint32_t *status_ptr_vol = reinterpret_cast<volatile uint32_t*>(&_bucket[bucket_id].status);
     volatile  int32_t *num_pb_ptr_vol = reinterpret_cast<volatile  int32_t*>(&_num_prefetched_bucket);
 
@@ -220,30 +448,51 @@ template <class logger_t> long bwc_manager_tmpl<logger_t>::push_bucket() {
     return ret;
 }
 
-template <class logger_t> long bwc_manager_tmpl<logger_t>::pop_bucket() {
+template <class logger_t> long bwc_manager_tmpl<logger_t>::pop_bucket(int device_ptr) {
     lg_init();
     int32_t ret = -1;
+    bool was_prefetched = false;
 
     pthread_spin_lock(&_bwc_lock);
     for (int32_t i = 0; i < _num_prefetched_bucket; i++) {
-        if (_bucket[_prefetched_bucket_id[i]].status & l0_bucket_t::_bk_ready) {
+        int32_t candidate = _prefetched_bucket_id[i];
+        bool device_match = !(_bucket[candidate].status & l0_bucket_t::_bk_hbm) ||
+                            device_ptr < 0 || _bucket[candidate].hbm_device == device_ptr;
+        if ((_bucket[candidate].status & l0_bucket_t::_bk_ready) && device_match) {
             ret = _prefetched_bucket_id[i];
+            was_prefetched = true;
             _bucket[_prefetched_bucket_id[i]].status = 
             (_bucket[_prefetched_bucket_id[i]].status & ~l0_bucket_t::_bk_ready) | l0_bucket_t::_bk_reading;
             break;
         }
     }
     if (ret == -1 && _num_ready_buckets) {
-        ret = _ready_bucket_id[--_num_ready_buckets];
+        int32_t ready_ptr = -1;
+        for (int32_t i = _num_ready_buckets - 1; i >= 0; i--) {
+            int32_t candidate = _ready_bucket_id[i];
+            if (!(_bucket[candidate].status & l0_bucket_t::_bk_hbm) ||
+                device_ptr < 0 || _bucket[candidate].hbm_device == device_ptr) {
+                ready_ptr = i;
+                break;
+            }
+        }
+        if (ready_ptr >= 0) {
+            ret = _ready_bucket_id[ready_ptr];
+            _ready_bucket_id[ready_ptr] = _ready_bucket_id[--_num_ready_buckets];
+        }
+    }
+    if (ret != -1) {
         _bucket[ret].status = (_bucket[ret].status & ~l0_bucket_t::_bk_ready) | l0_bucket_t::_bk_reading;        
-        if (_num_prefetched_bucket < bwc_auto_prefetch_for_read) {
+        if (!was_prefetched && !(_bucket[ret].status & l0_bucket_t::_bk_hbm) &&
+            _num_prefetched_bucket < bwc_auto_prefetch_for_read) {
             _prefetched_bucket_id[_num_prefetched_bucket++] = ret;
             _bucket[ret].status |= l0_bucket_t::_bk_caching;
         }
     }
     pthread_spin_unlock(&_bwc_lock);
 
-    if (ret != -1) __prefetch_for_reading(ret);
+    if (ret != -1 && !(_bucket[ret].status & l0_bucket_t::_bk_hbm))
+        __prefetch_for_reading(ret);
 
     lg_exit();
     return ret;
@@ -256,7 +505,21 @@ template <class logger_t> void bwc_manager_tmpl<logger_t>::bucket_finalize(long 
     volatile uint32_t *_chunk_status_vol = reinterpret_cast<volatile uint32_t*>(_chunk_status);
     chunk_t *volatile *writing_chunk_ptr_vol = reinterpret_cast<chunk_t *volatile *>(&_bucket[bucket_id].writing_chunk);
 
-    if (_bucket[bucket_id].status & l0_bucket_t::_bk_reading) {
+    if ((_bucket[bucket_id].status &
+         (l0_bucket_t::_bk_reading | l0_bucket_t::_bk_hbm)) ==
+        (l0_bucket_t::_bk_reading | l0_bucket_t::_bk_hbm)) {
+        pthread_spin_lock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+        int32_t num_chunks = _bucket[bucket_id].num_chunks;
+        int32_t device_ptr = _bucket[bucket_id].hbm_device;
+        _bucket[bucket_id].num_chunks = 0;
+        _bucket[bucket_id].status = 0;
+        pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+        for (int32_t i = 0; i < num_chunks; i++)
+            __hbm_release(device_ptr, _bucket[bucket_id].chunk_ids[i]);
+        pthread_spin_lock(&_bwc_lock);
+        _deleted_bucket_ids[_num_deleted_buckets++] = bucket_id;
+        pthread_spin_unlock(&_bwc_lock);
+    } else if (_bucket[bucket_id].status & l0_bucket_t::_bk_reading) {
         pthread_spin_lock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
         int32_t num_chunks = _bucket[bucket_id].num_chunks;
         _bucket[bucket_id].num_chunks = 0;
@@ -328,18 +591,22 @@ template <class logger_t> void bwc_manager_tmpl<logger_t>::bucket_finalize(long 
             pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
         }
 
-        _bucket[bucket_id].status = l0_bucket_t::_bk_ready;
+        bool staged_in_hbm = __stage_bucket_to_hbm(bucket_id);
+        _bucket[bucket_id].status = l0_bucket_t::_bk_ready |
+                                    (staged_in_hbm ? l0_bucket_t::_bk_hbm : 0);
         pthread_spin_lock(&_bwc_lock);
         if (_num_ready_buckets < bwc_max_buckets) {
             _ready_bucket_id[_num_ready_buckets++] = bucket_id;
         } else {
             lg_err("ready list full(%d), bucket %d discarded", _num_ready_buckets, bucket_id);
-            _bucket[bucket_id].status = l0_bucket_t::_bk_reading;
+            _bucket[bucket_id].status = l0_bucket_t::_bk_reading |
+                                        (staged_in_hbm ? l0_bucket_t::_bk_hbm : 0);
         }
         pthread_spin_unlock(&_bwc_lock);
 
-        if (_bucket[bucket_id].status == l0_bucket_t::_bk_ready) {
-            __prefetch_for_reading(bucket_id);
+        if (_bucket[bucket_id].status & l0_bucket_t::_bk_ready) {
+            if (!(_bucket[bucket_id].status & l0_bucket_t::_bk_hbm))
+                __prefetch_for_reading(bucket_id);
         } else {
             bucket_finalize(bucket_id);
         }
@@ -436,6 +703,10 @@ template <class logger_t> chunk_t *bwc_manager_tmpl<logger_t>::fetch_for_write(l
 
 template <class logger_t> chunk_t *bwc_manager_tmpl<logger_t>::fetch_for_read(long bucket_id) {
     lg_init();
+    if (_bucket[bucket_id].status & l0_bucket_t::_bk_hbm) {
+        lg_exit();
+        return NULL;
+    }
     volatile uint32_t *_chunk_status_vol = reinterpret_cast<volatile uint32_t*>(_chunk_status);
     volatile int32_t *num_chunks_ptr_vol = reinterpret_cast<volatile int32_t*>(&_bucket[bucket_id].num_chunks);
     volatile uint32_t *status_ptr_vol = reinterpret_cast<volatile uint32_t*>(&_bucket[bucket_id].status);

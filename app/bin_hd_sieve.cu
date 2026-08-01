@@ -561,6 +561,11 @@ int task_config_t::_run_final_sieve() {
     if (min_lifting_dim == val_not_assigned) {
         min_lifting_dim = 176;
     }
+    if (target_sieving_dim > Pool_hd_t::host_vec_nbytes) {
+        printf("[Error] target sieving dimension %ld exceeds this build's host-cache limit %ld\n",
+               target_sieving_dim, Pool_hd_t::host_vec_nbytes);
+        return -1;
+    }
 
     int real_ind_l = -1, real_ind_r = -1;
     uint64_t real_hash = 0;
@@ -594,7 +599,7 @@ int task_config_t::_run_final_sieve() {
     }
 
     Pool_hd_t pool(&L);
-    pool.set_sieving_context(L.NumRows() - current_sieving_dim, L.NumRows());
+    if (pool.set_sieving_context(L.NumRows() - current_sieving_dim, L.NumRows())) return -1;
     pool.set_boost_depth(0);
 
     pool.set_num_threads(8);
@@ -645,7 +650,9 @@ int task_config_t::_run_final_sieve() {
                                e_mt ? atof(e_mt) : 0.0, &dh_pos);
             }
         }
-        if (pool.CSD < target_sieving_dim) pool.extend_left();
+        if (pool.CSD < target_sieving_dim) {
+            if (pool.extend_left()) return -1;
+        }
         else break;
     }
 
@@ -681,6 +688,11 @@ int task_config_t::_run_local_pump() {
         printf("max sieving dimension too small(%ld), nothing done\n", max_sieving_dim);
         return -1;
     }
+    if (max_sieving_dim > Pool_hd_t::host_vec_nbytes) {
+        printf("[Error] max sieving dimension %ld exceeds this build's host-cache limit %ld\n",
+               max_sieving_dim, Pool_hd_t::host_vec_nbytes);
+        return -1;
+    }
 
     if (start_sieving_dim > max_sieving_dim) start_sieving_dim = max_sieving_dim;
 
@@ -699,7 +711,7 @@ int task_config_t::_run_local_pump() {
 
     Lattice_QP L_locs(loc_basis_file);
     Pool_hd_t pool(&L_locs);
-    pool.set_sieving_context(L_locs.NumRows() - start_sieving_dim, L_locs.NumRows());
+    if (pool.set_sieving_context(L_locs.NumRows() - start_sieving_dim, L_locs.NumRows())) return -1;
     pool.set_boost_depth(0);
 
     pool.set_num_threads(8);
@@ -722,7 +734,7 @@ int task_config_t::_run_local_pump() {
             }
             pool.store();
             if (pool.CSD < max_sieving_dim) {
-                pool.extend_left();
+                if (pool.extend_left()) return -1;
                 last_sieve_time = 0.0;
             }
             else break;
@@ -814,7 +826,7 @@ int task_config_t::_run_dual_hash() {
     }
 
     Pool_hd_t pool(&L);
-    pool.set_sieving_context(real_ind_l, real_ind_r);
+    if (pool.set_sieving_context(real_ind_l, real_ind_r)) return -1;
     pool.set_boost_depth(0);
 
     pool.set_num_threads(8);

@@ -1800,8 +1800,11 @@ int Bucketer_t::_batch(int tid, int replace_th, int batch0) {
                     gettimeofday(&fetch_end, NULL);
                     logger->ev_ld_stall_us += (fetch_end.tv_sec - fetch_start.tv_sec) * 1000000 + fetch_end.tv_usec - fetch_start.tv_usec;
                     #endif
-                    if (!_dst) lg_err("tid = %d, bucket %d(%d-th this batch) fetch_for_write failed, "
-                                     "%d entries ignored", tid, buc_id[i], i, to_add);
+                    if (!_dst) {
+                        lg_err("tid = %d, bucket %d(%d-th this batch) fetch_for_write failed, "
+                               "%d entries ignored", tid, buc_id[i], i, to_add);
+                        break;
+                    }
                     
                     int to_move = to_add < chunk_max_nvecs - _dst->size ? to_add : chunk_max_nvecs - _dst->size;
                     for (int j = 0; j < to_move; j++) {
@@ -1820,8 +1823,6 @@ int Bucketer_t::_batch(int tid, int replace_th, int batch0) {
                             long gs = (long)_src->id * Pool_hd_t::chunk_max_nvecs + pos;
                             if (gs >= 0 && gs < _stale_slot_capacity) _stale_slot_batch[gs] = (uint8_t)_cur_batch;
                         }
-                        _dst->u[_dst->size + j] = sign ? -_src->u[pos] : _src->u[pos];
-                        _dst->score[_dst->size + j] = _src->score[pos];
                         _dst->norm[_dst->size + j] = _src->norm[pos];
                         traits::l0_sign_copy_epi8(_dst->vec + CSD * (_dst->size + j), _src->vec + CSD * pos, CSD, sign);
                         if (_int4_buckets) __int4_roundtrip(_dst->vec + CSD * (_dst->size + j), CSD, _int4_buckets);
@@ -2828,12 +2829,40 @@ int red_buffer_holder_t::bgjs_h2d(int tid, chunk_t *chunk, int &used) {
     return to_copy;
 }
 
-int red_buffer_holder_t::bgjs_upk(int tid) {
+int red_buffer_holder_t::bgjs_d2d(int tid, const int8_t *d_src_vec,
+                                  const int32_t *d_src_norm, int size,
+                                  int &used) {
+    int buc_full = 0;
+    int to_copy = size - used < traits::taskVecs - task_vecs[tid] ?
+                  size - used : traits::taskVecs - task_vecs[tid];
+    if (to_copy + task_vecs[tid] + buc_vecs[tid] >= buc_max_size) {
+        to_copy = buc_max_size - buc_vecs[tid] - task_vecs[tid];
+        if (to_copy < 0) to_copy = 0;
+        buc_full = 1;
+    }
+    if (to_copy) {
+        CHECK_CUDA_ERR(cudaMemcpyAsync(d_upk[tid] + task_vecs[tid] * CSD,
+                                       d_src_vec + (size_t)used * CSD,
+                                       (size_t)to_copy * CSD,
+                                       cudaMemcpyDeviceToDevice, streams[tid]));
+        CHECK_CUDA_ERR(cudaMemcpyAsync(d_norm[tid] + buc_vecs[tid] + task_vecs[tid],
+                                       d_src_norm + used,
+                                       (size_t)to_copy * sizeof(int32_t),
+                                       cudaMemcpyDeviceToDevice, streams[tid]));
+    }
+    task_vecs[tid] += to_copy;
+    used = buc_full ? -1 : used + to_copy;
+    CHECK_CUDA_ERR(cudaStreamSynchronize(streams[tid]));
+    return to_copy;
+}
+
+int red_buffer_holder_t::bgjs_upk(int tid, bool norm_on_device) {
     #if ENABLE_PROFILING
     CHECK_CUDA_ERR(cudaEventRecord(logger->h2d_sstart[tid], streams[tid]));
     #endif
-    CHECK_CUDA_ERR(cudaMemcpyAsync(d_norm[tid] + buc_vecs[tid], h_norm[tid], task_vecs[tid] * 4, 
-                                   cudaMemcpyHostToDevice, streams[tid]));
+    if (!norm_on_device)
+        CHECK_CUDA_ERR(cudaMemcpyAsync(d_norm[tid] + buc_vecs[tid], h_norm[tid], task_vecs[tid] * 4,
+                                       cudaMemcpyHostToDevice, streams[tid]));
     #if ENABLE_PROFILING
     CHECK_CUDA_ERR(cudaEventRecord(logger->h2d_sstop[tid], streams[tid]));
     #endif
@@ -2852,7 +2881,7 @@ int red_buffer_holder_t::bgjs_upk(int tid) {
         CHECK_CUDA_ERR(cudaEventElapsedTime(&upk_tt, logger->h2d_sstop[tid], logger->upk_stop[tid]));
         logger->ev_h2d_us += 1000.f * h2d_tt;
         logger->ev_upk_us += 1000.f * upk_tt;
-        logger->ev_h2d_nbytes += task_vecs[tid] * (CSD + 4);
+        if (!norm_on_device) logger->ev_h2d_nbytes += task_vecs[tid] * (CSD + 4);
     }
     #endif
 
@@ -2986,12 +3015,13 @@ int red_buffer_holder_t::bgj2_ctr(int tid, int8_t *ctr0) {
     return 0;
 }
 
-int red_buffer_holder_t::bgjm_upk(int tid) {
+int red_buffer_holder_t::bgjm_upk(int tid, bool norm_on_device) {
     #if ENABLE_PROFILING
     CHECK_CUDA_ERR(cudaEventRecord(logger->h2d_sstart[tid], streams[tid]));
     #endif
-    CHECK_CUDA_ERR(cudaMemcpyAsync(d_norm[tid] + buc_vecs[tid], h_norm[tid], task_vecs[tid] * 4, 
-                                   cudaMemcpyHostToDevice, streams[tid]));
+    if (!norm_on_device)
+        CHECK_CUDA_ERR(cudaMemcpyAsync(d_norm[tid] + buc_vecs[tid], h_norm[tid], task_vecs[tid] * 4,
+                                       cudaMemcpyHostToDevice, streams[tid]));
     #if ENABLE_PROFILING
     CHECK_CUDA_ERR(cudaEventRecord(logger->h2d_sstop[tid], streams[tid]));
     #endif
@@ -3012,7 +3042,7 @@ int red_buffer_holder_t::bgjm_upk(int tid) {
         CHECK_CUDA_ERR(cudaEventElapsedTime(&bk1_tt, logger->h2d_sstop[tid], logger->upk_stop[tid]));
         logger->ev_h2d_us += 1000.f * h2d_tt;
         logger->ev_bk1_us += 1000.f * bk1_tt;
-        logger->ev_h2d_nbytes += task_vecs[tid] * (CSD + 4);
+        if (!norm_on_device) logger->ev_h2d_nbytes += task_vecs[tid] * (CSD + 4);
     }
     #endif
 
@@ -3835,7 +3865,7 @@ int Reducer_t::auto_bgj_params_set(int bgj) {
         this->_threads_per_buc = BGJ4_DEFAULT_THREADS_PER_BUC;
     }
 
-    const int cache_for_prefetch = bwc_manager_t::bwc_auto_prefetch_for_read * 
+    const int cache_for_prefetch = bwc_manager_t::bwc_auto_prefetch_for_read *
                                    bwc_manager_t::bwc_auto_prefetch_for_read_depth + 
                                    bwc_manager_t::bwc_auto_prefetch_for_write;
     const int cache_per_thread  = (traits::buc_max_size(_pool->CSD, _pool->ESD, _strategy) - 1) / Pool_hd_t::chunk_max_nvecs + 1;
@@ -3847,6 +3877,18 @@ int Reducer_t::auto_bgj_params_set(int bgj) {
     }
     if (expect_num_threads < 1) expect_num_threads = 1;
     if (!this->_num_threads) this->set_num_threads(expect_num_threads);
+
+    // Large-bucket strategies still require host chunk pointers for their CPU
+    // preprocessing. Small/medium strategies can consume exact ready chunks
+    // directly from GPU-local HBM. Require at least one reducer worker per GPU
+    // so every device-owned ready bucket is guaranteed to make progress.
+    const char *hbm_min_env = getenv("HD_HBM_BWC_MIN_CSD");
+    const int hbm_min_csd = hbm_min_env ? atoi(hbm_min_env) : 120;
+    _bwc->configure_hbm_cache(_pool->CSD >= hbm_min_csd &&
+                              _num_threads >= hw::gpu_num &&
+                              (_strategy == strategy_bgj1 ||
+                               _strategy == strategy_bgj2 ||
+                               _strategy == strategy_bgj3));
 
     if (_strategy == strategy_bgj1) {
         lg_dbg("CSD %d, strategy bgj1, #threads %ld, #swc chunks <= %ld(%.2f TB)",
@@ -4021,13 +4063,14 @@ int Reducer_t::run() {
 
 int Reducer_t::_reduce(int tid) {
     constexpr long vec_nbytes = Pool_hd_t::vec_nbytes;
+    const int device_ptr = hw::gpu_ptr(tid, _num_threads);
 
     for (;;) {
         long bucket_id = -1;
         std::unique_lock<std::mutex> red_lock(_red_mtx);
-        _red_cv.wait(red_lock, [this, &bucket_id] {
-            if (flag & flag_stop_now) return true; 
-            bucket_id = _bwc->pop_bucket();
+        _red_cv.wait(red_lock, [this, &bucket_id, device_ptr] {
+            if (flag & flag_stop_now) return true;
+            bucket_id = _bwc->pop_bucket(device_ptr);
             return bucket_id >= 0 || (flag & flag_stop);
         });
         red_lock.unlock();
@@ -4243,6 +4286,8 @@ int Reducer_t::_red_out_2_swc(int tid, int sid) {
 }
 
 int Reducer_t::_ld_sbuc(int tid, int bucket_id) {
+    if (_bwc->bucket_in_hbm(bucket_id)) return _ld_hbm_sbuc(tid, bucket_id);
+
     #if ENABLE_PROFILING
     struct timeval fetch_start, fetch_end;
     gettimeofday(&fetch_start, NULL);
@@ -4262,11 +4307,8 @@ int Reducer_t::_ld_sbuc(int tid, int bucket_id) {
         int no_more_chunks_in_buc = 0;
         while (task_vecs < traits::taskVecs) {
             if (!curr_chunk) { no_more_chunks_in_buc = 1; break; }
-            if (!used) {
-                if (_normalize_chunk(curr_chunk, _pool->CSD)) {
-                    lg_warn("chunk %d from bwc (bucket_id %d) not normalized", curr_chunk->id, bucket_id);
-                }
-            }
+            // BWC chunks are append-only compact vec+norm arrays, so they are
+            // already dense and have no score/u fields to normalize.
             task_vecs += _red_buf->bgjs_h2d(tid, curr_chunk, used);
             if (used == -1) {
                 // lg_warn("bucket %d size exceeds buc_max_size(%d), truncated", bucket_id, _red_buf->buc_max_size);
@@ -4324,6 +4366,80 @@ int Reducer_t::_ld_sbuc(int tid, int bucket_id) {
     logger->ev_bk1_vmmas += ceil(bk0_size / 16.0) * ceil(_batch1 / 16.0);
     #endif
 
+    return 0;
+}
+
+int Reducer_t::_ld_hbm_sbuc(int tid, int bucket_id) {
+    const int device_ptr = hw::gpu_ptr(tid, _num_threads);
+    int chunk_size = 0;
+    int slot_id = -1;
+    const int32_t *d_src_norm = NULL;
+    const int8_t *d_src_vec = NULL;
+    bool have_chunk = _bwc->fetch_hbm_for_read(bucket_id, device_ptr,
+                                                &chunk_size, &d_src_norm,
+                                                &d_src_vec, &slot_id);
+    #if ENABLE_PROFILING
+    if (have_chunk) logger->ev_ld_chunks++;
+    #endif
+    int used = 0;
+    for (;;) {
+        int task_vecs = 0;
+        int no_more_chunks_in_buc = 0;
+        while (task_vecs < traits::taskVecs) {
+            if (!have_chunk) {
+                no_more_chunks_in_buc = 1;
+                break;
+            }
+            task_vecs += _red_buf->bgjs_d2d(tid, d_src_vec, d_src_norm,
+                                             chunk_size, used);
+            if (used == -1) {
+                _bwc->hbm_read_done(device_ptr, slot_id);
+                have_chunk = false;
+                no_more_chunks_in_buc = 1;
+                break;
+            }
+            if (used == chunk_size) {
+                _bwc->hbm_read_done(device_ptr, slot_id);
+                have_chunk = _bwc->fetch_hbm_for_read(bucket_id, device_ptr,
+                                                       &chunk_size, &d_src_norm,
+                                                       &d_src_vec, &slot_id);
+                #if ENABLE_PROFILING
+                if (have_chunk) logger->ev_ld_chunks++;
+                #endif
+                used = 0;
+            }
+        }
+
+        if (_strategy == strategy_bgj1) _red_buf->bgjs_upk(tid, true);
+        if (_strategy == strategy_bgj2 || _strategy == strategy_bgj3)
+            _red_buf->bgjm_upk(tid, true);
+        if (no_more_chunks_in_buc) break;
+    }
+
+    #if ENABLE_PROFILING
+    int bk0_size = _red_buf->buc_vecs[tid];
+    int bk1_size[BGJ3_DEFAULT_BATCH1 + BGJ2_DEFAULT_BATCH1];
+    if (_strategy == strategy_bgj2 || _strategy == strategy_bgj3) {
+        CHECK_CUDA_ERR(cudaMemcpyAsync(bk1_size, _red_buf->d_bk1[tid],
+                                       _batch1 * sizeof(int), cudaMemcpyDeviceToHost,
+                                       _red_buf->streams[tid]));
+        CHECK_CUDA_ERR(cudaStreamSynchronize(_red_buf->streams[tid]));
+        logger->ev_bk1_num += _batch1;
+        for (int i = 0; i < _batch1; i++) {
+            logger->ev_bk1_ssum += bk1_size[i];
+            logger->ev_bk1_max = std::max((int)logger->ev_bk1_max.load(), bk1_size[i]);
+            if (_strategy == strategy_bgj3)
+                logger->ev_bk2_vmmas += ceil(_batch2 / 16.0) * ceil(bk1_size[i] / 16.0);
+            if (_strategy == strategy_bgj2)
+                logger->ev_red_vmmas += ceil(bk1_size[i] / 16.0) *
+                                        ceil(bk1_size[i] / 16.0 + 1.0) / 2;
+        }
+    }
+    logger->ev_bk0_num += 1;
+    logger->ev_bk0_ssum += bk0_size;
+    logger->ev_bk0_max = std::max((int)logger->ev_bk0_max.load(), bk0_size);
+    logger->ev_bk1_vmmas += ceil(bk0_size / 16.0) * ceil(_batch1 / 16.0);
+    #endif
     return 0;
 }
 
@@ -4419,9 +4535,6 @@ int Reducer_t::_ld_lbuc(int tid, int bucket_id, int &num_chunks, chunk_t **&work
         logger->ev_ld_chunks++;
         #endif
         if (!src) break;
-        if (_normalize_chunk(src, _pool->CSD)) {
-            lg_warn("chunk %d from bwc (bucket_id %d) not normalized", src->id, bucket_id);
-        }
         if (src->size == 0) {
             lg_warn("chunk %d from bwc (bucket_id %d) has size 0", src->id, bucket_id);
             _bwc->read_done(src, bucket_id);
@@ -4430,13 +4543,10 @@ int Reducer_t::_ld_lbuc(int tid, int bucket_id, int &num_chunks, chunk_t **&work
         if (src->size < Pool_hd_t::chunk_max_nvecs) {
             if (!unfull_chunk) unfull_chunk = src;
             else {
-                int to_copy = Pool_hd_t::chunk_max_nvecs - unfull_chunk->size < src->size ? 
+                int to_copy = Pool_hd_t::chunk_max_nvecs - unfull_chunk->size < src->size ?
                               Pool_hd_t::chunk_max_nvecs - unfull_chunk->size : src->size;
                 memcpy(unfull_chunk->vec + _pool->CSD * unfull_chunk->size, src->vec + _pool->CSD * (src->size - to_copy), _pool->CSD * to_copy);
                 memcpy(unfull_chunk->norm + unfull_chunk->size, src->norm + src->size - to_copy, sizeof(int32_t) * to_copy);
-                memcpy(unfull_chunk->score + unfull_chunk->size, src->score + src->size - to_copy, sizeof(uint16_t) * to_copy);
-                memcpy(unfull_chunk->u + unfull_chunk->size, src->u + src->size - to_copy, sizeof(uint64_t) * to_copy);
-                memset(src->score + src->size - to_copy, 0, sizeof(uint16_t) * to_copy);
                 memset(src->norm + src->size - to_copy, 0, sizeof(int32_t) * to_copy);
                 src->size -= to_copy;
                 unfull_chunk->size += to_copy;

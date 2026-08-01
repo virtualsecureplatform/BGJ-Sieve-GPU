@@ -213,8 +213,17 @@ namespace thread_pool {
 
 	inline void thread_pool::wait_sleep()
 	{
-		while (_tasks.size() != 0 || _threads_busy != 0)
+		while (true) {
+			// _tasks is also consumed under _mutex.  Reading it without the
+			// mutex races with std::queue::pop() and can let this function
+			// return while a worker is between taking and running a task.
+			{
+				std::lock_guard<std::mutex> lock(_mutex);
+				if (_tasks.empty() && _threads_busy == 0)
+					return;
+			}
 			std::this_thread::yield();
+		}
 	}
 
 	inline void thread_pool::push(const std::function<void()>& f)

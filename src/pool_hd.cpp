@@ -111,7 +111,14 @@ int Pool_hd_t::set_num_threads(long num_threads) {
 
 int Pool_hd_t::set_sieving_context(long ind_l, long ind_r) {
     // I don't want to check the validity of l and r here
-    this->CSD = ind_r - ind_l;
+    const long new_CSD = ind_r - ind_l;
+    if (new_CSD > host_vec_nbytes) {
+        fprintf(stderr, "[Error] sieving dimension %ld exceeds the %ld-byte host "
+                        "cache slot configured by POOL_HOST_VEC_MAX_DIM\n",
+                        new_CSD, host_vec_nbytes);
+        return -1;
+    }
+    this->CSD = new_CSD;
     this->index_l = ind_l;
     this->index_r = ind_r;
     

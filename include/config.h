@@ -46,37 +46,56 @@ struct hw {
 
 
 ///////////////// pwc config /////////////////
-// Host cache slot layout: slots are (POOL_VEC_MAX_DIM + 14) bytes per vec.
-// Lowering this for low-TSD profiles would give ~20% more slots per GB,
-// BUT the value doubles as the device CSD16 kernel tier: bgj/dh kernels
-// hardcode <...,176> dispatch and buffer strides, so any other value
-// silently corrupts vectors (verified: bucket-cache corruption + SIGSEGV).
-// Changing it requires adding a matching CSD16 kernel tier first.
+// Device kernels retain the 176-byte CSD16 tier.  Host cache chunks only
+// store CSD bytes per vector, so their fixed slot can be smaller for the
+// SVP-120/130/140 profiles used by this build.  Keeping these constants
+// separate avoids changing CUDA strides while providing ~20% more host
+// cache slots per GB (190 -> 158 bytes per vector).
 #define POOL_VEC_MAX_DIM                176
-#define POOL_VEC_SLOT_NBYTES            (POOL_VEC_MAX_DIM + 14ULL)
+#ifndef POOL_HOST_VEC_MAX_DIM
+#define POOL_HOST_VEC_MAX_DIM           144
+#endif
+#define POOL_HOST_VEC_SLOT_NBYTES       (POOL_HOST_VEC_MAX_DIM + 14ULL)
+#define BWC_HOST_VEC_SLOT_NBYTES        (POOL_HOST_VEC_MAX_DIM + 4ULL)
 #if POOL_VEC_MAX_DIM != 176
 #error "POOL_VEC_MAX_DIM != 176 needs a matching CSD16 kernel tier (bgj/dh kernels hardcode 176)"
+#endif
+#if POOL_HOST_VEC_MAX_DIM > POOL_VEC_MAX_DIM
+#error "POOL_HOST_VEC_MAX_DIM cannot exceed the CUDA vector tier"
 #endif
 // DRAM cache profiles for a 125GB host (PWC/BWC/SWC _DRAM_SLIMIT):
 //   SVP-120 profile: 14/24/4 GB (committed default)
 //   SVP-130 profile: 16/50/12 GB — solution working set needs ~12GB by
 //   CSD 116, buckets ~48GB by CSD 120
-//   SVP-140 profile: 51/32/12 GB — caps bind in SLOTS (SLIMIT/8192/190):
-//   pool must stay slot-resident or full-pool scans thrash the SSD; PWC51
-//   = 35.2K slots covers the CSD127 pool (33.6K chunks). BWC below 32GB
+//   SVP-140 profile: 51/32/12 GB — caps bind in exact host slots
+//   (158 bytes for PWC/SWC, 148 for BWC): pool must stay slot-resident or
+//   full-pool scans thrash the SSD. PWC51 now provides 42.3K slots and covers
+//   the measured CSD127 pool (33.6K chunks). BWC below 32GB
 //   thrashes buckets from CSD ~115 (2.4-3.4x per-dim, measured). The
-//   process needs ~24GB non-pinned at CSD127, so PWC58 (= CSD128 cover,
-//   38.8K chunks) cannot fit next to BWC32 on a 125GB host — peak CSD127
-//   is this box's ceiling with healthy caches.
+//   process needs ~24GB non-pinned at CSD127, so total cache bytes still need
+//   to be kept below the 125GB host limit.
 // Fast persistence behavior is the DEFAULT (single-SSD tuning): lazy sync
 // on, pool persisted every 6th dim, no between-sieve pwc borrow. Restore
 // stock behavior with HD_LAZY_SYNC=0 HD_SYNC_EVERY=1 HD_PWC_NO_GROW=0.
+// Build with -DHD_SVP140_CACHE_PROFILE=1 for the 51/32/12 GB profile.
 #define ONE_TIME_IO                     1
+#ifndef HD_SVP140_CACHE_PROFILE
+#define HD_SVP140_CACHE_PROFILE         0
+#endif
+#if HD_SVP140_CACHE_PROFILE
+#define PWC_DRAM_SLIMIT                 (51ULL << 30)
+#define BWC_DRAM_SLIMIT                 (32ULL << 30)
+#define SWC_DRAM_SLIMIT                 (12ULL << 30)
+#else
+#define PWC_DRAM_SLIMIT                 (14ULL << 30)
+#define BWC_DRAM_SLIMIT                 (24ULL << 30)
+#define SWC_DRAM_SLIMIT                 (4ULL << 30)
+#endif
+
 #define PWC_DEFAULT_LOADING_THREADS     6
 #define PWC_DEFAULT_SYNCING_THREADS     6
 #define PWC_SSD_SLIMIT                  (10000ULL << 30)
-#define PWC_DRAM_SLIMIT                 (14ULL << 30)
-#define PWC_DEFAULT_MAX_CACHED_CHUNKS   (PWC_DRAM_SLIMIT / 8192ULL / POOL_VEC_SLOT_NBYTES)
+#define PWC_DEFAULT_MAX_CACHED_CHUNKS   (PWC_DRAM_SLIMIT / 8192ULL / POOL_HOST_VEC_SLOT_NBYTES)
 #define PWC_MAX_PARALLEL_SYNC_CHUNKS    5
 
 
@@ -84,8 +103,7 @@ struct hw {
 #define BWC_DEFAULT_LOADING_THREADS     8
 #define BWC_DEFAULT_SYNCING_THREADS     6
 #define BWC_SSD_SLIMIT                  (32ULL << 30)
-#define BWC_DRAM_SLIMIT                 (24ULL << 30)
-#define BWC_DEFAULT_MAX_CACHED_CHUNKS   (BWC_DRAM_SLIMIT / 8192ULL / POOL_VEC_SLOT_NBYTES)
+#define BWC_DEFAULT_MAX_CACHED_CHUNKS   (BWC_DRAM_SLIMIT / 8192ULL / BWC_HOST_VEC_SLOT_NBYTES)
 #define BWC_MAX_PARALLEL_SYNC_CHUNKS    5
 #define BWC_MAX_BUCKETS                 4192
 
@@ -94,8 +112,7 @@ struct hw {
 #define SWC_DEFAULT_LOADING_THREADS     5
 #define SWC_DEFAULT_SYNCING_THREADS     3
 #define SWC_SSD_SLIMIT                  (5000ULL << 30)
-#define SWC_DRAM_SLIMIT                 (4ULL << 30)
-#define SWC_DEFAULT_MAX_CACHED_CHUNKS   (SWC_DRAM_SLIMIT / 8192ULL / POOL_VEC_SLOT_NBYTES)
+#define SWC_DEFAULT_MAX_CACHED_CHUNKS   (SWC_DRAM_SLIMIT / 8192ULL / POOL_HOST_VEC_SLOT_NBYTES)
 #define SWC_MAX_PARALLEL_SYNC_CHUNKS    5
 
 
@@ -178,7 +195,7 @@ struct hw {
 #define UT_DEFAULT_NUM_THREADS          16
 #define UT_TABLE_DRAM_SLIMIT            (1500ULL << 30)
 #define UT_BUFFER_DRAM_SLIMIT           (300ULL << 30)
-#define UT_DEFAULT_MAX_CHUNKS           (UT_BUFFER_DRAM_SLIMIT / 8192ULL / POOL_VEC_SLOT_NBYTES)
+#define UT_DEFAULT_MAX_CHUNKS           (UT_BUFFER_DRAM_SLIMIT / 8192ULL / POOL_HOST_VEC_SLOT_NBYTES)
 #define UT_DEFAULT_MAX_UIDS             (UT_BUFFER_DRAM_SLIMIT / 8192ULL / 32ULL)
 #define UT_DEFAULT_BATCH_RATIO          0.01
 

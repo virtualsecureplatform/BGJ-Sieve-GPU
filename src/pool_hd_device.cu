@@ -21,108 +21,113 @@ static std::atomic<int> ck_allocator_started{0};
 #include <sys/mman.h>
 #include <fcntl.h>
 
-struct chunk_allocator_t {
-    static constexpr long max_cached_chunks = PWC_DEFAULT_MAX_CACHED_CHUNKS + 
-              BWC_DEFAULT_MAX_CACHED_CHUNKS + SWC_DEFAULT_MAX_CACHED_CHUNKS + 256;
+struct chunk_arena_t {
+    chunk_arena_t() { pthread_spin_init(&cache_lock, PTHREAD_PROCESS_PRIVATE); }
 
-    chunk_allocator_t() {}
-
-    ~chunk_allocator_t() {
-        if (!ck_allocator_started.load()) return;
-        pthread_spin_lock(&cache_lock);
-        cached_num = 0;
-        if (using_num) {
-            fprintf(stderr, "[Warning] %ld chunks not freed\n", using_num);
-            using_num = 0;
-        }
-        pthread_spin_unlock(&cache_lock);
+    ~chunk_arena_t() {
+        if (using_num) fprintf(stderr, "[Warning] %ld %s chunks not freed\n",
+                               using_num, compact ? "bucket" : "regular");
         pthread_spin_destroy(&cache_lock);
         free(cached_chunks);
     }
 
-    void destory() {
-        if (!ck_allocator_started.load()) return;
+    void start(long num_chunks, bool compact_vec_norm, const char *hugepage_name) {
+        compact = compact_vec_norm;
+        max_cached_chunks = num_chunks;
+        cached_chunks = (chunk_t *)calloc(max_cached_chunks, sizeof(chunk_t));
+        if (!cached_chunks) {
+            fprintf(stderr, "[Error] chunk metadata allocation failed\n");
+            abort();
+        }
+
+        const long fields_nbytes = compact ? 4 : (2 + 4 + 8);
+        chunk_nbytes = Pool_hd_t::chunk_max_nvecs *
+                       (Pool_hd_t::host_vec_nbytes + fields_nbytes) +
+                       (ONE_TIME_IO ? 4096 : 0);
+        const size_t arena_nbytes = (size_t)max_cached_chunks * chunk_nbytes;
+
+        #if USE_HUGE_PAGE
+        hp_size = ((arena_nbytes + 2097151L) / 2097152L) * 2097152L;
+        char hp_path[128];
+        snprintf(hp_path, sizeof(hp_path), "/dev/hugepages/%s", hugepage_name);
+        hp_fd = open(hp_path, O_CREAT | O_RDWR, 0755);
+        if (hp_fd < 0) {
+            perror("open");
+            exit(1);
+        }
+        space = (int8_t *)mmap(NULL, hp_size, PROT_READ | PROT_WRITE,
+                               MAP_SHARED, hp_fd, 0);
+        if (space == MAP_FAILED) {
+            perror("mmap");
+            close(hp_fd);
+            exit(1);
+        }
+        CHECK_CUDA_ERR(cudaHostRegister(space, hp_size, cudaHostAllocPortable));
+        #else
+        if (posix_memalign((void **)&space, 4096, arena_nbytes)) {
+            fprintf(stderr, "[Error] chunk arena allocation of %.2f GiB failed\n",
+                    arena_nbytes / 1073741824.0);
+            abort();
+        }
+        CHECK_CUDA_ERR(cudaHostRegister(space, arena_nbytes, cudaHostAllocPortable));
+        #endif
+
+        for (long i = 0; i < max_cached_chunks; i++) {
+            int8_t *base = space + i * chunk_nbytes + (ONE_TIME_IO ? 12L : 0);
+            if (compact) {
+                cached_chunks[i].score = NULL;
+                cached_chunks[i].norm = (int32_t *)base;
+                cached_chunks[i].u = NULL;
+                cached_chunks[i].vec = (int8_t *)(cached_chunks[i].norm +
+                                                  Pool_hd_t::chunk_max_nvecs);
+            } else {
+                cached_chunks[i].score = (uint16_t *)base;
+                cached_chunks[i].norm = (int32_t *)(cached_chunks[i].score +
+                                                    Pool_hd_t::chunk_max_nvecs);
+                cached_chunks[i].u = (uint64_t *)(cached_chunks[i].norm +
+                                                  Pool_hd_t::chunk_max_nvecs);
+                cached_chunks[i].vec = (int8_t *)(cached_chunks[i].u +
+                                                  Pool_hd_t::chunk_max_nvecs);
+            }
+        }
+        cached_num = max_cached_chunks;
+    }
+
+    void destroy() {
         pthread_spin_lock(&cache_lock);
         if (space) {
-            #if USE_HUGE_PAGE
             CHECK_CUDA_ERR(cudaHostUnregister(space));
+            #if USE_HUGE_PAGE
             munmap(space, hp_size);
             close(hp_fd);
             #else
-            CHECK_CUDA_ERR(cudaHostUnregister(space));
             free(space);
             #endif
             space = NULL;
         }
         cached_num = 0;
         if (using_num) {
-            fprintf(stderr, "[Warning] %ld chunks not freed\n", using_num);
+            fprintf(stderr, "[Warning] %ld %s chunks not freed\n",
+                    using_num, compact ? "bucket" : "regular");
             using_num = 0;
         }
         pthread_spin_unlock(&cache_lock);
-        cudaDeviceReset();
     }
 
-    void _ck_allocator_start() {
-        struct bitmask *nodes = numa_get_mems_allowed();
-        numa_set_interleave_mask(nodes);
-        numa_bitmask_free(nodes);
-
-        cached_chunks = (chunk_t *) malloc(max_cached_chunks * sizeof(chunk_t));
-        pthread_spin_init(&cache_lock, PTHREAD_PROCESS_SHARED);
-
-        #if ONE_TIME_IO
-        long chunk_nbytes = Pool_hd_t::chunk_max_nvecs * (Pool_hd_t::vec_nbytes + 8 + 4 + 2) + 4096;
-        #else
-        long chunk_nbytes = Pool_hd_t::chunk_max_nvecs * (Pool_hd_t::vec_nbytes + 8 + 4 + 2);
-        #endif
-
-        #if USE_HUGE_PAGE
-        size_t hp_size = ((max_cached_chunks * chunk_nbytes + 2097151L) / 2097152L) * 2097152L;
-        hp_fd = open("/dev/hugepages/hugepagefile", O_CREAT | O_RDWR, 0755);
-        if (hp_fd < 0) {
-            perror("open");
-            exit(1);
-        }
-        space = (int8_t *)mmap(NULL, hp_size, PROT_READ | PROT_WRITE, MAP_SHARED, hp_fd, 0);
-        CHECK_CUDA_ERR(cudaHostRegister(space, hp_size, cudaHostAllocPortable));
-        if (space == MAP_FAILED) {
-            perror("mmap");
-            close(hp_fd);
-            exit(1);
-        }
-        #else
-        if (posix_memalign((void **)&space, 4096, max_cached_chunks * chunk_nbytes)) {
-            printf("[Error] _ck_allocator_start: posix_memalign failed");
-            fflush(stdout);
-        }
-        CHECK_CUDA_ERR(cudaHostRegister(space, max_cached_chunks * chunk_nbytes, cudaHostAllocPortable));
-        #endif
-
-
-        for (long i = 0; i < max_cached_chunks; i++) {
-            cached_chunks[i].score = (uint16_t *) (space + i * chunk_nbytes + (ONE_TIME_IO ? 12L : 0));
-            cached_chunks[i].norm  = (int32_t  *) (cached_chunks[i].score + Pool_hd_t::chunk_max_nvecs);
-            cached_chunks[i].u     = (uint64_t *) (cached_chunks[i].norm + Pool_hd_t::chunk_max_nvecs);
-            cached_chunks[i].vec   = (int8_t   *) (cached_chunks[i].u + Pool_hd_t::chunk_max_nvecs);
-        }
-        cached_num = max_cached_chunks;
-    }
-
-    void _outer_malloc_chunk(chunk_t *chunk) {
+    void allocate(chunk_t *chunk) {
         for (;;) {
             pthread_spin_lock(&cache_lock);
             if (cached_num > 0) {
                 using_num++;
                 chunk_t *src = &cached_chunks[--cached_num];
                 chunk->score = src->score;
-                chunk->vec   = src->vec;
-                chunk->norm  = src->norm;
-                chunk->u     = src->u;
-                src->score   = NULL;
-                src->vec     = NULL;
-                src->norm    = NULL;
-                src->u       = NULL;
+                chunk->norm = src->norm;
+                chunk->u = src->u;
+                chunk->vec = src->vec;
+                src->score = NULL;
+                src->norm = NULL;
+                src->u = NULL;
+                src->vec = NULL;
                 pthread_spin_unlock(&cache_lock);
                 return;
             }
@@ -131,26 +136,56 @@ struct chunk_allocator_t {
         }
     }
 
-    void _outer_free_chunk(chunk_t *src) {
+    void release(chunk_t *src) {
         pthread_spin_lock(&cache_lock);
         using_num--;
         chunk_t *dst = &cached_chunks[cached_num++];
         dst->score = src->score;
-        dst->vec   = src->vec;
-        dst->norm  = src->norm;
-        dst->u     = src->u;
+        dst->norm = src->norm;
+        dst->u = src->u;
+        dst->vec = src->vec;
+        src->score = NULL;
+        src->norm = NULL;
+        src->u = NULL;
+        src->vec = NULL;
         pthread_spin_unlock(&cache_lock);
     }
 
-
     private:
-    int                hp_fd;
-    size_t             hp_size;
+    bool compact = false;
+    int hp_fd = -1;
+    size_t hp_size = 0;
     pthread_spinlock_t cache_lock;
-    long               cached_num = 0;
-    long               using_num  = 0;
-    chunk_t           *cached_chunks = NULL;
-    int8_t            *space = NULL;
+    long max_cached_chunks = 0;
+    long cached_num = 0;
+    long using_num = 0;
+    long chunk_nbytes = 0;
+    chunk_t *cached_chunks = NULL;
+    int8_t *space = NULL;
+};
+
+struct chunk_allocator_t {
+    static constexpr long regular_chunks = PWC_DEFAULT_MAX_CACHED_CHUNKS +
+                                            SWC_DEFAULT_MAX_CACHED_CHUNKS + 256;
+    static constexpr long bucket_chunks = BWC_DEFAULT_MAX_CACHED_CHUNKS + 64;
+
+    void _ck_allocator_start() {
+        struct bitmask *nodes = numa_get_mems_allowed();
+        numa_set_interleave_mask(nodes);
+        numa_bitmask_free(nodes);
+        regular.start(regular_chunks, false, "bgj-regular");
+        bucket.start(bucket_chunks, true, "bgj-bucket");
+    }
+
+    void destory() {
+        if (!ck_allocator_started.load()) return;
+        bucket.destroy();
+        regular.destroy();
+        cudaDeviceReset();
+    }
+
+    chunk_arena_t regular;
+    chunk_arena_t bucket;
 };
 
 static chunk_allocator_t chunk_allocator;
@@ -166,11 +201,49 @@ void _destory_ck_allocator() {
 }
 
 extern void _malloc_chunk(chunk_t *chunk) {
-    chunk_allocator._outer_malloc_chunk(chunk);
+    chunk_allocator.regular.allocate(chunk);
 }
 
 extern void _free_chunk(chunk_t *chunk) {
-    chunk_allocator._outer_free_chunk(chunk);
+    chunk_allocator.regular.release(chunk);
+}
+
+extern void _malloc_bucket_chunk(chunk_t *chunk) {
+    chunk_allocator.bucket.allocate(chunk);
+}
+
+extern void _free_bucket_chunk(chunk_t *chunk) {
+    chunk_allocator.bucket.release(chunk);
+}
+
+int _cuda_device_mem_info(int device_ptr, size_t *free_nbytes, size_t *total_nbytes) {
+    if (device_ptr < 0 || device_ptr >= hw::gpu_num) return -1;
+    if (cudaSetDevice(hw::gpu_id_list[device_ptr]) != cudaSuccess) return -1;
+    return cudaMemGetInfo(free_nbytes, total_nbytes) == cudaSuccess ? 0 : -1;
+}
+
+int _cuda_device_malloc(int device_ptr, void **ptr, size_t nbytes) {
+    if (device_ptr < 0 || device_ptr >= hw::gpu_num) return -1;
+    if (cudaSetDevice(hw::gpu_id_list[device_ptr]) != cudaSuccess) return -1;
+    cudaError_t status = cudaMalloc(ptr, nbytes);
+    if (status != cudaSuccess) {
+        cudaGetLastError();
+        *ptr = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+int _cuda_device_free(int device_ptr, void *ptr) {
+    if (!ptr || device_ptr < 0 || device_ptr >= hw::gpu_num) return -1;
+    if (cudaSetDevice(hw::gpu_id_list[device_ptr]) != cudaSuccess) return -1;
+    return cudaFree(ptr) == cudaSuccess ? 0 : -1;
+}
+
+int _cuda_device_h2d(int device_ptr, void *dst, const void *src, size_t nbytes) {
+    if (device_ptr < 0 || device_ptr >= hw::gpu_num) return -1;
+    if (cudaSetDevice(hw::gpu_id_list[device_ptr]) != cudaSuccess) return -1;
+    return cudaMemcpy(dst, src, nbytes, cudaMemcpyHostToDevice) == cudaSuccess ? 0 : -1;
 }
 
 extern int _prepare_device_prop(int &num_devices, cudaDeviceProp device_props[]) {
@@ -1039,8 +1112,9 @@ int Pool_hd_t::stream_stat_template(int num_devices, cudaDeviceProp device_props
     return 0;
 }
 
-// Between sieves pwc may borrow the idle bwc/swc arena slots so more of the
-// pool stays cached during extend_left/min_lift at CSD > 120. The borrow is
+// Between sieves pwc may borrow the idle swc arena slots so more of the pool
+// stays cached during extend_left/min_lift at CSD > 120. BWC slots now use the
+// compact vec+norm layout and cannot safely hold pool chunks. The borrow is
 // repaid by a positional shrink at the next sieve start, which first writes
 // out every lazy-dirty chunk; when the base cap already holds the whole pool
 // the borrow buys nothing and that drain dominates per-dim SSD writes. The
@@ -1054,7 +1128,6 @@ static long __pwc_between_sieve_target() {
     }
     if (no_grow) return PWC_DEFAULT_MAX_CACHED_CHUNKS;
     return PWC_DEFAULT_MAX_CACHED_CHUNKS +
-           BWC_DEFAULT_MAX_CACHED_CHUNKS +
            SWC_DEFAULT_MAX_CACHED_CHUNKS;
 }
 
@@ -1064,6 +1137,13 @@ int Pool_hd_t::extend_left() {
         lg_warn("index_l = 0, cannot extend_left, nothing done.");
         lg_exit();
         return -2;
+    }
+    if (CSD >= host_vec_nbytes) {
+        fprintf(stderr, "[Error] cannot extend CSD %ld: host cache slots are "
+                        "configured for at most %ld bytes\n",
+                        CSD, host_vec_nbytes);
+        lg_exit();
+        return -1;
     }
 
     pwc_manager->wait_work();
