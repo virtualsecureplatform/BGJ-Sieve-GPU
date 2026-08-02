@@ -190,6 +190,80 @@ struct chunk_allocator_t {
 
 static chunk_allocator_t chunk_allocator;
 
+static int _common_gpu_numa_node() {
+    static int cached = -2;
+    if (cached != -2) return cached;
+
+    const char *override_node = getenv("HD_GPU_NUMA_NODE");
+    if (override_node) {
+        cached = atoi(override_node);
+        return cached;
+    }
+
+    int common = -1;
+    for (int device_ptr = 0; device_ptr < hw::gpu_num; device_ptr++) {
+        char bus_id[32] = {};
+        if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), hw::gpu_id_list[device_ptr]) !=
+            cudaSuccess) {
+            cached = -1;
+            return cached;
+        }
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/numa_node", bus_id);
+        FILE *fp = fopen(path, "r");
+        int node = -1;
+        if (!fp || fscanf(fp, "%d", &node) != 1) node = -1;
+        if (fp) fclose(fp);
+        if (node < 0 || (common >= 0 && common != node)) {
+            cached = -1;
+            return cached;
+        }
+        common = node;
+    }
+    cached = common;
+    return cached;
+}
+
+int _gpu_numa_host_alloc(void **ptr, size_t alignment, size_t nbytes) {
+    if (posix_memalign(ptr, alignment, nbytes)) return -1;
+
+    const char *local_env = getenv("HD_GPU_NUMA_LOCAL");
+    if (local_env && atoi(local_env) == 0) return 0;
+    const int node = _common_gpu_numa_node();
+    if (node < 0 || node >= (int)(8 * sizeof(unsigned long))) return 0;
+
+    // Binding a large reducer buffer to the GPU node is useful only while it
+    // leaves enough local memory for CUDA, I/O workers, and transient solution
+    // queues.  The SVP-140 cache profile nearly fills both NUMA nodes; blindly
+    // binding another ~8 GiB to node 0 can therefore invoke the kernel OOM
+    // killer even while the other node still has free pages.
+    const char *reserve_env = getenv("HD_GPU_NUMA_RESERVE_GB");
+    const double reserve_gb = reserve_env ? atof(reserve_env) : 16.0;
+    long long node_free = 0;
+    if (numa_node_size64(node, &node_free) >= 0 && reserve_gb >= 0.0) {
+        const uint64_t reserve = (uint64_t)(reserve_gb * (1ULL << 30));
+        if ((uint64_t)node_free < nbytes + reserve) {
+            static std::atomic<int> reported{0};
+            if (!reported.fetch_or(1))
+                fprintf(stderr,
+                        "[Info] GPU-NUMA staging left interleaved: node %d has %.2f GiB free, "
+                        "%.2f GiB allocation plus %.2f GiB reserve requested\n",
+                        node, node_free / (double)(1ULL << 30),
+                        nbytes / (double)(1ULL << 30), reserve_gb);
+            return 0;
+        }
+    }
+
+    unsigned long node_mask = 1UL << node;
+    if (mbind(*ptr, nbytes, MPOL_BIND, &node_mask, node + 1, 0) != 0) {
+        static std::atomic<int> warned{0};
+        if (!warned.fetch_or(1))
+            fprintf(stderr, "[Warning] NUMA binding of GPU staging memory to node %d failed: %s\n",
+                    node, strerror(errno));
+    }
+    return 0;
+}
+
 void _start_ck_allocator() {
     if (!ck_allocator_started.fetch_or(1, std::memory_order_acq_rel)) {
         chunk_allocator._ck_allocator_start();
@@ -240,10 +314,24 @@ int _cuda_device_free(int device_ptr, void *ptr) {
     return cudaFree(ptr) == cudaSuccess ? 0 : -1;
 }
 
-int _cuda_device_h2d(int device_ptr, void *dst, const void *src, size_t nbytes) {
+int _cuda_device_h2d_pair_nonblocking(int device_ptr,
+                                      void *dst0, const void *src0, size_t nbytes0,
+                                      void *dst1, const void *src1, size_t nbytes1) {
     if (device_ptr < 0 || device_ptr >= hw::gpu_num) return -1;
     if (cudaSetDevice(hw::gpu_id_list[device_ptr]) != cudaSuccess) return -1;
-    return cudaMemcpy(dst, src, nbytes, cudaMemcpyHostToDevice) == cudaSuccess ? 0 : -1;
+
+    // Finalizer workers persist across dimensions, so each worker/device pair
+    // can retain a copy stream. Non-blocking streams do not impose legacy
+    // default-stream barriers on the reducer streams, allowing an already
+    // finalized bucket to reduce while the next bucket is staged.
+    static thread_local cudaStream_t copy_streams[MAX_NUM_DEVICE] = {};
+    cudaStream_t &stream = copy_streams[device_ptr];
+    if (!stream && cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess)
+        return -1;
+    if (cudaMemcpyAsync(dst0, src0, nbytes0, cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+        cudaMemcpyAsync(dst1, src1, nbytes1, cudaMemcpyHostToDevice, stream) != cudaSuccess)
+        return -1;
+    return cudaStreamSynchronize(stream) == cudaSuccess ? 0 : -1;
 }
 
 extern int _prepare_device_prop(int &num_devices, cudaDeviceProp device_props[]) {

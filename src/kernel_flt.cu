@@ -577,9 +577,60 @@ __global__ void filter_prepare_vec(int8_t *__restrict__ data, const int8_t *__re
     }
 }
 
+__device__ __forceinline__ uint32_t _uid_hash_pos(uint64_t key, uint32_t mask) {
+    key ^= key >> 33;
+    key *= 0xff51afd7ed558ccdULL;
+    key ^= key >> 33;
+    key *= 0xc4ceb9fe1a85ec53ULL;
+    key ^= key >> 33;
+    return (uint32_t)key & mask;
+}
+
+// Insert a full UID into an epoch-tagged open-addressing table. Return 0 for
+// an exact duplicate, 1 for an inserted key, and 2 when deduplication is
+// bypassed. Bypass at the load limit (or on exhaustion) preserves every
+// candidate while avoiding pathological full-table probes.
+__device__ __forceinline__ int _uid_hash_insert(uint64_t key, uint64_t *keys,
+                                                uint32_t *tags, uint32_t mask,
+                                                uint32_t epoch,
+                                                uint32_t *occupied,
+                                                uint32_t insert_limit) {
+    if (!keys || !tags || !occupied) return 1;
+    if (atomicAdd(occupied, 0U) >= insert_limit) return 2;
+    const uint32_t epoch_tag = epoch << 2;
+    uint32_t pos = _uid_hash_pos(key, mask);
+    for (uint32_t probe = 0; probe <= mask; probe++, pos = (pos + 1) & mask) {
+        for (;;) {
+            uint32_t tag = atomicAdd(&tags[pos], 0U);
+            if ((tag & ~3U) != epoch_tag) {
+                if (atomicCAS(&tags[pos], tag, epoch_tag | 1U) == tag) {
+                    keys[pos] = key;
+                    __threadfence();
+                    atomicExch(&tags[pos], epoch_tag | 2U);
+                    atomicAdd(occupied, 1U);
+                    return 1;
+                }
+                continue;
+            }
+            if (tag == (epoch_tag | 1U)) {
+                do { tag = atomicAdd(&tags[pos], 0U); }
+                while (tag == (epoch_tag | 1U));
+                continue;
+            }
+            if (tag == (epoch_tag | 2U) && keys[pos] == key) return 0;
+            break;
+        }
+    }
+    return 2;
+}
+
 template <uint32_t CSD16>
 __global__ void filter_collect_sol(int8_t *vec_out, uint16_t *score_out, int32_t *norm_out, uint64_t *u_out, 
-                                   int *num_out, int out_max_size, int8_t *__restrict__ data, int n, int goal_score) {
+                                   int *num_out, int out_max_size, int8_t *__restrict__ data, int n,
+                                   int goal_score, uint64_t *uid_keys, uint32_t *uid_tags,
+                                   uint32_t uid_hash_mask, uint32_t uid_epoch,
+                                   uint32_t *uid_occupied, uint32_t uid_insert_limit,
+                                   uint32_t *num_uid_dup, uint32_t *num_uid_bypass) {
     constexpr int batchVecs = 64;
     constexpr int blockWarps = 8;
     
@@ -616,14 +667,32 @@ __global__ void filter_collect_sol(int8_t *vec_out, uint16_t *score_out, int32_t
         ((int *)wscore)[lid] = ((int *)glob_score)[ind / 2 + lid];
         __syncwarp();
         if (wscore[lid] && wscore[lid] < goal_score) {
-            int pos = atomicAdd(wacc_num, 1);
-            wacc[pos] = ind + lid;
-            wacc_score[pos] = wscore[lid];
+            const int idx = ind + lid;
+            const int uid_result = _uid_hash_insert(glob_u[idx], uid_keys, uid_tags,
+                                                    uid_hash_mask, uid_epoch,
+                                                    uid_occupied, uid_insert_limit);
+            if (uid_result) {
+                int pos = atomicAdd(wacc_num, 1);
+                wacc[pos] = idx;
+                wacc_score[pos] = wscore[lid];
+                if (uid_result == 2 && num_uid_bypass) atomicAdd(num_uid_bypass, 1U);
+            } else if (num_uid_dup) {
+                atomicAdd(num_uid_dup, 1U);
+            }
         }
         if (wscore[lid + 32] && wscore[lid + 32] < goal_score) {
-            int pos = atomicAdd(wacc_num, 1);
-            wacc[pos] = ind + lid + 32;
-            wacc_score[pos] = wscore[lid + 32];
+            const int idx = ind + lid + 32;
+            const int uid_result = _uid_hash_insert(glob_u[idx], uid_keys, uid_tags,
+                                                    uid_hash_mask, uid_epoch,
+                                                    uid_occupied, uid_insert_limit);
+            if (uid_result) {
+                int pos = atomicAdd(wacc_num, 1);
+                wacc[pos] = idx;
+                wacc_score[pos] = wscore[lid + 32];
+                if (uid_result == 2 && num_uid_bypass) atomicAdd(num_uid_bypass, 1U);
+            } else if (num_uid_dup) {
+                atomicAdd(num_uid_dup, 1U);
+            }
         }
 
         __syncwarp();
@@ -722,14 +791,18 @@ template __global__ void filter_kernel<176, 24>(int8_t *__restrict__ data, int n
 template __global__ void filter_prepare_vec<176>(int8_t *__restrict__ data, const int8_t *__restrict__ vec_pad16, 
                                                  int *__restrict__ pairs, int n);
 template __global__ void filter_collect_sol<176>(int8_t *vec_out, uint16_t *score_out, int32_t *norm_out, uint64_t *u_out, 
-                                                 int *num_out, int out_max_size, int8_t *__restrict__ data, int n, int goal_score);
+                                                 int *num_out, int out_max_size, int8_t *__restrict__ data, int n, int goal_score,
+                                                 uint64_t *, uint32_t *, uint32_t, uint32_t, uint32_t *, uint32_t,
+                                                 uint32_t *, uint32_t *);
 #if RED_MIN_CSD16 < 176
 template __global__ void filter_kernel<160, 48>(int8_t *__restrict__ data, int n, local_data_t *__restrict__ local_data);
 template __global__ void filter_kernel<160, 24>(int8_t *__restrict__ data, int n, local_data_t *__restrict__ local_data);
 template __global__ void filter_prepare_vec<160>(int8_t *__restrict__ data, const int8_t *__restrict__ vec_pad16, 
                                                  int *__restrict__ pairs, int n);
 template __global__ void filter_collect_sol<160>(int8_t *vec_out, uint16_t *score_out, int32_t *norm_out, uint64_t *u_out,
-                                                int *num_out, int out_max_size, int8_t *__restrict__ data, int n, int goal_score);
+                                                int *num_out, int out_max_size, int8_t *__restrict__ data, int n, int goal_score,
+                                                uint64_t *, uint32_t *, uint32_t, uint32_t, uint32_t *, uint32_t,
+                                                uint32_t *, uint32_t *);
 #endif
 #if RED_MIN_CSD16 < 160
 template __global__ void filter_kernel<144, 48>(int8_t *__restrict__ data, int n, local_data_t *__restrict__ local_data);
@@ -737,7 +810,9 @@ template __global__ void filter_kernel<144, 24>(int8_t *__restrict__ data, int n
 template __global__ void filter_prepare_vec<144>(int8_t *__restrict__ data, const int8_t *__restrict__ vec_pad16, 
                                                  int *__restrict__ pairs, int n);
 template __global__ void filter_collect_sol<144>(int8_t *vec_out, uint16_t *score_out, int32_t *norm_out, uint64_t *u_out,
-                                                int *num_out, int out_max_size, int8_t *__restrict__ data, int n, int goal_score);
+                                                int *num_out, int out_max_size, int8_t *__restrict__ data, int n, int goal_score,
+                                                uint64_t *, uint32_t *, uint32_t, uint32_t, uint32_t *, uint32_t,
+                                                uint32_t *, uint32_t *);
 #endif
 #if RED_MIN_CSD16 < 144
 template __global__ void filter_kernel<128, 48>(int8_t *__restrict__ data, int n, local_data_t *__restrict__ local_data);
@@ -745,5 +820,7 @@ template __global__ void filter_kernel<128, 24>(int8_t *__restrict__ data, int n
 template __global__ void filter_prepare_vec<128>(int8_t *__restrict__ data, const int8_t *__restrict__ vec_pad16, 
                                                  int *__restrict__ pairs, int n);
 template __global__ void filter_collect_sol<128>(int8_t *vec_out, uint16_t *score_out, int32_t *norm_out, uint64_t *u_out,
-                                                int *num_out, int out_max_size, int8_t *__restrict__ data, int n, int goal_score);
+                                                int *num_out, int out_max_size, int8_t *__restrict__ data, int n, int goal_score,
+                                                uint64_t *, uint32_t *, uint32_t, uint32_t, uint32_t *, uint32_t,
+                                                uint32_t *, uint32_t *);
 #endif

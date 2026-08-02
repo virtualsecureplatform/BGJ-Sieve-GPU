@@ -8,10 +8,14 @@
 
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 
 void _start_ck_allocator();
 void _destory_ck_allocator();
+int _gpu_numa_host_alloc(void **ptr, size_t alignment, size_t nbytes);
 
 struct cudaDeviceProp;
 struct local_data_t;
@@ -703,6 +707,15 @@ struct pwc_manager_tmpl {
     std::queue<int32_t> _to_sync_chunks;
     pthread_spinlock_t _to_sync_chunks_lock;
 
+    // Loading/syncing completion is also consumed by the bucket manager.
+    // Keep the status bits protected by the existing per-chunk spinlocks and
+    // use this mutex/CV only to avoid polling (and, historically, discarding)
+    // chunks while an I/O worker is still finishing them.
+    std::mutex _chunk_io_mutex;
+    std::condition_variable _chunk_io_cv;
+    bool __wait_chunk_io(long chunk_id, std::chrono::milliseconds timeout);
+    void __notify_chunk_io();
+
     // Lazy sync (default ON, HD_LAZY_SYNC=0 restores write-through): don't
     // write dirty chunks to SSD on every release; keep them cached
     // (unevictable via _ck_to_sync) and only write on cache pressure or
@@ -1276,6 +1289,7 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__load_chunk(long chu
     #endif
 
     _num_loading_chunks--;
+    __notify_chunk_io();
     lg_exit();
 }
 
@@ -1337,6 +1351,7 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__sync_chunk(long chu
     _chunk_status[chunk_id] &= ~_ck_syncing;
     pthread_spin_unlock(&_locks[chunk_id % pwc_locks]);
     _num_syncing_chunks--;
+    __notify_chunk_io();
     __signal_sync_done();
 
     #if ENABLE_PROFILING
@@ -1344,6 +1359,28 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__sync_chunk(long chu
     #endif
 
     lg_exit();
+}
+
+template <class logger_t>
+bool pwc_manager_tmpl<logger_t>::__wait_chunk_io(
+        long chunk_id, std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(_chunk_io_mutex);
+    return _chunk_io_cv.wait_for(lock, timeout, [this, chunk_id] {
+        pthread_spin_lock(&_locks[chunk_id % pwc_locks]);
+        const bool idle = (_chunk_status[chunk_id] & (_ck_loading | _ck_syncing)) == 0;
+        pthread_spin_unlock(&_locks[chunk_id % pwc_locks]);
+        return idle;
+    });
+}
+
+template <class logger_t>
+void pwc_manager_tmpl<logger_t>::__notify_chunk_io() {
+    // Pair with the waiter's mutex so a completion between its status check
+    // and sleep cannot be lost.
+    {
+        std::lock_guard<std::mutex> lock(_chunk_io_mutex);
+    }
+    _chunk_io_cv.notify_all();
 }
 
 template <class logger_t> void pwc_manager_tmpl<logger_t>::__signal_sync_done() {

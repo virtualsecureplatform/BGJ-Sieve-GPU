@@ -67,25 +67,26 @@ struct hw {
 //   SVP-120 profile: 14/24/4 GB (committed default)
 //   SVP-130 profile: 16/50/12 GB — solution working set needs ~12GB by
 //   CSD 116, buckets ~48GB by CSD 120
-//   SVP-140 profile: 51/32/12 GB — caps bind in exact host slots
+//   SVP-140 profile: 47/32/8 GB — caps bind in exact host slots
 //   (158 bytes for PWC/SWC, 148 for BWC): pool must stay slot-resident or
-//   full-pool scans thrash the SSD. PWC51 now provides 42.3K slots and covers
-//   the measured CSD127 pool (33.6K chunks). BWC below 32GB
-//   thrashes buckets from CSD ~115 (2.4-3.4x per-dim, measured). The
-//   process needs ~24GB non-pinned at CSD127, so total cache bytes still need
-//   to be kept below the 125GB host limit.
+//   full-pool scans thrash the SSD. PWC47 provides 39.0K slots, enough for a
+//   size-ratio-3.2 CSD128 pool (38.8K chunks). BWC below 32GB thrashes buckets
+//   from CSD ~115 (2.4-3.4x per-dim, measured). GPU UID dedup reduces the SWC
+//   working set enough to use an 8GB cache. The resulting 87GB arena budget
+//   leaves room for the ~8GB reducer staging and transient solution queues on
+//   this 125GB host; the previous 51/32/12 profile was OOM-killed at CSD127.
 // Fast persistence behavior is the DEFAULT (single-SSD tuning): lazy sync
 // on, pool persisted every 6th dim, no between-sieve pwc borrow. Restore
 // stock behavior with HD_LAZY_SYNC=0 HD_SYNC_EVERY=1 HD_PWC_NO_GROW=0.
-// Build with -DHD_SVP140_CACHE_PROFILE=1 for the 51/32/12 GB profile.
+// Build with -DHD_SVP140_CACHE_PROFILE=1 for the 47/32/8 GB profile.
 #define ONE_TIME_IO                     1
 #ifndef HD_SVP140_CACHE_PROFILE
 #define HD_SVP140_CACHE_PROFILE         0
 #endif
 #if HD_SVP140_CACHE_PROFILE
-#define PWC_DRAM_SLIMIT                 (51ULL << 30)
+#define PWC_DRAM_SLIMIT                 (47ULL << 30)
 #define BWC_DRAM_SLIMIT                 (32ULL << 30)
-#define SWC_DRAM_SLIMIT                 (12ULL << 30)
+#define SWC_DRAM_SLIMIT                 (8ULL << 30)
 #else
 #define PWC_DRAM_SLIMIT                 (14ULL << 30)
 #define BWC_DRAM_SLIMIT                 (24ULL << 30)

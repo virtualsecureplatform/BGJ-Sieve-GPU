@@ -9,7 +9,9 @@
 int _cuda_device_mem_info(int device_ptr, size_t *free_nbytes, size_t *total_nbytes);
 int _cuda_device_malloc(int device_ptr, void **ptr, size_t nbytes);
 int _cuda_device_free(int device_ptr, void *ptr);
-int _cuda_device_h2d(int device_ptr, void *dst, const void *src, size_t nbytes);
+int _cuda_device_h2d_pair_nonblocking(int device_ptr,
+                                      void *dst0, const void *src0, size_t nbytes0,
+                                      void *dst1, const void *src1, size_t nbytes1);
 
 #if ENABLE_PROFILING
 struct bwc_logger_t : public pwc_logger_t {
@@ -208,6 +210,7 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
     using pwc_manager_tmpl<logger_t>::release_sync;
     using pwc_manager_tmpl<logger_t>::sync_release;
     using pwc_manager_tmpl<logger_t>::__load_chunk;
+    using pwc_manager_tmpl<logger_t>::__wait_chunk_io;
     using pwc_manager_tmpl<logger_t>::_num_chunks;
     using pwc_manager_tmpl<logger_t>::_chunk_status;
     using pwc_manager_tmpl<logger_t>::_cached_chunks;

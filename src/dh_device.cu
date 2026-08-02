@@ -645,8 +645,8 @@ dhb_buffer_t::dhb_buffer_t(dh_bucketer_t *bucketer) {
     long nbytes_pinned = nbytes_task_vecs + nbytes_h_center + nbytes_h_data + nbytes_h_out * num_threads;
     nbytes_pinned = ((nbytes_pinned + 4095L) / 4096L) * 4096L;
     char *pinned_buf = NULL;
-    if (posix_memalign((void **)&pinned_buf, 4096, nbytes_pinned)) {
-        lg_err("posix_memalign failed");
+    if (_gpu_numa_host_alloc((void **)&pinned_buf, 4096, nbytes_pinned)) {
+        lg_err("GPU-NUMA host allocation failed");
     }
     CHECK_CUDA_ERR(cudaHostRegister(pinned_buf, nbytes_pinned, cudaHostAllocPortable));
     pinned_ram.fetch_add(nbytes_pinned, std::memory_order_relaxed);
@@ -929,8 +929,8 @@ dhr_buffer_t::dhr_buffer_t(dh_reducer_t *reducer, double target_length) {
     long nbytes_pinned = nbytes_task_vecs + nbytes_buc_vecs + nbytes_h_data + nbytes_h_res * num_threads;
     nbytes_pinned = ((nbytes_pinned + 4095L) / 4096L) * 4096L;
     char *pinned_buf = NULL;
-    if (posix_memalign((void **)&pinned_buf, 4096, nbytes_pinned)) {
-        lg_err("posix_memalign failed");
+    if (_gpu_numa_host_alloc((void **)&pinned_buf, 4096, nbytes_pinned)) {
+        lg_err("GPU-NUMA host allocation failed");
     }
     CHECK_CUDA_ERR(cudaHostRegister(pinned_buf, nbytes_pinned, cudaHostAllocPortable));
     pinned_ram.fetch_add(nbytes_pinned, std::memory_order_relaxed);

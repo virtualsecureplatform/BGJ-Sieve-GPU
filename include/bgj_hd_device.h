@@ -45,7 +45,11 @@ __global__ void filter_prepare_vec(int8_t *__restrict__ data, const int8_t *__re
 
 template <uint32_t CSD16>
 __global__ void filter_collect_sol(int8_t *vec_out, uint16_t *score_out, int32_t *norm_out, uint64_t *u_out, 
-                                   int *num_out, int out_max_size, int8_t *__restrict__ data, int n, int goal_score);
+                                   int *num_out, int out_max_size, int8_t *__restrict__ data, int n,
+                                   int goal_score, uint64_t *uid_keys, uint32_t *uid_tags,
+                                   uint32_t uid_hash_mask, uint32_t uid_epoch,
+                                   uint32_t *uid_occupied, uint32_t uid_insert_limit,
+                                   uint32_t *num_uid_dup, uint32_t *num_uid_bypass);
 
 struct buc_traits_t {
     typedef void (*l0_buc_kernel_t)(uint32_t *, int, int8_t *, int32_t *, const int8_t *, uint32_t,
@@ -100,7 +104,9 @@ struct red_traits_t {
     #endif
     typedef void (*fpv_kernel_t)(int8_t *, const int8_t *, int *, int);
     typedef void (*flt_kernel_t)(int8_t *, int n, local_data_t *);
-    typedef void (*fcs_kernel_t)(int8_t *, uint16_t *, int32_t *, uint64_t *, int *, int, int8_t *, int, int);
+    typedef void (*fcs_kernel_t)(int8_t *, uint16_t *, int32_t *, uint64_t *, int *, int,
+                                 int8_t *, int, int, uint64_t *, uint32_t *, uint32_t,
+                                 uint32_t, uint32_t *, uint32_t, uint32_t *, uint32_t *);
     typedef void (*bk_kernel_t)(uint32_t *, int, int8_t *, int32_t *, const int8_t *, uint32_t, const int8_t *, int *, float, int, int, int);
     
     static constexpr unsigned int taskChunks     = 8;
@@ -232,6 +238,8 @@ struct red_logger_t : public generic_logger_t {
     std::atomic<uint64_t>       ev_red_ssum;
     std::atomic<uint64_t>       ev_red_msum;
     std::atomic<uint64_t>       ev_red_usum;
+    std::atomic<uint64_t>       ev_uid_bypass;
+    std::atomic<uint64_t>       ev_uid_rotations;
     std::atomic<uint64_t>       ev_flt_num;
     std::atomic<uint64_t>       ev_flt_max;
     std::atomic<uint64_t>       ev_flt_ssum;
@@ -291,7 +299,8 @@ struct red_logger_t : public generic_logger_t {
         ev_bk0_num = ev_bk1_num = ev_bk2_num = ev_bk3_num = 0;
         ev_bk0_max = ev_bk1_max = ev_bk2_max = ev_bk3_max = 0;
         ev_bk0_ssum = ev_bk1_ssum = ev_bk2_ssum = ev_bk3_ssum = 0;
-        ev_red_max = ev_red_ssum = ev_red_msum = 0;
+        ev_red_max = ev_red_ssum = ev_red_msum = ev_red_usum = 0;
+        ev_uid_bypass = ev_uid_rotations = 0;
         ev_flt_max = ev_flt_ssum = ev_flt_num = 0;
         ev_fff_us = ev_upk_us = ev_h2d_us = ev_d2h_us = ev_ld_stall_us = ev_collect_us = 0;
         ev_h2d_nbytes = ev_d2h_nbytes = ev_ld_chunks = ev_st_chunks = 0;
@@ -362,7 +371,8 @@ struct red_buffer_holder_t {
     
     int bgjl_out(int tid, int sid, int *size, int8_t **h_vec, int32_t **h_norm, uint16_t **h_score, uint64_t **h_u);
     int bgjm_out(int tid, int sid, int *size, int8_t **h_vec, int32_t **h_norm, uint16_t **h_score, uint64_t **h_u);
-    int bgjs_out(int tid, int *size, int8_t **h_vec, int32_t **h_norm, uint16_t **h_score, uint64_t **h_u);
+    int bgjs_out(int tid, int *size, int8_t **h_vec, int32_t **h_norm,
+                 uint16_t **h_score, uint64_t **h_u, bool use_uid_dedup);
     int bgjs_h2d(int tid, chunk_t *chunk, int &used);
     int bgjs_d2d(int tid, const int8_t *d_vec, const int32_t *d_src_norm,
                  int size, int &used);
@@ -408,7 +418,9 @@ struct red_buffer_holder_t {
     #endif
     void (*fpv_kernel)(int8_t *, const int8_t *, int *, int);
     void (*flt_kernel)(int8_t *, int n, local_data_t *);
-    void (*fcs_kernel)(int8_t *, uint16_t *, int32_t *, uint64_t *, int *, int, int8_t *, int, int);
+    void (*fcs_kernel)(int8_t *, uint16_t *, int32_t *, uint64_t *, int *, int,
+                       int8_t *, int, int, uint64_t *, uint32_t *, uint32_t,
+                       uint32_t, uint32_t *, uint32_t, uint32_t *, uint32_t *);
     void (*bk1_kernel)(uint32_t *, int, int8_t *, int32_t *, const int8_t *, uint32_t, const int8_t *, int *, float, int, int, int);
     void (*bk2_kernel)(uint32_t *, int, int8_t *, int32_t *, const int8_t *, uint32_t, const int8_t *, int *, float, int, int, int);
     void (*bk3_kernel)(uint32_t *, int, int8_t *, int32_t *, const int8_t *, uint32_t, const int8_t *, int *, float, int, int, int);
@@ -452,6 +464,31 @@ struct red_buffer_holder_t {
     uint16_t **d_score_out, **h_score_out;
     int32_t  **d_norm_out, **h_norm_out;
     uint64_t **d_u_out, **h_u_out;
+
+    // Exact per-GPU UID deduplication for BGJ2. Workers on one GPU share a
+    // full-key table. Epochs rotate only after every active filter using the
+    // old epoch has completed; a load-limit bypass can lose optimization but
+    // never a candidate.
+    struct uid_device_table_t {
+        std::mutex mutex;
+        std::condition_variable cv;
+        uint64_t *d_keys = NULL;
+        uint32_t *d_tags = NULL;
+        uint32_t *d_occupied = NULL;
+        uint32_t hash_size = 0;
+        uint32_t hash_mask = 0;
+        uint32_t insert_limit = 0;
+        uint32_t epoch = 1;
+        int active = 0;
+        bool reset_pending = false;
+    };
+
+    bool uid_dedup = false;
+    uint32_t uid_worker_hash_size = 0;
+    uid_device_table_t *uid_tables = NULL;
+    uint32_t **d_num_uid_dup = NULL, **d_num_uid_bypass = NULL;
+    uint32_t uid_dedup_acquire(int id, int device_ptr, cudaStream_t stream);
+    void uid_dedup_release(int device_ptr, uint32_t bypassed);
 };
 
 struct buc_iterator_t {
@@ -647,6 +684,24 @@ struct Reducer_t {
     pthread_spinlock_t traffic_ctrl_lock;
     volatile int32_t ld_bk0_tids = 0;
 
+    // Dimension-independent host backpressure. Per-GPU reducer concurrency
+    // follows SWC occupancy with hysteresis so UID checking and pool insertion
+    // retain CPU and memory bandwidth when solutions backlog.
+    bool _adaptive_backpressure = true;
+    int _active_reducers[MAX_NUM_DEVICE] = {};
+    int _device_workers[MAX_NUM_DEVICE] = {};
+    int _backpressure_tier[MAX_NUM_DEVICE] = {};
+
+    // A GPU-deduplicated output must be guaranteed room in SWC: otherwise a
+    // UID could be remembered for a candidate that the bounded queue drops.
+    // Concurrent exact-filter outputs reserve their worst-case chunk count;
+    // calls that cannot reserve run fail-open without GPU UID filtering.
+    std::mutex _swc_output_mtx;
+    std::condition_variable _swc_output_cv;
+    long _reserved_swc_output_chunks = 0;
+    int _reserved_swc_outputs = 0;
+    bool _plain_swc_output_active = false;
+
     /// HD_MEASURE_INT4=1: debug-only precision probe for INT4 bucket
     /// coordinates (docs/indexed-buckets-design.md, "safe partial compression").
     /// On sampled buckets, compares int8 vs per-vector-scaled int4 reduce
@@ -665,6 +720,10 @@ struct Reducer_t {
     int _signal_bucket_done();
     int _signal_red_done();
     int _signal_red_stuck();
+    int _adaptive_reduce_limit(int device_ptr);
+    void _release_reduce_slot(int device_ptr);
+    bool _acquire_swc_output_reservation(long chunks);
+    void _release_swc_output_reservation(bool reserved, long chunks);
 
     long _num_threads = 0;
     thread_pool::thread_pool **_red_pool = NULL;
@@ -809,11 +868,13 @@ inline void red_logger_t::report(const char *key_func) {
         pg = real_num / (float) goal_num * 100.f;
     }
     
-    char r_str[16], rr_str[16], f_str[16], u_str[16];
+    char r_str[16], rr_str[16], f_str[16], u_str[16], d_str[16], x_str[16];
     ull_2_str(r_str, ev_red_ssum.load());
     ull_2_str(rr_str, (uint64_t)(ev_red_vmmas * 256.0 / ev_red_ssum.load()));
     ull_2_str(f_str, ev_flt_ssum.load());
     ull_2_str(u_str, ev_total_notin_ptr[0]);
+    ull_2_str(d_str, ev_red_usum.load());
+    ull_2_str(x_str, ev_uid_bypass.load());
     float f_r = ev_red_ssum.load() / (float) ev_flt_ssum.load();
     float u_r = ev_total_check_ptr[0] / (float) ev_total_notin_ptr[0];
 
@@ -868,8 +929,10 @@ inline void red_logger_t::report(const char *key_func) {
     float bk3_tbw = ev_bk3_vmmas.load() * (float)(512.0 * CSD16) * 1e-12 / bk3;
     float red_tbw = ev_red_vmmas.load() * (float)(512.0 * CSD16) * 1e-12 / red;
 
-    this->info("|%.2f%|g %d|r %s(%s)|f %s(%.2f)|u %s(%.2f)|, elapsed %.3fs, cpu: %.3fs(avg: %.2f), #thread %d #device %d",
-                pg, *ev_goal_score_ptr, r_str, rr_str, f_str, f_r, u_str, u_r, elapsed, cpu, avg_load, num_threads, num_devices);
+    this->info("|%.2f%|g %d|r %s(%s)|f %s(%.2f)|d %s(x %s,e %llu)|u %s(%.2f)|, elapsed %.3fs, cpu: %.3fs(avg: %.2f), #thread %d #device %d",
+                pg, *ev_goal_score_ptr, r_str, rr_str, f_str, f_r, d_str, x_str,
+                (unsigned long long)ev_uid_rotations.load(), u_str, u_r,
+                elapsed, cpu, avg_load, num_threads, num_devices);
     this->info("load stall: %.3fs(%.2f/%.2f GB/s), H2D: %.2fs(%.2f(%.2f) GB/s), D2H: %.2fs(%.2f(%.2f) GB/s), upk: %.2fs(%.2f(%.2f) GB/s)", 
                 ld_stall, bw_i, bw_o, h2d, h2d_bw, h2d_tbw, d2h, d2h_bw, d2h_tbw, upk, upk_bw, upk_tbw);
     if (strategy == Reducer_t::strategy_bgj1) {

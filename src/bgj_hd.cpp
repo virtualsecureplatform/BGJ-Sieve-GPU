@@ -192,10 +192,11 @@ template <class logger_t> bool bwc_manager_tmpl<logger_t>::__stage_bucket_to_hbm
     const size_t norm_capacity = Pool_hd_t::chunk_max_nvecs * sizeof(int32_t);
     for (int32_t i = 0; i < num_chunks; i++) {
         int8_t *slot = __hbm_slot(device_ptr, slots[i]);
-        if (_cuda_device_h2d(device_ptr, slot, chunks[i]->norm,
-                             chunks[i]->size * sizeof(int32_t)) ||
-            _cuda_device_h2d(device_ptr, slot + norm_capacity, chunks[i]->vec,
-                             (size_t)chunks[i]->size * this->_pool->CSD)) {
+        if (_cuda_device_h2d_pair_nonblocking(
+                device_ptr,
+                slot, chunks[i]->norm, chunks[i]->size * sizeof(int32_t),
+                slot + norm_capacity, chunks[i]->vec,
+                (size_t)chunks[i]->size * this->_pool->CSD)) {
             fprintf(stderr, "[Error] failed to stage bucket %d in GPU %d HBM\n",
                     bucket_id, hw::gpu_id_list[device_ptr]);
             abort();
@@ -536,17 +537,19 @@ template <class logger_t> void bwc_manager_tmpl<logger_t>::bucket_finalize(long 
         }
         pthread_spin_unlock(&_bwc_lock);
 
-        /// clean all chunks in the chunk list
-        struct timeval start, end;
-        gettimeofday(&start, NULL);
+        /// Clean all chunks in the chunk list. I/O completion is lossless:
+        /// wait for the worker that owns a busy chunk instead of abandoning
+        /// the remainder after an arbitrary ten-second deadline.
+        bool warned = false;
         while (num_chunks) {
+            int32_t busy_id = -1;
             for (int32_t i = num_chunks - 1; i >= 0; i--) {
                 int32_t id = _bucket[bucket_id].chunk_ids[i];
-                if (_chunk_status[id] & (_ck_syncing | _ck_loading)) continue;
                 pthread_spin_lock(&_locks[id % pwc_locks]);
                 if ((_chunk_status_vol[id] & (_ck_syncing | _ck_loading)) == 0) {
                     _chunk_status[id] |= _ck_writing | _ck_loading;
                 } else {
+                    busy_id = id;
                     pthread_spin_unlock(&_locks[id % pwc_locks]);
                     continue;
                 }
@@ -555,12 +558,13 @@ template <class logger_t> void bwc_manager_tmpl<logger_t>::bucket_finalize(long 
                 release_del(id);
             }
 
-            gettimeofday(&end, NULL);
-            if (end.tv_sec - start.tv_sec + (end.tv_usec - start.tv_usec) * 1e-6 > 10.0) {
-                lg_err("%d chunks still loading/syncing after 10 seconds, discarded", num_chunks);
-                for (int32_t i = num_chunks - 1; i >= 0; i--) 
-                    _chunk_status[_bucket[bucket_id].chunk_ids[i]] &= ~(_ck_writing | _ck_reading);
-                break;
+            if (num_chunks && busy_id >= 0 &&
+                !__wait_chunk_io(busy_id, std::chrono::seconds(10))) {
+                if (!warned) {
+                    lg_warn("%d chunks still loading/syncing after 10 seconds; waiting losslessly",
+                            num_chunks);
+                    warned = true;
+                }
             }
         }
 

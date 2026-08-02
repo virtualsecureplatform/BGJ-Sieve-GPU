@@ -886,8 +886,8 @@ buc_buffer_holder_t::buc_buffer_holder_t(Bucketer_t *bucketer) {
     long nbytes_pinned = nbytes_task_vecs + nbytes_h_center16 + (nbytes_h_norm + nbytes_h_out) * num_threads;
     nbytes_pinned = ((nbytes_pinned + 4095L) / 4096L) * 4096L;
     char *pinned_buf = NULL;
-    if (posix_memalign((void **)&pinned_buf, 4096, nbytes_pinned)) {
-        lg_err("posix_memalign failed");
+    if (_gpu_numa_host_alloc((void **)&pinned_buf, 4096, nbytes_pinned)) {
+        lg_err("GPU-NUMA host allocation failed");
     }
     CHECK_CUDA_ERR(cudaHostRegister(pinned_buf, nbytes_pinned, cudaHostAllocPortable));
     pinned_ram.fetch_add(nbytes_pinned, std::memory_order_relaxed);
@@ -1579,9 +1579,25 @@ int Bucketer_t::run() {
         lg_dbg("batch done, current #buc: %ld / %ld, goal_norm %d, goal_score %d(%.4f)", 
                 _bwc->num_ready(), _num_buc_slimit, _reducer->goal_norm, _reducer->goal_score, old_nss / (float)old_oss);
 
-        for (int i = 0; i < batch0; i++) _bwc->bucket_finalize(buc_id[i]);    
-
-        _signal_new_buc_ready();    
+        // Finalization can include host-cache release and exact HBM staging.
+        // Run independent buckets concurrently and wake reducers as soon as
+        // each one is consumable instead of presenting the entire batch at
+        // once after a long GPU-idle gap.
+        const char *finalize_env = getenv("HD_BWC_FINALIZE_THREADS");
+        int finalize_threads = finalize_env ? atoi(finalize_env) : 2 * hw::gpu_num;
+        if (finalize_threads < 1) finalize_threads = 1;
+        if (finalize_threads > _num_threads) finalize_threads = _num_threads;
+        if (finalize_threads > batch0) finalize_threads = batch0;
+        for (int tid = 0; tid < finalize_threads; tid++) {
+            _buc_pool[tid]->push([this, tid, batch0, finalize_threads] {
+                for (int i = tid; i < batch0; i += finalize_threads) {
+                    _bwc->bucket_finalize(buc_id[i]);
+                    _signal_new_buc_ready();
+                }
+            });
+        }
+        for (int tid = 0; tid < finalize_threads; tid++)
+            _buc_pool[tid]->wait_sleep();
 
         if (_sieve_is_over() || (flag & flag_stuck)) {
             _signal_buc_done();
@@ -1976,6 +1992,15 @@ red_buffer_holder_t::red_buffer_holder_t(Reducer_t *reducer) {
     this->bgj4_repeat       = reducer->bgj4_repeat;
     local_data              = (local_data_t **) malloc(MAX_NUM_DEVICE * sizeof(local_data_t *));
 
+    const char *uid_dedup_env = getenv("HD_GPU_UID_DEDUP");
+    uid_dedup = strategy == Reducer_t::strategy_bgj2 &&
+                (!uid_dedup_env || atoi(uid_dedup_env) != 0);
+    if (uid_dedup) {
+        uint64_t needed = 2ULL * flt_out_max_size;
+        uid_worker_hash_size = 1;
+        while (uid_worker_hash_size < needed) uid_worker_hash_size <<= 1;
+    }
+
     #if USE_GRAPH
     this->out_max_size_i    = this->out_max_size;
     this->bk1_max_size_i    = this->bk1_max_size;
@@ -2041,6 +2066,29 @@ red_buffer_holder_t::red_buffer_holder_t(Reducer_t *reducer) {
     this->used_gram      = (long *) calloc(num_devices, sizeof(long));
     this->sstreams    = (cudaStream_t *) malloc(num_threads * tpb * sizeof(cudaStream_t));
 
+    if (uid_dedup) {
+        uid_tables = new uid_device_table_t[num_devices];
+        const char *load_env = getenv("HD_GPU_UID_SHARED_LOAD_PCT");
+        int load_pct = load_env ? atoi(load_env) : 60;
+        if (load_pct < 25) load_pct = 25;
+        if (load_pct > 80) load_pct = 80;
+        for (int device_ptr = 0; device_ptr < num_devices; device_ptr++) {
+            int workers = 0;
+            for (int tid = 0; tid < num_threads; tid++)
+                if (hw::gpu_ptr(tid, num_threads) == device_ptr) workers++;
+            uint64_t budget_slots = (uint64_t)uid_worker_hash_size * workers;
+            uint64_t shared_slots = 1;
+            while ((shared_slots << 1) <= budget_slots &&
+                   (shared_slots << 1) <= (1ULL << 31)) shared_slots <<= 1;
+            uid_tables[device_ptr].hash_size = (uint32_t)shared_slots;
+            uid_tables[device_ptr].hash_mask = (uint32_t)shared_slots - 1;
+            uid_tables[device_ptr].insert_limit =
+                (uint32_t)(shared_slots * (uint64_t)load_pct / 100);
+        }
+        lg_dbg("shared GPU UID dedup enabled, load limit %d%%, per-worker budget %.2f MiB",
+               load_pct, uid_worker_hash_size * 12.0 / (1 << 20));
+    }
+
     #if ENABLE_PROFILING
     this->logger->num_devices = this->num_devices;
     this->logger->num_threads = this->num_threads;
@@ -2098,8 +2146,8 @@ red_buffer_holder_t::red_buffer_holder_t(Reducer_t *reducer) {
                          ((strategy == Reducer_t::strategy_bgj4 || strategy == Reducer_t::strategy_bgj3l) ? tpb : 1) * nbytes_h_norm * num_threads;
     nbytes_pinned = ((nbytes_pinned + 4095L) / 4096L) * 4096L;
     char *pinned_buf = NULL;
-    if (posix_memalign((void **)&pinned_buf, 4096, nbytes_pinned)) {
-        lg_err("posix_memalign failed");
+    if (_gpu_numa_host_alloc((void **)&pinned_buf, 4096, nbytes_pinned)) {
+        lg_err("GPU-NUMA host allocation failed");
     }
     CHECK_CUDA_ERR(cudaHostRegister(pinned_buf, nbytes_pinned, cudaHostAllocPortable));
     pinned_ram.fetch_add(nbytes_pinned, std::memory_order_relaxed);
@@ -2143,6 +2191,8 @@ red_buffer_holder_t::red_buffer_holder_t(Reducer_t *reducer) {
     h_norm_out      = (int32_t **) malloc(num_threads * tpb * sizeof(int32_t *));
     d_u_out         = (uint64_t **) malloc(num_threads * tpb * sizeof(uint64_t *));
     h_u_out         = (uint64_t **) malloc(num_threads * tpb * sizeof(uint64_t *));
+    d_num_uid_dup   = (uint32_t **) calloc(num_threads * tpb, sizeof(uint32_t *));
+    d_num_uid_bypass = (uint32_t **) calloc(num_threads * tpb, sizeof(uint32_t *));
     
     /// random and graph
     state               = (curandState **) malloc(num_threads * tpb * sizeof(curandState*));
@@ -2231,6 +2281,45 @@ red_buffer_holder_t::red_buffer_holder_t(Reducer_t *reducer) {
     }
 }
 
+uint32_t red_buffer_holder_t::uid_dedup_acquire(int id, int device_ptr,
+                                                cudaStream_t stream) {
+    if (!uid_dedup) return 0;
+    uid_device_table_t &table = uid_tables[device_ptr];
+    std::unique_lock<std::mutex> lock(table.mutex);
+    while (table.reset_pending && table.active) table.cv.wait(lock);
+    if (table.reset_pending) {
+        CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[device_ptr]));
+        if (++table.epoch >= 0x3ffffffeU) {
+            CHECK_CUDA_ERR(cudaMemsetAsync(table.d_tags, 0,
+                                           (size_t)table.hash_size * sizeof(uint32_t), stream));
+            table.epoch = 1;
+        }
+        CHECK_CUDA_ERR(cudaMemsetAsync(table.d_occupied, 0, sizeof(uint32_t), stream));
+        CHECK_CUDA_ERR(cudaStreamSynchronize(stream));
+        table.reset_pending = false;
+        #if ENABLE_PROFILING
+        logger->ev_uid_rotations++;
+        #endif
+        table.cv.notify_all();
+    }
+    table.active++;
+    const uint32_t epoch = table.epoch;
+    lock.unlock();
+
+    CHECK_CUDA_ERR(cudaMemsetAsync(d_num_uid_dup[id], 0, sizeof(uint32_t), stream));
+    CHECK_CUDA_ERR(cudaMemsetAsync(d_num_uid_bypass[id], 0, sizeof(uint32_t), stream));
+    return epoch;
+}
+
+void red_buffer_holder_t::uid_dedup_release(int device_ptr, uint32_t bypassed) {
+    if (!uid_dedup) return;
+    uid_device_table_t &table = uid_tables[device_ptr];
+    std::lock_guard<std::mutex> lock(table.mutex);
+    if (bypassed) table.reset_pending = true;
+    table.active--;
+    table.cv.notify_all();
+}
+
 red_buffer_holder_t::~red_buffer_holder_t() {
     for (int i = 0; i < num_devices; i++) {
         CHECK_CUDA_ERR(cudaFree(local_data[i]));
@@ -2274,6 +2363,9 @@ red_buffer_holder_t::~red_buffer_holder_t() {
     free(h_norm_out);
     free(d_u_out);
     free(h_u_out);
+    free(d_num_uid_dup);
+    free(d_num_uid_bypass);
+    delete[] uid_tables;
     free(state);
     free(statte);
     #if USE_GRAPH
@@ -2470,19 +2562,44 @@ int red_buffer_holder_t::device_init(int tid, int sid) {
 
     long _used_gram = 0;
 
+    const bool first_device_worker =
+        tid == 0 || hw::gpu_ptr(tid - 1, num_threads) != device_ptr;
+    if (uid_dedup && first_device_worker) {
+        uid_device_table_t &table = uid_tables[device_ptr];
+        CHECK_CUDA_ERR(cudaMalloc(&table.d_keys,
+                                  (size_t)table.hash_size * sizeof(uint64_t)));
+        CHECK_CUDA_ERR(cudaMalloc(&table.d_tags,
+                                  (size_t)table.hash_size * sizeof(uint32_t)));
+        CHECK_CUDA_ERR(cudaMalloc(&table.d_occupied, sizeof(uint32_t)));
+        CHECK_CUDA_ERR(cudaMemsetAsync(table.d_tags, 0,
+                                       (size_t)table.hash_size * sizeof(uint32_t),
+                                       streams[tid]));
+        CHECK_CUDA_ERR(cudaMemsetAsync(table.d_occupied, 0, sizeof(uint32_t),
+                                       streams[tid]));
+        _used_gram += (size_t)table.hash_size * (sizeof(uint64_t) + sizeof(uint32_t)) +
+                      sizeof(uint32_t);
+    }
+
     for (int t = 0; t < tpb; t++) {
-        CHECK_CUDA_ERR(cudaMalloc(&d_num_red_out[tid * tpb + t], sizeof(int)));
-        CHECK_CUDA_ERR(cudaMalloc(&d_red_out[tid * tpb + t], out_max_size * 2L * sizeof(int)));
-        CHECK_CUDA_ERR(cudaMalloc(&d_num_flt_out[tid * tpb + t], sizeof(int)));
-        CHECK_CUDA_ERR(cudaMalloc(&d_vec_out[tid * tpb + t], flt_out_max_size * CSD16 * sizeof(int8_t)));
-        CHECK_CUDA_ERR(cudaMalloc(&d_score_out[tid * tpb + t], flt_out_max_size * sizeof(uint16_t)));
-        CHECK_CUDA_ERR(cudaMalloc(&d_norm_out[tid * tpb + t], flt_out_max_size * sizeof(int32_t)));
-        CHECK_CUDA_ERR(cudaMalloc(&d_u_out[tid * tpb + t], flt_out_max_size * sizeof(uint64_t)));
-        CHECK_CUDA_ERR(cudaMalloc(&data[tid * tpb + t], (2 + 4 + 8 + Pool_hd_t::vec_nbytes) * (long) filter_taskVecs));
-        _used_gram += sizeof(int) + out_max_size * 2 * sizeof(int) + sizeof(int) + 
-                      flt_out_max_size * CSD16 * sizeof(int8_t) + flt_out_max_size * sizeof(uint16_t) + 
-                      flt_out_max_size * sizeof(int32_t) + flt_out_max_size * sizeof(uint64_t) + 
+        const int id = tid * tpb + t;
+        CHECK_CUDA_ERR(cudaMalloc(&d_num_red_out[id], sizeof(int)));
+        CHECK_CUDA_ERR(cudaMalloc(&d_red_out[id], out_max_size * 2L * sizeof(int)));
+        CHECK_CUDA_ERR(cudaMalloc(&d_num_flt_out[id], sizeof(int)));
+        CHECK_CUDA_ERR(cudaMalloc(&d_vec_out[id], flt_out_max_size * CSD16 * sizeof(int8_t)));
+        CHECK_CUDA_ERR(cudaMalloc(&d_score_out[id], flt_out_max_size * sizeof(uint16_t)));
+        CHECK_CUDA_ERR(cudaMalloc(&d_norm_out[id], flt_out_max_size * sizeof(int32_t)));
+        CHECK_CUDA_ERR(cudaMalloc(&d_u_out[id], flt_out_max_size * sizeof(uint64_t)));
+        CHECK_CUDA_ERR(cudaMalloc(&data[id], (2 + 4 + 8 + Pool_hd_t::vec_nbytes) * (long) filter_taskVecs));
+        _used_gram += sizeof(int) + out_max_size * 2 * sizeof(int) + sizeof(int) +
+                      flt_out_max_size * CSD16 * sizeof(int8_t) + flt_out_max_size * sizeof(uint16_t) +
+                      flt_out_max_size * sizeof(int32_t) + flt_out_max_size * sizeof(uint64_t) +
                       (2 + 4 + 8 + Pool_hd_t::vec_nbytes) * filter_taskVecs;
+
+        if (uid_dedup) {
+            CHECK_CUDA_ERR(cudaMalloc(&d_num_uid_dup[id], sizeof(uint32_t)));
+            CHECK_CUDA_ERR(cudaMalloc(&d_num_uid_bypass[id], sizeof(uint32_t)));
+            _used_gram += 2 * sizeof(uint32_t);
+        }
 
         if (t == 0) {
             long d_norm_vecs = buc_max_size > traits::taskVecs ? buc_max_size : traits::taskVecs;
@@ -2653,19 +2770,40 @@ int red_buffer_holder_t::device_done(int tid, int sid) {
 
     long _used_gram = 0;
 
+    const bool first_device_worker =
+        tid == 0 || hw::gpu_ptr(tid - 1, num_threads) != device_ptr;
+    if (uid_dedup && first_device_worker) {
+        uid_device_table_t &table = uid_tables[device_ptr];
+        CHECK_CUDA_ERR(cudaFree(table.d_keys));
+        CHECK_CUDA_ERR(cudaFree(table.d_tags));
+        CHECK_CUDA_ERR(cudaFree(table.d_occupied));
+        _used_gram += (size_t)table.hash_size * (sizeof(uint64_t) + sizeof(uint32_t)) +
+                      sizeof(uint32_t);
+        table.d_keys = NULL;
+        table.d_tags = NULL;
+        table.d_occupied = NULL;
+    }
+
     for (int t = 0; t < tpb; t++) {
-        CHECK_CUDA_ERR(cudaFree(d_num_red_out[tid * tpb + t]));
-        CHECK_CUDA_ERR(cudaFree(d_red_out[tid * tpb + t]));
-        CHECK_CUDA_ERR(cudaFree(d_num_flt_out[tid * tpb + t]));
-        CHECK_CUDA_ERR(cudaFree(d_vec_out[tid * tpb + t]));
-        CHECK_CUDA_ERR(cudaFree(d_score_out[tid * tpb + t]));
-        CHECK_CUDA_ERR(cudaFree(d_norm_out[tid * tpb + t]));
-        CHECK_CUDA_ERR(cudaFree(d_u_out[tid * tpb + t]));
-        CHECK_CUDA_ERR(cudaFree(data[tid * tpb + t]));
+        const int id = tid * tpb + t;
+        CHECK_CUDA_ERR(cudaFree(d_num_red_out[id]));
+        CHECK_CUDA_ERR(cudaFree(d_red_out[id]));
+        CHECK_CUDA_ERR(cudaFree(d_num_flt_out[id]));
+        CHECK_CUDA_ERR(cudaFree(d_vec_out[id]));
+        CHECK_CUDA_ERR(cudaFree(d_score_out[id]));
+        CHECK_CUDA_ERR(cudaFree(d_norm_out[id]));
+        CHECK_CUDA_ERR(cudaFree(d_u_out[id]));
+        CHECK_CUDA_ERR(cudaFree(data[id]));
         _used_gram += sizeof(int) + out_max_size * 2 * sizeof(int) + sizeof(int) +
-                      flt_out_max_size * CSD16 * sizeof(int8_t) + flt_out_max_size * sizeof(uint16_t) + 
-                      flt_out_max_size * sizeof(int32_t) + flt_out_max_size * sizeof(uint64_t) + 
+                      flt_out_max_size * CSD16 * sizeof(int8_t) + flt_out_max_size * sizeof(uint16_t) +
+                      flt_out_max_size * sizeof(int32_t) + flt_out_max_size * sizeof(uint64_t) +
                       (2 + 4 + 8 + Pool_hd_t::vec_nbytes) * filter_taskVecs;
+
+        if (uid_dedup) {
+            CHECK_CUDA_ERR(cudaFree(d_num_uid_dup[id]));
+            CHECK_CUDA_ERR(cudaFree(d_num_uid_bypass[id]));
+            _used_gram += 2 * sizeof(uint32_t);
+        }
 
         if (t == 0) {
             int d_norm_vecs = buc_max_size > traits::taskVecs ? buc_max_size : traits::taskVecs;
@@ -2919,7 +3057,9 @@ int red_buffer_holder_t::bgj1_run(int tid) {
     return 0;
 }
 
-int red_buffer_holder_t::bgjs_out(int tid, int *size, int8_t **h_vec, int32_t **h_norm, uint16_t **h_score, uint64_t **h_u) {
+int red_buffer_holder_t::bgjs_out(int tid, int *size, int8_t **h_vec, int32_t **h_norm,
+                                  uint16_t **h_score, uint64_t **h_u,
+                                  bool use_uid_dedup) {
     CHECK_CUDA_ERR(cudaMemcpyAsync(h_num_flt_out[tid], d_num_red_out[tid], sizeof(int), cudaMemcpyDeviceToHost, streams[tid]));
     CHECK_CUDA_ERR(cudaMemsetAsync(d_num_flt_out[tid], 0, sizeof(int), streams[tid]));
     CHECK_CUDA_ERR(cudaStreamSynchronize(streams[tid]));
@@ -2941,22 +3081,49 @@ int red_buffer_holder_t::bgjs_out(int tid, int *size, int8_t **h_vec, int32_t **
     #if ENABLE_PROFILING
     CHECK_CUDA_ERR(cudaEventRecord(logger->fff_start[tid], streams[tid]));
     #endif
+    uid_device_table_t *uid_table = use_uid_dedup ? &uid_tables[device_ptr] : NULL;
+    const uint32_t uid_epoch = use_uid_dedup ?
+        uid_dedup_acquire(tid, device_ptr, streams[tid]) : 0;
     for (int i = 0; i < to_flt; i += filter_taskVecs) {
         int batch_num = to_flt - i < filter_taskVecs ? to_flt - i : filter_taskVecs;
         fpv_kernel<<<fpv_blocks, fpv_threads, fpv_shmem, streams[tid]>>>(data[tid], d_vec16[tid], d_red_out[tid] + 2 * i, batch_num);
         flt_kernel<<<check_traits::kernelBlocks, check_traits::blockThreads, check_traits::dynamic_shmem, streams[tid]>>>(
             data[tid], batch_num, local_data[device_ptr]
         );
-        fcs_kernel<<<fcs_blocks, fcs_threads, fcs_shmem, streams[tid]>>>(d_vec_out[tid], d_score_out[tid], 
-            d_norm_out[tid], d_u_out[tid], d_num_flt_out[tid], flt_out_max_size, data[tid], batch_num, reducer->goal_score);
+        fcs_kernel<<<fcs_blocks, fcs_threads, fcs_shmem, streams[tid]>>>(d_vec_out[tid], d_score_out[tid],
+            d_norm_out[tid], d_u_out[tid], d_num_flt_out[tid], flt_out_max_size, data[tid],
+            batch_num, reducer->goal_score,
+            uid_table ? uid_table->d_keys : NULL,
+            uid_table ? uid_table->d_tags : NULL,
+            uid_table ? uid_table->hash_mask : 0,
+            uid_epoch,
+            uid_table ? uid_table->d_occupied : NULL,
+            uid_table ? uid_table->insert_limit : 0,
+            use_uid_dedup ? d_num_uid_dup[tid] : NULL,
+            use_uid_dedup ? d_num_uid_bypass[tid] : NULL);
     }
     #if ENABLE_PROFILING
     CHECK_CUDA_ERR(cudaEventRecord(logger->fff_stop[tid], streams[tid]));
     #endif
 
     CHECK_CUDA_ERR(cudaMemcpyAsync(h_num_flt_out[tid], d_num_flt_out[tid], sizeof(int), cudaMemcpyDeviceToHost, streams[tid]));
+    if (use_uid_dedup)
+        CHECK_CUDA_ERR(cudaMemcpyAsync(h_num_flt_out[tid] + 1, d_num_uid_dup[tid],
+                                       sizeof(uint32_t), cudaMemcpyDeviceToHost, streams[tid]));
+    if (use_uid_dedup)
+        CHECK_CUDA_ERR(cudaMemcpyAsync(h_num_flt_out[tid] + 2, d_num_uid_bypass[tid],
+                                       sizeof(uint32_t), cudaMemcpyDeviceToHost, streams[tid]));
     CHECK_CUDA_ERR(cudaStreamSynchronize(streams[tid]));
+    if (use_uid_dedup && h_num_flt_out[tid][0] > flt_out_max_size) {
+        lg_err("thread %d produced %d filtered vectors for a %d-vector buffer; "
+               "stopping to avoid retaining UIDs for truncated candidates",
+               tid, h_num_flt_out[tid][0], flt_out_max_size);
+        abort();
+    }
+    if (use_uid_dedup) uid_dedup_release(device_ptr, (uint32_t)h_num_flt_out[tid][2]);
     #if ENABLE_PROFILING
+    if (use_uid_dedup) logger->ev_red_usum += (uint32_t)h_num_flt_out[tid][1];
+    if (use_uid_dedup) logger->ev_uid_bypass += (uint32_t)h_num_flt_out[tid][2];
     logger->ev_flt_max = std::max((int)logger->ev_flt_max.load(), h_num_flt_out[tid][0]);
     logger->ev_flt_ssum += std::min((long)h_num_flt_out[tid][0], flt_out_max_size);
     CHECK_CUDA_ERR(cudaEventRecord(logger->d2h_start[tid], streams[tid]));
@@ -3163,8 +3330,9 @@ int red_buffer_holder_t::bgjm_out(int tid, int sid, int *size, int8_t **h_vec, i
         flt_kernel<<<check_traits::kernelBlocks, check_traits::blockThreads, check_traits::dynamic_shmem, sstreams[id]>>>(
             data[id], batch_num, local_data[device_ptr]
         );
-        fcs_kernel<<<fcs_blocks, fcs_threads, fcs_shmem, sstreams[id]>>>(d_vec_out[id], d_score_out[id], 
-            d_norm_out[id], d_u_out[id], d_num_flt_out[id], flt_out_max_size, data[id], batch_num, reducer->goal_score);
+        fcs_kernel<<<fcs_blocks, fcs_threads, fcs_shmem, sstreams[id]>>>(d_vec_out[id], d_score_out[id],
+            d_norm_out[id], d_u_out[id], d_num_flt_out[id], flt_out_max_size, data[id],
+            batch_num, reducer->goal_score, NULL, NULL, 0, 0, NULL, 0, NULL, NULL);
     }
     #if ENABLE_PROFILING
     CHECK_CUDA_ERR(cudaEventRecord(logger->fff_stop[id], sstreams[id]));
@@ -3569,8 +3737,9 @@ int red_buffer_holder_t::bgj3l_run(int tid, int sid) {
         flt_kernel<<<check_traits::kernelBlocks, check_traits::blockThreads, check_traits::dynamic_shmem, sstreams[id]>>>(
             data[id], batch_num, local_data[device_ptr]
         );
-        fcs_kernel<<<fcs_blocks, fcs_threads, fcs_shmem, sstreams[id]>>>(d_vec_out[id], d_score_out[id], 
-            d_norm_out[id], d_u_out[id], d_num_flt_out[id], flt_out_max_size, data[id], batch_num, reducer->goal_score);
+        fcs_kernel<<<fcs_blocks, fcs_threads, fcs_shmem, sstreams[id]>>>(d_vec_out[id], d_score_out[id],
+            d_norm_out[id], d_u_out[id], d_num_flt_out[id], flt_out_max_size, data[id],
+            batch_num, reducer->goal_score, NULL, NULL, 0, 0, NULL, 0, NULL, NULL);
     }
     #if ENABLE_PROFILING
     CHECK_CUDA_ERR(cudaEventRecord(logger->fff_stop[id], sstreams[id]));
@@ -3729,8 +3898,9 @@ int red_buffer_holder_t::bgj4_run(int tid, int sid) {
         flt_kernel<<<check_traits::kernelBlocks, check_traits::blockThreads, check_traits::dynamic_shmem, sstreams[id]>>>(
             data[id], batch_num, local_data[device_ptr]
         );
-        fcs_kernel<<<fcs_blocks, fcs_threads, fcs_shmem, sstreams[id]>>>(d_vec_out[id], d_score_out[id], 
-            d_norm_out[id], d_u_out[id], d_num_flt_out[id], flt_out_max_size, data[id], batch_num, reducer->goal_score);
+        fcs_kernel<<<fcs_blocks, fcs_threads, fcs_shmem, sstreams[id]>>>(d_vec_out[id], d_score_out[id],
+            d_norm_out[id], d_u_out[id], d_num_flt_out[id], flt_out_max_size, data[id],
+            batch_num, reducer->goal_score, NULL, NULL, 0, 0, NULL, 0, NULL, NULL);
     }
     #if ENABLE_PROFILING
     CHECK_CUDA_ERR(cudaEventRecord(logger->fff_stop[id], sstreams[id]));
@@ -3755,6 +3925,9 @@ Reducer_t::Reducer_t(Pool_hd_t *pool, bwc_manager_t *bwc, swc_manager_t *swc, ut
 
     pthread_spin_init(&stuck_stat_lock, PTHREAD_PROCESS_SHARED);
     pthread_spin_init(&traffic_ctrl_lock, PTHREAD_PROCESS_SHARED);
+
+    const char *backpressure_env = getenv("HD_ADAPTIVE_BACKPRESSURE");
+    _adaptive_backpressure = !backpressure_env || atoi(backpressure_env) != 0;
 
     this->set_pool(pool);
     this->set_bwc_manager(bwc);
@@ -3877,6 +4050,15 @@ int Reducer_t::auto_bgj_params_set(int bgj) {
     }
     if (expect_num_threads < 1) expect_num_threads = 1;
     if (!this->_num_threads) this->set_num_threads(expect_num_threads);
+    for (int device_ptr = 0; device_ptr < hw::gpu_num; device_ptr++) {
+        _device_workers[device_ptr] = 0;
+        _active_reducers[device_ptr] = 0;
+        _backpressure_tier[device_ptr] = 0;
+    }
+    for (int tid = 0; tid < _num_threads; tid++)
+        _device_workers[hw::gpu_ptr(tid, _num_threads)]++;
+    if (_strategy == strategy_bgj2 && _adaptive_backpressure)
+        lg_dbg("adaptive reducer backpressure enabled (SWC tiers 80/90/97%%)");
 
     // Large-bucket strategies still require host chunk pointers for their CPU
     // preprocessing. Small/medium strategies can consume exact ready chunks
@@ -4061,16 +4243,91 @@ int Reducer_t::run() {
     return ret;
 }
 
+// Called with _red_mtx held. Keep the normal reducer pipeline unrestricted;
+// these high-water tiers are a safety valve for a host checker that falls far
+// enough behind to approach the bounded SWC limit.  The gaps on the way down
+// keep workers from flapping around a boundary.
+int Reducer_t::_adaptive_reduce_limit(int device_ptr) {
+    const int workers = _device_workers[device_ptr];
+    if (!_adaptive_backpressure || _strategy != strategy_bgj2 ||
+        _num_sol_chunks_slimit <= 0 || workers <= 1) return workers;
+
+    const long using_chunks = _swc->num_using();
+    int pressure_pct = (int)(100 * using_chunks / _num_sol_chunks_slimit);
+    if (pressure_pct > 100) pressure_pct = 100;
+
+    static constexpr int up[3] = {80, 90, 97};
+    static constexpr int down[3] = {75, 85, 92};
+    int tier = _backpressure_tier[device_ptr];
+    while (tier < 3 && pressure_pct >= up[tier]) tier++;
+    while (tier > 0 && pressure_pct < down[tier - 1]) tier--;
+    if (tier != _backpressure_tier[device_ptr]) {
+        _backpressure_tier[device_ptr] = tier;
+        lg_dbg("GPU %d reducer backpressure tier %d, SWC %ld/%ld chunks (%d%%)",
+               hw::gpu_id_list[device_ptr], tier, using_chunks,
+               (long)_num_sol_chunks_slimit, pressure_pct);
+    }
+
+    int limit = (workers * (4 - tier) + 3) / 4;
+    if (limit < 1) limit = 1;
+    return limit;
+}
+
+void Reducer_t::_release_reduce_slot(int device_ptr) {
+    std::lock_guard<std::mutex> lock(_red_mtx);
+    if (_active_reducers[device_ptr] > 0) _active_reducers[device_ptr]--;
+    _red_cv.notify_all();
+}
+
+bool Reducer_t::_acquire_swc_output_reservation(long chunks) {
+    std::unique_lock<std::mutex> lock(_swc_output_mtx);
+    for (;;) {
+        if (!_plain_swc_output_active &&
+            _swc->num_using() + _reserved_swc_output_chunks + chunks <=
+                _num_sol_chunks_slimit) {
+            _reserved_swc_output_chunks += chunks;
+            _reserved_swc_outputs++;
+            return true;
+        }
+        if (!_plain_swc_output_active && _reserved_swc_outputs == 0) {
+            // No worst-case guarantee is possible. Serialize this fail-open
+            // call against exact-filter calls so it cannot consume capacity
+            // they reserved, then retain the original unfiltered behavior.
+            _plain_swc_output_active = true;
+            return false;
+        }
+        _swc_output_cv.wait(lock);
+    }
+}
+
+void Reducer_t::_release_swc_output_reservation(bool reserved, long chunks) {
+    std::lock_guard<std::mutex> lock(_swc_output_mtx);
+    if (reserved) {
+        _reserved_swc_output_chunks -= chunks;
+        _reserved_swc_outputs--;
+    } else {
+        _plain_swc_output_active = false;
+    }
+    _swc_output_cv.notify_all();
+}
+
 int Reducer_t::_reduce(int tid) {
     constexpr long vec_nbytes = Pool_hd_t::vec_nbytes;
     const int device_ptr = hw::gpu_ptr(tid, _num_threads);
 
     for (;;) {
         long bucket_id = -1;
+        bool owns_reduce_slot = false;
         std::unique_lock<std::mutex> red_lock(_red_mtx);
-        _red_cv.wait(red_lock, [this, &bucket_id, device_ptr] {
+        _red_cv.wait(red_lock, [this, &bucket_id, &owns_reduce_slot, device_ptr] {
             if (flag & flag_stop_now) return true;
+            if (_active_reducers[device_ptr] >= _adaptive_reduce_limit(device_ptr))
+                return false;
             bucket_id = _bwc->pop_bucket(device_ptr);
+            if (bucket_id >= 0) {
+                _active_reducers[device_ptr]++;
+                owns_reduce_slot = true;
+            }
             return bucket_id >= 0 || (flag & flag_stop);
         });
         red_lock.unlock();
@@ -4081,6 +4338,7 @@ int Reducer_t::_reduce(int tid) {
 
         if (_swc->num_using() >= _num_sol_chunks_slimit) {
             _bwc->bucket_finalize(bucket_id);
+            if (owns_reduce_slot) _release_reduce_slot(device_ptr);
             _signal_bucket_done();
             continue;
         }
@@ -4197,6 +4455,7 @@ int Reducer_t::_reduce(int tid) {
         }
 
         _bwc->bucket_finalize(bucket_id);
+        if (owns_reduce_slot) _release_reduce_slot(device_ptr);
 
         _signal_bucket_done();
 
@@ -4216,8 +4475,18 @@ int Reducer_t::_red_out_2_swc(int tid, int sid) {
     uint16_t *h_score;
     uint64_t *h_u;
 
+    bool use_uid_dedup = false;
+    long swc_reservation = 0;
+    if (_strategy == strategy_bgj2 && _red_buf->uid_dedup) {
+        swc_reservation =
+            (_red_buf->flt_out_max_size + Pool_hd_t::chunk_max_nvecs - 1) /
+            Pool_hd_t::chunk_max_nvecs;
+        use_uid_dedup = _acquire_swc_output_reservation(swc_reservation);
+    }
+
     if (_strategy == strategy_bgj1 || _strategy == strategy_bgj2) {
-        _red_buf->bgjs_out(tid, &size, &h_vec, &h_norm, &h_score, &h_u);
+        _red_buf->bgjs_out(tid, &size, &h_vec, &h_norm, &h_score, &h_u,
+                           use_uid_dedup);
     }
     if (_strategy == strategy_bgj3) {
         _red_buf->bgjm_out(tid, sid, &size, &h_vec, &h_norm, &h_score, &h_u);
@@ -4233,7 +4502,12 @@ int Reducer_t::_red_out_2_swc(int tid, int sid) {
         if (!dst) {
             if (_swc->num_using() >= _num_sol_chunks_slimit) {
                 _ut_checker->trigger_batch();
-                /// lg_warn("swc full, %d new sols ignored", size);
+                if (use_uid_dedup) {
+                    lg_err("SWC reached its %d-chunk limit after GPU UID filtering; "
+                           "reservation invariant failed with %d candidates remaining",
+                           _num_sol_chunks_slimit, size);
+                    abort();
+                }
                 break;
             }
             #if ENABLE_PROFILING
@@ -4246,9 +4520,10 @@ int Reducer_t::_red_out_2_swc(int tid, int sid) {
             logger->ev_ld_stall_us += (fetch_end.tv_sec - fetch_start.tv_sec) * 1000000 + fetch_end.tv_usec - fetch_start.tv_usec;
             #endif
             if (!dst) {
-                lg_err("tid = %d, fetch_for_write failed, swc %d using, limit %d, %d new sols ignored",
+                lg_err("tid = %d, fetch_for_write failed, swc %d using, limit %d; "
+                       "stopping rather than ignoring %d new solutions",
                         tid, _swc->num_using(), _num_sol_chunks_slimit, size);
-                break;
+                abort();
             } else if (_normalize_chunk(dst, _pool->CSD)) {
                 lg_warn("chunk %d from swc not normalized", dst->id);
             }
@@ -4281,6 +4556,9 @@ int Reducer_t::_red_out_2_swc(int tid, int sid) {
         #endif
         _ut_checker->task_commit(dst);
     }
+
+    if (_strategy == strategy_bgj2 && _red_buf->uid_dedup)
+        _release_swc_output_reservation(use_uid_dedup, swc_reservation);
 
     return 0;
 }
