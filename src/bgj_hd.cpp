@@ -24,7 +24,9 @@ static uint64_t __host_mem_available() {
 static long __swc_runtime_max_cached_chunks(Pool_hd_t *p) {
     const long base = SWC_DEFAULT_MAX_CACHED_CHUNKS;
     const char *grow_env = getenv("HD_SWC_GROW_GB");
-    double grow_gb = grow_env ? atof(grow_env) : (HD_SVP140_CACHE_PROFILE ? 2.0 : 0.0);
+    // Keep the profiled cache size inside the physical-memory envelope by
+    // default.  Runtime growth remains available as an explicit experiment.
+    double grow_gb = grow_env ? atof(grow_env) : 0.0;
     if (grow_gb <= 0.0) return base;
 
     const char *min_csd_env = getenv("HD_SWC_GROW_MIN_CSD");
