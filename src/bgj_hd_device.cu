@@ -5,6 +5,39 @@
 #include "../include/pool_hd_device.h"
 #include "../include/bgj_hd_device.h"
 
+static bool __sieve_rng_base_seed(uint64_t *seed) {
+    const char *env = getenv("HD_SIEVE_SEED");
+    if (!env || !env[0]) return false;
+    char *end = NULL;
+    const uint64_t value = strtoull(env, &end, 0);
+    if (end == env || *end != '\0') return false;
+    *seed = value;
+    return true;
+}
+
+static inline uint64_t __sieve_rng_mix(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+static unsigned long long __sieve_rng_seed(Pool_hd_t *pool,
+                                           uint64_t domain,
+                                           uint64_t legacy_stream_seed) {
+    uint64_t base_seed;
+    // Preserve the historical trajectory exactly unless the user explicitly
+    // asks for a restart seed.
+    if (!__sieve_rng_base_seed(&base_seed)) return legacy_stream_seed;
+    uint64_t context = pool->basis_hash;
+    context ^= (uint64_t)(uint32_t)pool->CSD << 32;
+    context ^= (uint64_t)(uint16_t)pool->index_l << 16;
+    context ^= (uint64_t)(uint16_t)pool->index_r;
+    return __sieve_rng_mix(base_seed ^ __sieve_rng_mix(context) ^
+                           __sieve_rng_mix(domain) ^
+                           __sieve_rng_mix(legacy_stream_seed));
+}
+
 int Pool_hd_t::_bgj_Sieve_hd(int bgj) {
     if (pwc_manager->max_cached_chunks() > pwc_manager_t::pwc_default_max_cached_chunks) {
         pwc_manager->wait_work();
@@ -955,7 +988,9 @@ int buc_buffer_holder_t::device_init(int tid) {
     
     if (tid == 0) {
         CHECK_CUDA_ERR(cudaMalloc(&state, sizeof(curandState) * buccg_blocks * buccg_threads));
-        init_curand<<<buccg_blocks, buccg_threads, 0, streams[tid]>>>(state, num_threads);
+        init_curand<<<buccg_blocks, buccg_threads, 0, streams[tid]>>>(
+            state, __sieve_rng_seed(bucketer->_pool, 0x6275636b65746572ULL,
+                                    num_threads));
         CHECK_CUDA_ERR(cudaStreamSynchronize(streams[tid]));
     }
 
@@ -1992,6 +2027,16 @@ red_buffer_holder_t::red_buffer_holder_t(Reducer_t *reducer) {
     this->bgj4_repeat       = reducer->bgj4_repeat;
     local_data              = (local_data_t **) malloc(MAX_NUM_DEVICE * sizeof(local_data_t *));
 
+    uint64_t configured_seed;
+    if (__sieve_rng_base_seed(&configured_seed)) {
+        lg_dbg("custom sieve RNG seed %llu enabled for CSD %ld",
+               (unsigned long long)configured_seed, CSD);
+    } else {
+        const char *seed_env = getenv("HD_SIEVE_SEED");
+        if (seed_env && seed_env[0])
+            lg_warn("ignoring invalid HD_SIEVE_SEED='%s'", seed_env);
+    }
+
     const char *uid_dedup_env = getenv("HD_GPU_UID_DEDUP");
     uid_dedup = strategy == Reducer_t::strategy_bgj2 &&
                 (!uid_dedup_env || atoi(uid_dedup_env) != 0);
@@ -2485,7 +2530,9 @@ int red_buffer_holder_t::device_init(int tid, int sid) {
             CHECK_CUDA_ERR(cudaStreamCreate(&streams[tid]));
             CHECK_CUDA_ERR(cudaMalloc(&d_ctt1[tid], batch1 * Pool_hd_t::vec_nbytes));
             CHECK_CUDA_ERR(cudaMalloc(&statte[tid], buccg_threads * buccg_blocks * sizeof(curandState)));
-            init_curand<<<buccg_blocks, buccg_threads, 0, streams[tid]>>>(statte[tid], tid);
+            init_curand<<<buccg_blocks, buccg_threads, 0, streams[tid]>>>(
+                statte[tid], __sieve_rng_seed(reducer->_pool,
+                                             0x7265647374617474ULL, tid));
             CHECK_CUDA_ERR(cudaStreamSynchronize(streams[tid]));
             return 0;
         }
@@ -2513,7 +2560,9 @@ int red_buffer_holder_t::device_init(int tid, int sid) {
         CHECK_CUDA_ERR(cudaMalloc(&d_vec16[id], bk1_max_size * CSD16 * sizeof(int8_t)));
         CHECK_CUDA_ERR(cudaMalloc(&d_norm[id], d_norm_vecs * sizeof(int32_t)));
         CHECK_CUDA_ERR(cudaMalloc(&state[id], buccg_threads * buccg_blocks * sizeof(curandState)));
-        init_curand<<<buccg_blocks, buccg_threads, 0, sstreams[id]>>>(state[id], id);
+        init_curand<<<buccg_blocks, buccg_threads, 0, sstreams[id]>>>(
+            state[id], __sieve_rng_seed(reducer->_pool,
+                                        0x726564737374726dULL, id));
         _used_gram += sizeof(int) + out_max_size * 2 * sizeof(int) + sizeof(int) + 
                       flt_out_max_size * CSD16 * sizeof(int8_t) + flt_out_max_size * sizeof(uint16_t) + 
                       flt_out_max_size * sizeof(int32_t) + flt_out_max_size * sizeof(uint64_t) + 
@@ -2610,7 +2659,10 @@ int red_buffer_holder_t::device_init(int tid, int sid) {
             _used_gram += traits::taskVecs * CSD16 + buc_max_size * CSD16 + d_norm_vecs * sizeof(int32_t) + sizeof(int);
         }
         CHECK_CUDA_ERR(cudaMalloc(&state[tid * tpb + t], buccg_threads * buccg_blocks * sizeof(curandState)));
-        init_curand<<<buccg_blocks, buccg_threads, 0, streams[tid]>>>(state[tid * tpb + t], tid * tpb + t);
+        init_curand<<<buccg_blocks, buccg_threads, 0, streams[tid]>>>(
+            state[tid * tpb + t], __sieve_rng_seed(reducer->_pool,
+                                                   0x726564726567756cULL,
+                                                   tid * tpb + t));
     }
     CHECK_CUDA_ERR(cudaStreamSynchronize(streams[tid]));
 
