@@ -4162,8 +4162,21 @@ int Reducer_t::run() {
     if (_red_buf) delete _red_buf;
     _red_buf = new red_buffer_holder_t(this);
 
+    const char *pin_env = getenv("HD_NUMA_PIN_REDUCER");
+    const bool pin_reducers = pin_env ? atoi(pin_env) != 0
+                                      : HD_SVP140_CACHE_PROFILE;
+    if (pin_reducers)
+        lg_dbg("pinning %ld reducer workers to their GPUs' NUMA nodes", _num_threads);
     for (int tid = 0; tid < _num_threads; tid++) {
-        _red_pool[tid]->push([this, tid] { _red_buf->device_init(tid); });
+        _red_pool[tid]->push([this, tid, pin_reducers] {
+            if (pin_reducers &&
+                _pin_thread_to_gpu_numa(hw::gpu_ptr(tid, _num_threads), tid)) {
+                static std::atomic<int> warned{0};
+                if (!warned.fetch_or(1))
+                    fprintf(stderr, "[Warning] reducer NUMA pinning failed; continuing unpinned\n");
+            }
+            _red_buf->device_init(tid);
+        });
     }
     for (int tid = 0; tid < _num_threads; tid++) {
         _red_pool[tid]->wait_sleep();

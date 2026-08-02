@@ -19,6 +19,7 @@ static std::atomic<int> ck_allocator_started{0};
 #include <numa.h>
 #include <numaif.h>
 #include <sys/mman.h>
+#include <sched.h>
 #include <fcntl.h>
 
 struct chunk_arena_t {
@@ -333,6 +334,67 @@ void _destory_ck_allocator() {
 long _ensure_regular_chunk_capacity(long num_chunks) {
     if (!ck_allocator_started.load(std::memory_order_acquire)) _start_ck_allocator();
     return chunk_allocator.regular.grow(num_chunks);
+}
+
+int _pin_thread_to_gpu_numa(int device_ptr, int worker_index) {
+    if (device_ptr < 0 || device_ptr >= hw::gpu_num) return -1;
+
+    char bus_id[32];
+    if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id),
+                              hw::gpu_id_list[device_ptr]) != cudaSuccess)
+        return -1;
+    for (char *p = bus_id; *p; p++)
+        if (*p >= 'A' && *p <= 'F') *p += 'a' - 'A';
+    char node_path[128];
+    snprintf(node_path, sizeof(node_path),
+             "/sys/bus/pci/devices/%s/numa_node", bus_id);
+    FILE *fp = fopen(node_path, "r");
+    if (!fp) return -1;
+    int node = -1;
+    int scanned = fscanf(fp, "%d", &node);
+    fclose(fp);
+    if (scanned != 1 || node < 0 || node > numa_max_node()) return -1;
+
+    struct bitmask *node_cpus = numa_allocate_cpumask();
+    if (!node_cpus) return -1;
+    if (numa_node_to_cpus(node, node_cpus)) {
+        numa_free_cpumask(node_cpus);
+        return -1;
+    }
+
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed)) {
+        numa_free_cpumask(node_cpus);
+        return -1;
+    }
+    int cpu_count = 0;
+    for (int cpu = 0; cpu < CPU_SETSIZE && cpu < (int)node_cpus->size; cpu++)
+        if (CPU_ISSET(cpu, &allowed) && numa_bitmask_isbitset(node_cpus, cpu))
+            cpu_count++;
+    if (!cpu_count) {
+        numa_free_cpumask(node_cpus);
+        return -1;
+    }
+
+    int selected = worker_index % cpu_count;
+    int target_cpu = -1;
+    for (int cpu = 0, seen = 0;
+         cpu < CPU_SETSIZE && cpu < (int)node_cpus->size; cpu++) {
+        if (!CPU_ISSET(cpu, &allowed) || !numa_bitmask_isbitset(node_cpus, cpu))
+            continue;
+        if (seen++ == selected) {
+            target_cpu = cpu;
+            break;
+        }
+    }
+    numa_free_cpumask(node_cpus);
+    if (target_cpu < 0) return -1;
+
+    cpu_set_t target;
+    CPU_ZERO(&target);
+    CPU_SET(target_cpu, &target);
+    return pthread_setaffinity_np(pthread_self(), sizeof(target), &target);
 }
 
 extern void _malloc_chunk(chunk_t *chunk) {

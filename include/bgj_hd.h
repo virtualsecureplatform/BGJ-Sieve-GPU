@@ -14,6 +14,7 @@ int _cuda_device_h2d_pair_enqueue(int device_ptr,
                                   void *dst1, const void *src1, size_t nbytes1);
 int _cuda_device_h2d_wait(int device_ptr);
 long _ensure_regular_chunk_capacity(long num_chunks);
+int _pin_thread_to_gpu_numa(int device_ptr, int worker_index);
 
 #if ENABLE_PROFILING
 struct bwc_logger_t : public pwc_logger_t {
