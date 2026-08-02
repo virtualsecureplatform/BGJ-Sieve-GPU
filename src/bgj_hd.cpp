@@ -5,6 +5,53 @@
 
 #include <omp.h>
 
+static uint64_t __host_mem_available() {
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) return 0;
+    char key[64], unit[16];
+    unsigned long long value = 0;
+    uint64_t available = 0;
+    while (fscanf(fp, "%63s %llu %15s", key, &value, unit) == 3) {
+        if (strcmp(key, "MemAvailable:") == 0) {
+            available = value * 1024ULL;
+            break;
+        }
+    }
+    fclose(fp);
+    return available;
+}
+
+static long __swc_runtime_max_cached_chunks(Pool_hd_t *p) {
+    const long base = SWC_DEFAULT_MAX_CACHED_CHUNKS;
+    const char *grow_env = getenv("HD_SWC_GROW_GB");
+    double grow_gb = grow_env ? atof(grow_env) : (HD_SVP140_CACHE_PROFILE ? 2.0 : 0.0);
+    if (grow_gb <= 0.0) return base;
+
+    const char *min_csd_env = getenv("HD_SWC_GROW_MIN_CSD");
+    const long min_csd = min_csd_env ? atol(min_csd_env) : 124;
+    if (!p || p->CSD < min_csd) return base;
+
+    const char *reserve_env = getenv("HD_SWC_RESERVE_GB");
+    // The reducer allocates up to roughly 8 GiB of additional pinned staging
+    // memory after this decision at the largest dimensions.  Keeping 20 GiB
+    // here therefore preserves about a 12 GiB live-run cushion.
+    double reserve_gb = reserve_env ? atof(reserve_env) : 20.0;
+    if (reserve_gb < 8.0) reserve_gb = 8.0;
+    const uint64_t gib = 1ULL << 30;
+    const uint64_t available = __host_mem_available();
+    const uint64_t reserve = (uint64_t)(reserve_gb * gib);
+    if (available <= reserve) return base;
+
+    uint64_t allowed_extra = available - reserve;
+    const uint64_t requested_extra = (uint64_t)(grow_gb * gib);
+    if (allowed_extra > requested_extra) allowed_extra = requested_extra;
+    const uint64_t chunk_nbytes = Pool_hd_t::chunk_max_nvecs *
+                                  (uint64_t)POOL_HOST_VEC_SLOT_NBYTES +
+                                  (ONE_TIME_IO ? 4096ULL : 0ULL);
+    const long extra_chunks = (long)(allowed_extra / chunk_nbytes);
+    return extra_chunks > 0 ? base + extra_chunks : base;
+}
+
 template <class logger_t> bwc_manager_tmpl<logger_t>::bwc_manager_tmpl(Pool_hd_t *p) : 
                           pwc_manager_tmpl<logger_t>(bwc_default_loading_threads,
                                                      bwc_default_syncing_threads,
@@ -824,7 +871,16 @@ template <class logger_t> long bwc_manager_tmpl<logger_t>::bucket_num_chunks(lon
 }
 
 template <class logger_t> swc_manager_tmpl<logger_t>::swc_manager_tmpl(Pool_hd_t *p) : 
-                          pwc_manager_tmpl<logger_t>(swc_default_loading_threads, swc_default_syncing_threads, swc_default_max_cached_chunks) {
+                          pwc_manager_tmpl<logger_t>(swc_default_loading_threads,
+                                                     swc_default_syncing_threads,
+                                                     __swc_runtime_max_cached_chunks(p)) {
+    const long requested_chunks = _max_cached_chunks;
+    const long arena_chunks = _ensure_regular_chunk_capacity(
+        PWC_DEFAULT_MAX_CACHED_CHUNKS + requested_chunks + 256);
+    const long supported_chunks = arena_chunks - PWC_DEFAULT_MAX_CACHED_CHUNKS - 256;
+    if (supported_chunks < _max_cached_chunks)
+        this->set_max_cached_chunks(supported_chunks > 0 ? supported_chunks
+                                                         : swc_default_max_cached_chunks);
     _num_ready = 0;
     _num_writing = 0;
     _num_rp = 0; 
@@ -832,10 +888,25 @@ template <class logger_t> swc_manager_tmpl<logger_t>::swc_manager_tmpl(Pool_hd_t
     _num_wp = 0;
     _num_wl = 0;
     _ready_chunks = (int32_t *) malloc(swc_max_ready_chunks * sizeof(int32_t));
+    _writing_chunks = (chunk_t **) malloc(_max_cached_chunks * sizeof(chunk_t *));
+    if (!_ready_chunks || !_writing_chunks) {
+        fprintf(stderr, "[Error] SWC metadata allocation failed\n");
+        abort();
+    }
     pthread_spin_init(&_swc_lock, PTHREAD_PROCESS_SHARED);
 
     this->_pool = p;
     this->set_dirname("sol");
+
+    if (_max_cached_chunks > swc_default_max_cached_chunks) {
+        const double extra_gib = (_max_cached_chunks - swc_default_max_cached_chunks) *
+                                 Pool_hd_t::chunk_max_nvecs *
+                                 (double)POOL_HOST_VEC_SLOT_NBYTES / (1ULL << 30);
+        lg_warn("guarded SWC growth enabled at CSD %ld: +%.2f GiB (%ld chunks total)",
+                p->CSD, extra_gib, _max_cached_chunks);
+    } else if (requested_chunks > swc_default_max_cached_chunks) {
+        lg_warn("guarded SWC growth unavailable at CSD %ld; using base capacity", p->CSD);
+    }
 
     lg_info("manager initialized, (%d, %d) threads for I/O, #caching = %d", 
             _loading_threads, _syncing_threads, _max_cached_chunks);
@@ -873,6 +944,7 @@ template <class logger_t> swc_manager_tmpl<logger_t>::~swc_manager_tmpl() {
     }
 
     free(_ready_chunks);
+    free(_writing_chunks);
     pthread_spin_destroy(&_swc_lock);
 
     this->_syncing_pool.wait_work();
@@ -896,7 +968,7 @@ template <class logger_t> void swc_manager_tmpl<logger_t>::__prefetch_for_writin
     volatile int32_t *_num_wp_ptr_vol = reinterpret_cast<volatile int32_t*>(&_num_wp);
     volatile int32_t *_num_wl_ptr_vol = reinterpret_cast<volatile int32_t*>(&_num_wl);
 
-    if (_num_writing + _num_wl + _num_wp >= swc_max_writing_chunks) { 
+    if (_num_writing + _num_wl + _num_wp >= _max_cached_chunks) {
         lg_exit(); 
         return; 
     }
@@ -907,8 +979,8 @@ template <class logger_t> void swc_manager_tmpl<logger_t>::__prefetch_for_writin
 
     pthread_spin_lock(&_swc_lock);
     int to_prefetch = swc_auto_prefetch_for_write - _num_wl_ptr_vol[0] - _num_wp_ptr_vol[0];
-    if (to_prefetch > swc_max_writing_chunks - _num_writing + _num_wl + _num_wp)
-        to_prefetch = swc_max_writing_chunks - _num_writing + _num_wl + _num_wp;
+    if (to_prefetch > _max_cached_chunks - _num_writing - _num_wl - _num_wp)
+        to_prefetch = _max_cached_chunks - _num_writing - _num_wl - _num_wp;
     if (to_prefetch <= 0) {
         pthread_spin_unlock(&_swc_lock);
         lg_exit();
@@ -1163,7 +1235,7 @@ template <class logger_t> void swc_manager_tmpl<logger_t>::write_done(chunk_t *c
     lg_init();
     if (chunk->size < Pool_hd_t::chunk_max_nvecs || !swc_auto_finalize) {
         pthread_spin_lock(&_swc_lock);
-        if (_num_writing < swc_max_writing_chunks) {
+        if (_num_writing < _max_cached_chunks) {
             _writing_chunks[_num_writing++] = chunk;
             pthread_spin_unlock(&_swc_lock);
             lg_exit();

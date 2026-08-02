@@ -13,6 +13,7 @@ int _cuda_device_h2d_pair_enqueue(int device_ptr,
                                   void *dst0, const void *src0, size_t nbytes0,
                                   void *dst1, const void *src1, size_t nbytes1);
 int _cuda_device_h2d_wait(int device_ptr);
+long _ensure_regular_chunk_capacity(long num_chunks);
 
 #if ENABLE_PROFILING
 struct bwc_logger_t : public pwc_logger_t {
@@ -234,7 +235,6 @@ struct swc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
     static constexpr long swc_auto_prefetch_for_write = 8;
     static constexpr long swc_auto_prefetch_for_read = 64;
     static constexpr long swc_max_ready_chunks = pwc_manager_tmpl<logger_t>::_ck_cache_id_mask + 1;
-    static constexpr long swc_max_writing_chunks = swc_default_max_cached_chunks;
     static constexpr long swc_auto_finalize = 1;
 
     swc_manager_tmpl(Pool_hd_t *p);
@@ -282,7 +282,7 @@ struct swc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
     int32_t _num_wp, _num_wl;
     
     int32_t *_ready_chunks;
-    chunk_t *_writing_chunks[swc_max_writing_chunks];
+    chunk_t **_writing_chunks;
     chunk_t *_writing_prefetch_chunks[swc_auto_prefetch_for_write];
     chunk_t *_reading_prefetch_chunks[swc_auto_prefetch_for_read];
     

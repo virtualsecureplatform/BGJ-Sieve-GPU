@@ -93,6 +93,54 @@ struct chunk_arena_t {
         cached_num = max_cached_chunks;
     }
 
+    // Extend the regular arena only between sieve dimensions, while no SWC
+    // chunks exist.  The original arena remains in place, so PWC pointers are
+    // stable; the free-slot stack merely gains descriptors backed by a second
+    // pinned allocation.  Failure is lossless and leaves the old capacity.
+    long grow(long num_chunks) {
+        if (num_chunks <= max_cached_chunks) return max_cached_chunks;
+        if (compact || extra_space) return max_cached_chunks;
+
+        const long add_chunks = num_chunks - max_cached_chunks;
+        const size_t add_nbytes = (size_t)add_chunks * chunk_nbytes;
+        int8_t *new_space = NULL;
+        if (posix_memalign((void **)&new_space, 4096, add_nbytes)) return max_cached_chunks;
+        cudaError_t status = cudaHostRegister(new_space, add_nbytes, cudaHostAllocPortable);
+        if (status != cudaSuccess) {
+            cudaGetLastError();
+            free(new_space);
+            return max_cached_chunks;
+        }
+
+        pthread_spin_lock(&cache_lock);
+        chunk_t *new_cache = (chunk_t *)realloc(cached_chunks,
+                                                 num_chunks * sizeof(chunk_t));
+        if (!new_cache) {
+            pthread_spin_unlock(&cache_lock);
+            cudaHostUnregister(new_space);
+            free(new_space);
+            return max_cached_chunks;
+        }
+
+        cached_chunks = new_cache;
+        for (long i = 0; i < add_chunks; i++) {
+            int8_t *base = new_space + i * chunk_nbytes + (ONE_TIME_IO ? 12L : 0);
+            chunk_t &chunk = cached_chunks[cached_num + i];
+            chunk.score = (uint16_t *)base;
+            chunk.norm = (int32_t *)(chunk.score + Pool_hd_t::chunk_max_nvecs);
+            chunk.u = (uint64_t *)(chunk.norm + Pool_hd_t::chunk_max_nvecs);
+            chunk.vec = (int8_t *)(chunk.u + Pool_hd_t::chunk_max_nvecs);
+        }
+        extra_space = new_space;
+        extra_nbytes = add_nbytes;
+        cached_num += add_chunks;
+        max_cached_chunks = num_chunks;
+        pthread_spin_unlock(&cache_lock);
+        return max_cached_chunks;
+    }
+
+    long capacity() const { return max_cached_chunks; }
+
     void destroy() {
         pthread_spin_lock(&cache_lock);
         if (space) {
@@ -104,6 +152,12 @@ struct chunk_arena_t {
             free(space);
             #endif
             space = NULL;
+        }
+        if (extra_space) {
+            CHECK_CUDA_ERR(cudaHostUnregister(extra_space));
+            free(extra_space);
+            extra_space = NULL;
+            extra_nbytes = 0;
         }
         cached_num = 0;
         if (using_num) {
@@ -162,6 +216,8 @@ struct chunk_arena_t {
     long chunk_nbytes = 0;
     chunk_t *cached_chunks = NULL;
     int8_t *space = NULL;
+    int8_t *extra_space = NULL;
+    size_t extra_nbytes = 0;
 };
 
 struct chunk_allocator_t {
@@ -272,6 +328,11 @@ void _start_ck_allocator() {
 
 void _destory_ck_allocator() {
     chunk_allocator.destory();
+}
+
+long _ensure_regular_chunk_capacity(long num_chunks) {
+    if (!ck_allocator_started.load(std::memory_order_acquire)) _start_ck_allocator();
+    return chunk_allocator.regular.grow(num_chunks);
 }
 
 extern void _malloc_chunk(chunk_t *chunk) {
