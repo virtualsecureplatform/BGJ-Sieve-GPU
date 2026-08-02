@@ -9,9 +9,10 @@
 int _cuda_device_mem_info(int device_ptr, size_t *free_nbytes, size_t *total_nbytes);
 int _cuda_device_malloc(int device_ptr, void **ptr, size_t nbytes);
 int _cuda_device_free(int device_ptr, void *ptr);
-int _cuda_device_h2d_pair_nonblocking(int device_ptr,
-                                      void *dst0, const void *src0, size_t nbytes0,
-                                      void *dst1, const void *src1, size_t nbytes1);
+int _cuda_device_h2d_pair_enqueue(int device_ptr,
+                                  void *dst0, const void *src0, size_t nbytes0,
+                                  void *dst1, const void *src1, size_t nbytes1);
+int _cuda_device_h2d_wait(int device_ptr);
 
 #if ENABLE_PROFILING
 struct bwc_logger_t : public pwc_logger_t {

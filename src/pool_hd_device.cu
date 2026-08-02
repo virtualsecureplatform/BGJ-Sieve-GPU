@@ -314,9 +314,18 @@ int _cuda_device_free(int device_ptr, void *ptr) {
     return cudaFree(ptr) == cudaSuccess ? 0 : -1;
 }
 
-int _cuda_device_h2d_pair_nonblocking(int device_ptr,
-                                      void *dst0, const void *src0, size_t nbytes0,
-                                      void *dst1, const void *src1, size_t nbytes1) {
+static thread_local cudaStream_t hbm_copy_streams[MAX_NUM_DEVICE] = {};
+
+static cudaStream_t _cuda_hbm_copy_stream(int device_ptr) {
+    cudaStream_t &stream = hbm_copy_streams[device_ptr];
+    if (!stream && cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess)
+        return NULL;
+    return stream;
+}
+
+int _cuda_device_h2d_pair_enqueue(int device_ptr,
+                                  void *dst0, const void *src0, size_t nbytes0,
+                                  void *dst1, const void *src1, size_t nbytes1) {
     if (device_ptr < 0 || device_ptr >= hw::gpu_num) return -1;
     if (cudaSetDevice(hw::gpu_id_list[device_ptr]) != cudaSuccess) return -1;
 
@@ -324,13 +333,19 @@ int _cuda_device_h2d_pair_nonblocking(int device_ptr,
     // can retain a copy stream. Non-blocking streams do not impose legacy
     // default-stream barriers on the reducer streams, allowing an already
     // finalized bucket to reduce while the next bucket is staged.
-    static thread_local cudaStream_t copy_streams[MAX_NUM_DEVICE] = {};
-    cudaStream_t &stream = copy_streams[device_ptr];
-    if (!stream && cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess)
-        return -1;
+    cudaStream_t stream = _cuda_hbm_copy_stream(device_ptr);
+    if (!stream) return -1;
     if (cudaMemcpyAsync(dst0, src0, nbytes0, cudaMemcpyHostToDevice, stream) != cudaSuccess ||
         cudaMemcpyAsync(dst1, src1, nbytes1, cudaMemcpyHostToDevice, stream) != cudaSuccess)
         return -1;
+    return 0;
+}
+
+int _cuda_device_h2d_wait(int device_ptr) {
+    if (device_ptr < 0 || device_ptr >= hw::gpu_num) return -1;
+    if (cudaSetDevice(hw::gpu_id_list[device_ptr]) != cudaSuccess) return -1;
+    cudaStream_t stream = _cuda_hbm_copy_stream(device_ptr);
+    if (!stream) return -1;
     return cudaStreamSynchronize(stream) == cudaSuccess ? 0 : -1;
 }
 

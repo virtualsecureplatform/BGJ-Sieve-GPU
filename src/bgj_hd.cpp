@@ -192,7 +192,7 @@ template <class logger_t> bool bwc_manager_tmpl<logger_t>::__stage_bucket_to_hbm
     const size_t norm_capacity = Pool_hd_t::chunk_max_nvecs * sizeof(int32_t);
     for (int32_t i = 0; i < num_chunks; i++) {
         int8_t *slot = __hbm_slot(device_ptr, slots[i]);
-        if (_cuda_device_h2d_pair_nonblocking(
+        if (_cuda_device_h2d_pair_enqueue(
                 device_ptr,
                 slot, chunks[i]->norm, chunks[i]->size * sizeof(int32_t),
                 slot + norm_capacity, chunks[i]->vec,
@@ -202,6 +202,13 @@ template <class logger_t> bool bwc_manager_tmpl<logger_t>::__stage_bucket_to_hbm
             abort();
         }
         _bucket[bucket_id].hbm_sizes[i] = chunks[i]->size;
+    }
+    // Keep the bucket private until every chunk copy is complete, but avoid a
+    // host/device round trip after each pair of copies.
+    if (_cuda_device_h2d_wait(device_ptr)) {
+        fprintf(stderr, "[Error] failed to finish staging bucket %d in GPU %d HBM\n",
+                bucket_id, hw::gpu_id_list[device_ptr]);
+        abort();
     }
     for (int32_t i = 0; i < num_chunks; i++) {
         release_del(chunks[i]->id);
