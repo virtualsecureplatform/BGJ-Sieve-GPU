@@ -141,7 +141,46 @@ template <class logger_t> void bwc_manager_tmpl<logger_t>::configure_hbm_cache(b
     _hbm_enabled = enabled_devices > 0;
 }
 
+template <class logger_t> void bwc_manager_tmpl<logger_t>::configure_gpu_native_buckets(
+        bool enable, long max_bucket_nvecs) {
+    _gpu_native_enabled = false;
+    _gpu_native_max_nvecs = 0;
+    _gpu_native_max_chunks = 0;
+
+    const char *env = getenv("HD_GPU_NATIVE_BWC");
+    const bool requested = enable && env && atol(env) != 0;
+    const char *int4_env = getenv("HD_INT4_BUCKETS");
+    if (!requested || !_hbm_enabled || max_bucket_nvecs <= 0) return;
+    if (int4_env && atol(int4_env) != 0) {
+        fprintf(stderr, "[GPU-BWC] disabled because HD_INT4_BUCKETS is active\n");
+        return;
+    }
+    if (max_bucket_nvecs > INT32_MAX) {
+        fprintf(stderr, "[GPU-BWC] disabled: bucket capacity %ld exceeds INT32_MAX\n",
+                max_bucket_nvecs);
+        return;
+    }
+
+    _gpu_native_max_nvecs = (int32_t)max_bucket_nvecs;
+    _gpu_native_max_chunks =
+        (_gpu_native_max_nvecs + Pool_hd_t::chunk_max_nvecs - 1) /
+        Pool_hd_t::chunk_max_nvecs;
+    _gpu_native_buckets.store(0, std::memory_order_relaxed);
+    _gpu_native_host_fallbacks.store(0, std::memory_order_relaxed);
+    _gpu_native_entries.store(0, std::memory_order_relaxed);
+    _gpu_native_overflows.store(0, std::memory_order_relaxed);
+    _gpu_native_enabled = _gpu_native_max_chunks > 0;
+    if (_gpu_native_enabled) {
+        printf("[GPU-BWC] enabled: exact GPU materialization with host-staged "
+               "remote writes, capacity %d vectors (%d HBM slots) per "
+               "selected bucket\n",
+               _gpu_native_max_nvecs, _gpu_native_max_chunks);
+        fflush(stdout);
+    }
+}
+
 template <class logger_t> void bwc_manager_tmpl<logger_t>::__destroy_hbm_cache() {
+    _gpu_native_enabled = false;
     for (int device_ptr = 0; device_ptr < hw::gpu_num; device_ptr++) {
         hbm_arena_t &arena = _hbm[device_ptr];
         if (arena.base) {
@@ -171,6 +210,23 @@ template <class logger_t> int bwc_manager_tmpl<logger_t>::__hbm_alloc(int device
     return ret;
 }
 
+template <class logger_t> bool bwc_manager_tmpl<logger_t>::__hbm_reserve(
+        int device_ptr, int32_t num_slots, int32_t *slots) {
+    if (device_ptr < 0 || device_ptr >= hw::gpu_num || num_slots <= 0 || !slots)
+        return false;
+    hbm_arena_t &arena = _hbm[device_ptr];
+    if (!arena.base) return false;
+    pthread_spin_lock(&arena.lock);
+    if (arena.num_free < num_slots) {
+        pthread_spin_unlock(&arena.lock);
+        return false;
+    }
+    for (int32_t i = 0; i < num_slots; i++)
+        slots[i] = arena.free_slots[--arena.num_free];
+    pthread_spin_unlock(&arena.lock);
+    return true;
+}
+
 template <class logger_t> void bwc_manager_tmpl<logger_t>::__hbm_release(int device_ptr,
                                                                          int slot_id) {
     if (device_ptr < 0 || device_ptr >= hw::gpu_num || slot_id < 0) return;
@@ -184,6 +240,103 @@ template <class logger_t> void bwc_manager_tmpl<logger_t>::__hbm_release(int dev
 template <class logger_t> int8_t *bwc_manager_tmpl<logger_t>::__hbm_slot(int device_ptr,
                                                                          int slot_id) {
     return _hbm[device_ptr].base + (size_t)slot_id * _hbm[device_ptr].slot_nbytes;
+}
+
+template <class logger_t> bool bwc_manager_tmpl<logger_t>::__start_gpu_native_bucket(
+        int32_t bucket_id) {
+    if (!_gpu_native_enabled || _gpu_native_max_chunks <= 0) return false;
+
+    l0_bucket_t &bucket = _bucket[bucket_id];
+    bucket.reserve_chunks(_gpu_native_max_chunks);
+    int device_ptr = -1;
+    for (int step = 0; step < hw::gpu_num; step++) {
+        int candidate = (bucket_id + step) % hw::gpu_num;
+        if (__hbm_reserve(candidate, _gpu_native_max_chunks, bucket.chunk_ids)) {
+            device_ptr = candidate;
+            break;
+        }
+    }
+    if (device_ptr < 0) {
+        _gpu_native_host_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    bucket.status |= l0_bucket_t::_bk_gpu_write;
+    bucket.hbm_device = device_ptr;
+    bucket.hbm_reserved_chunks = _gpu_native_max_chunks;
+    bucket.hbm_capacity_nvecs = _gpu_native_max_nvecs;
+    bucket.hbm_nvecs = 0;
+    _gpu_native_buckets.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+template <class logger_t> bool bwc_manager_tmpl<logger_t>::reserve_gpu_native_write(
+        long bucket_id, int entry_size, bwc_gpu_write_desc_t *desc) {
+    if (!desc) return false;
+    memset(desc, 0, sizeof(*desc));
+    desc->device_ptr = -1;
+    if (bucket_id < 0 || bucket_id >= _num_buckets || entry_size < 0) return false;
+
+    pthread_spin_lock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+    l0_bucket_t &bucket = _bucket[bucket_id];
+    if ((bucket.status & (l0_bucket_t::_bk_writing | l0_bucket_t::_bk_gpu_write)) !=
+        (l0_bucket_t::_bk_writing | l0_bucket_t::_bk_gpu_write)) {
+        pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+        return false;
+    }
+
+    desc->enabled = 1;
+    desc->device_ptr = bucket.hbm_device;
+    desc->entry_size = entry_size;
+    const int32_t available = bucket.hbm_capacity_nvecs - bucket.hbm_nvecs;
+    const int32_t write_size = entry_size < available ? entry_size : available;
+    const int32_t start = bucket.hbm_nvecs;
+    bucket.hbm_nvecs += write_size;
+    desc->write_size = write_size;
+
+    int32_t logical_pos = start;
+    int32_t described = 0;
+    while (described < write_size && desc->num_spans < bwc_gpu_write_max_spans) {
+        const int32_t slot_ptr = logical_pos / Pool_hd_t::chunk_max_nvecs;
+        const int32_t slot_offset = logical_pos % Pool_hd_t::chunk_max_nvecs;
+        const int32_t room = Pool_hd_t::chunk_max_nvecs - slot_offset;
+        const int32_t span_size =
+            write_size - described < room ? write_size - described : room;
+        int8_t *slot = __hbm_slot(bucket.hbm_device, bucket.chunk_ids[slot_ptr]);
+        const int span = desc->num_spans++;
+        described += span_size;
+        desc->span_end[span] = described;
+        desc->d_norm[span] = (int32_t *)slot + slot_offset;
+        desc->d_vec[span] = slot +
+            Pool_hd_t::chunk_max_nvecs * sizeof(int32_t) +
+            (size_t)slot_offset * this->_pool->CSD;
+        logical_pos += span_size;
+    }
+    pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+
+    if (described != write_size || write_size != entry_size) {
+        _gpu_native_overflows.fetch_add((uint64_t)(entry_size - described),
+                                        std::memory_order_relaxed);
+        fprintf(stderr,
+                "[GPU-BWC] fatal capacity error: bucket %ld requested %d entries, "
+                "only %d described; refusing a lossy bucket\n",
+                bucket_id, entry_size, described);
+        abort();
+    }
+    _gpu_native_entries.fetch_add(write_size, std::memory_order_relaxed);
+    return true;
+}
+
+template <class logger_t> void bwc_manager_tmpl<logger_t>::report_gpu_native() {
+    if (!_gpu_native_max_chunks && !_gpu_native_buckets.load(std::memory_order_relaxed))
+        return;
+    printf("[GPU-BWC] buckets direct %lu, host fallback %lu, exact entries %lu, "
+           "overflow %lu\n",
+           (unsigned long)_gpu_native_buckets.load(std::memory_order_relaxed),
+           (unsigned long)_gpu_native_host_fallbacks.load(std::memory_order_relaxed),
+           (unsigned long)_gpu_native_entries.load(std::memory_order_relaxed),
+           (unsigned long)_gpu_native_overflows.load(std::memory_order_relaxed));
+    fflush(stdout);
 }
 
 template <class logger_t> bool bwc_manager_tmpl<logger_t>::__stage_bucket_to_hbm(
@@ -313,7 +466,10 @@ template <class logger_t> bwc_manager_tmpl<logger_t>::~bwc_manager_tmpl() {
 
     for (int32_t i = 0; i < _num_buckets; i++) {
         if (_bucket[i].status) {
-            if (_bucket[i].status & l0_bucket_t::_bk_hbm) {
+            if (_bucket[i].status & l0_bucket_t::_bk_gpu_write) {
+                for (int32_t j = 0; j < _bucket[i].hbm_reserved_chunks; j++)
+                    __hbm_release(_bucket[i].hbm_device, _bucket[i].chunk_ids[j]);
+            } else if (_bucket[i].status & l0_bucket_t::_bk_hbm) {
                 for (int32_t j = 0; j < _bucket[i].num_chunks; j++)
                     __hbm_release(_bucket[i].hbm_device, _bucket[i].chunk_ids[j]);
             } else {
@@ -489,7 +645,8 @@ template <class logger_t> long bwc_manager_tmpl<logger_t>::push_bucket() {
     if (ret >= 0) {
         _bucket[ret].init();
 
-        if (_num_wp) {
+        const bool gpu_native = __start_gpu_native_bucket(ret);
+        if (!gpu_native && _num_wp) {
             pthread_spin_lock(&_bwc_wp_lock);
             if (*_num_wp_ptr_vol) _bucket[ret].writing_chunk = _writing_prefetch_chunks[--_num_wp];
             pthread_spin_unlock(&_bwc_wp_lock);
@@ -498,7 +655,7 @@ template <class logger_t> long bwc_manager_tmpl<logger_t>::push_bucket() {
             }
         }
 
-        __prefetch_for_writing();
+        if (!gpu_native) __prefetch_for_writing();
     }
 
     lg_exit();
@@ -627,6 +784,40 @@ template <class logger_t> void bwc_manager_tmpl<logger_t>::bucket_finalize(long 
         pthread_spin_lock(&_bwc_lock);
         _deleted_bucket_ids[_num_deleted_buckets++] = bucket_id;
         pthread_spin_unlock(&_bwc_lock);
+    } else if ((_bucket[bucket_id].status &
+                (l0_bucket_t::_bk_writing | l0_bucket_t::_bk_gpu_write)) ==
+               (l0_bucket_t::_bk_writing | l0_bucket_t::_bk_gpu_write)) {
+        pthread_spin_lock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+        l0_bucket_t &bucket = _bucket[bucket_id];
+        const int32_t nvecs = bucket.hbm_nvecs;
+        const int32_t num_chunks =
+            (nvecs + Pool_hd_t::chunk_max_nvecs - 1) /
+            Pool_hd_t::chunk_max_nvecs;
+        const int32_t reserved_chunks = bucket.hbm_reserved_chunks;
+        const int32_t device_ptr = bucket.hbm_device;
+        for (int32_t i = 0; i < num_chunks; i++) {
+            const int32_t used = nvecs - i * Pool_hd_t::chunk_max_nvecs;
+            bucket.hbm_sizes[i] = used < Pool_hd_t::chunk_max_nvecs ?
+                                  used : Pool_hd_t::chunk_max_nvecs;
+        }
+        bucket.num_chunks = num_chunks;
+        bucket.hbm_reserved_chunks = num_chunks;
+        bucket.status = l0_bucket_t::_bk_ready | l0_bucket_t::_bk_hbm;
+        pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+
+        for (int32_t i = num_chunks; i < reserved_chunks; i++)
+            __hbm_release(device_ptr, bucket.chunk_ids[i]);
+
+        pthread_spin_lock(&_bwc_lock);
+        if (_num_ready_buckets < bwc_max_buckets) {
+            _ready_bucket_id[_num_ready_buckets++] = bucket_id;
+        } else {
+            lg_err("ready list full(%d), GPU-native bucket %d discarded",
+                   _num_ready_buckets, bucket_id);
+            bucket.status = l0_bucket_t::_bk_reading | l0_bucket_t::_bk_hbm;
+        }
+        pthread_spin_unlock(&_bwc_lock);
+        if (!(bucket.status & l0_bucket_t::_bk_ready)) bucket_finalize(bucket_id);
     } else if (_bucket[bucket_id].status & l0_bucket_t::_bk_writing) {
         for (;;) {
             if (_bucket[bucket_id].writing_chunk == (chunk_t *) -1) continue;
@@ -867,7 +1058,10 @@ template <class logger_t> void bwc_manager_tmpl<logger_t>::read_done(chunk_t *ch
 
 template <class logger_t> long bwc_manager_tmpl<logger_t>::bucket_num_chunks(long bucket_id) {
     pthread_spin_lock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
-    long ret = _bucket[bucket_id].num_chunks;
+    long ret = (_bucket[bucket_id].status & l0_bucket_t::_bk_gpu_write) ?
+        (_bucket[bucket_id].hbm_nvecs + Pool_hd_t::chunk_max_nvecs - 1) /
+            Pool_hd_t::chunk_max_nvecs :
+        _bucket[bucket_id].num_chunks;
     pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
     return ret;
 }

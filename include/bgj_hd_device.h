@@ -326,6 +326,11 @@ struct buc_buffer_holder_t {
     int h2d(int tid, chunk_t *chunk);
     int run(int tid);
     int out(int tid, int bid, int *num, int **entry);
+    bool gpu_native_reserve(int tid, int bid, int bucket_id, int entry_size);
+    int gpu_native_begin(int tid);
+    int gpu_native_wait(int tid);
+    int gpu_native_verify(int tid, int bid, chunk_t **working_chunk,
+                          int task_chunks, const int32_t *working_chunk_size);
 
     #if ENABLE_PROFILING
     buc_logger_t *logger;
@@ -351,6 +356,25 @@ struct buc_buffer_holder_t {
     int8_t *h_center16, **d_center16, **d_vec;
     int32_t **h_norm, **d_norm, **d_n;
     uint32_t **h_out, **d_out;
+
+    bool gpu_native = false;
+    bool gpu_native_verify_enabled = false;
+    int gpu_native_verify_stride = 1;
+    bwc_gpu_write_desc_t **h_gpu_write = NULL, **d_gpu_write = NULL;
+    int32_t **d_gpu_write_norm = NULL;
+    int8_t **d_gpu_write_vec = NULL;
+    bwc_gpu_write_desc_t **d_gpu_peer_write = NULL;
+    int32_t **d_gpu_peer_norm = NULL;
+    int8_t **d_gpu_peer_vec = NULL;
+    uint8_t **h_gpu_peer_bounce = NULL;
+    size_t gpu_write_stage_capacity = 0;
+    size_t gpu_write_bounce_nbytes = 0;
+    cudaEvent_t *gpu_write_start = NULL, *gpu_write_stop = NULL;
+    cudaStream_t *gpu_write_peer_streams = NULL;
+    int32_t *gpu_write_pending = NULL;
+    std::atomic<uint64_t> gpu_native_local_nbytes{0};
+    std::atomic<uint64_t> gpu_native_peer_nbytes{0};
+    std::atomic<uint64_t> gpu_native_kernel_us{0};
 
     void (*kernel)(uint32_t *, int, int8_t *, int32_t *, const int8_t *, uint32_t, const int8_t *, int *, float, int, int, int);
 };

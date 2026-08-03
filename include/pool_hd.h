@@ -38,6 +38,23 @@ typedef bwc_manager_tmpl<int> bwc_manager_t;
 typedef swc_manager_tmpl<int> swc_manager_t;
 #endif
 
+// A bucketing task contributes at most taskVecs entries to one logical
+// bucket. Since HBM slots hold 8192 vectors, one contribution crosses at most
+// nine slots with today's 65536-vector tasks. Keep headroom for future sizes.
+static constexpr int bwc_gpu_write_max_spans = 16;
+
+struct bwc_gpu_write_desc_t {
+    int32_t enabled = 0;
+    int32_t device_ptr = -1;
+    int32_t entry_size = 0;
+    int32_t write_size = 0;
+    int32_t stage_begin = 0;
+    int32_t num_spans = 0;
+    int32_t span_end[bwc_gpu_write_max_spans] = {};
+    int32_t *d_norm[bwc_gpu_write_max_spans] = {};
+    int8_t *d_vec[bwc_gpu_write_max_spans] = {};
+};
+
 #include <sys/time.h>
 
 #if ENABLE_PROFILING

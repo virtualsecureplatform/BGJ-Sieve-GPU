@@ -871,6 +871,104 @@ static inline long ceil256(long n) {
     return ((n + 255L) / 256L) * 256L;
 }
 
+static long __buc_out_max_size(Bucketer_t *bucketer) {
+    const long CSD = bucketer->_pool->CSD;
+    long ret = buc_traits_t::l0_out_max_size_ratio(
+                   bucketer->_alpha0, bucketer->_pool->ESD, CSD) *
+               buc_traits_t::taskVecs + 64;
+    if (bucketer->_reducer->_strategy == Reducer_t::strategy_bgj3 ||
+        bucketer->_reducer->_strategy == Reducer_t::strategy_bgj3l) {
+        const double size_ratio =
+            bucketer->_reducer->_strategy == Reducer_t::strategy_bgj3 ?
+            BGJ3_SIZE_RATIO : BGJ3L_SIZE_RATIO;
+        const double expect_pool_size = size_ratio * pow(4. / 3., CSD * .5);
+        ret = (1.1 * pow(2.0, 0.17286844935741618734 * CSD +
+                              0.27598874612316492971) /
+               expect_pool_size) * buc_traits_t::taskVecs + 64;
+    }
+    return ret;
+}
+
+__global__ static void __materialize_exact_buckets(
+        const bwc_gpu_write_desc_t *__restrict__ descs,
+        const uint32_t *__restrict__ bucket_out, int out_max_size,
+        int batch0, const int32_t *__restrict__ src_norm,
+        const int8_t *__restrict__ src_vec, int32_t *__restrict__ stage_norm,
+        int8_t *__restrict__ stage_vec, int CSD) {
+    const int bid = blockIdx.x;
+    if (bid >= batch0) return;
+    const bwc_gpu_write_desc_t desc = descs[bid];
+    if (!desc.enabled || desc.write_size <= 0) return;
+    const uint32_t *entries = bucket_out + batch0 + (size_t)out_max_size * bid;
+
+    for (int out_pos = threadIdx.x; out_pos < desc.write_size;
+         out_pos += blockDim.x) {
+        const uint32_t entry = entries[desc.entry_size - 1 - out_pos];
+        const int src_pos = entry >> 1;
+        stage_norm[desc.stage_begin + out_pos] = src_norm[src_pos];
+    }
+
+    const size_t coord_count = (size_t)desc.write_size * CSD;
+    for (size_t coord_pos = threadIdx.x; coord_pos < coord_count;
+         coord_pos += blockDim.x) {
+        const int out_pos = coord_pos / CSD;
+        const int coord = coord_pos - (size_t)out_pos * CSD;
+        const uint32_t entry = entries[desc.entry_size - 1 - out_pos];
+        const int src_pos = entry >> 1;
+        const int sign = entry & 1;
+        int8_t value = src_vec[(size_t)src_pos * CSD + coord];
+        if (sign) value = (int8_t)(-(int)value);
+        stage_vec[(size_t)(desc.stage_begin + out_pos) * CSD + coord] = value;
+    }
+}
+
+// The gather kernel always writes source-local staging memory.  Scatter on the
+// owning device afterwards so every final HBM write is local as well.  This is
+// reliable on PCIe-only topologies and lets all contributions for one
+// destination travel in contiguous transfers.
+__global__ static void __scatter_exact_buckets(
+        const bwc_gpu_write_desc_t *__restrict__ descs,
+        const int32_t *__restrict__ stage_norm,
+        const int8_t *__restrict__ stage_vec, int batch0,
+        int target_device, int CSD) {
+    const int bid = blockIdx.x;
+    if (bid >= batch0) return;
+    const bwc_gpu_write_desc_t desc = descs[bid];
+    if (!desc.enabled || desc.write_size <= 0 ||
+        desc.device_ptr != target_device) return;
+
+    for (int out_pos = threadIdx.x; out_pos < desc.write_size;
+         out_pos += blockDim.x) {
+        int span_begin = 0;
+        for (int span = 0; span < desc.num_spans; span++) {
+            if (out_pos < desc.span_end[span]) {
+                desc.d_norm[span][out_pos - span_begin] =
+                    stage_norm[desc.stage_begin + out_pos];
+                break;
+            }
+            span_begin = desc.span_end[span];
+        }
+    }
+
+    const size_t coord_count = (size_t)desc.write_size * CSD;
+    for (size_t coord_pos = threadIdx.x; coord_pos < coord_count;
+         coord_pos += blockDim.x) {
+        const int out_pos = coord_pos / CSD;
+        const int coord = coord_pos - (size_t)out_pos * CSD;
+        int span_begin = 0;
+        for (int span = 0; span < desc.num_spans; span++) {
+            if (out_pos < desc.span_end[span]) {
+                desc.d_vec[span][(size_t)(out_pos - span_begin) * CSD +
+                                 coord] =
+                    stage_vec[(size_t)(desc.stage_begin + out_pos) * CSD +
+                              coord];
+                break;
+            }
+            span_begin = desc.span_end[span];
+        }
+    }
+}
+
 buc_buffer_holder_t::buc_buffer_holder_t(Bucketer_t *bucketer) {
     #if ENABLE_PROFILING
     logger = bucketer->logger;
@@ -882,15 +980,19 @@ buc_buffer_holder_t::buc_buffer_holder_t(Bucketer_t *bucketer) {
     this->CSD           = bucketer->_pool->CSD;
     this->CSD16         = (CSD + 15) / 16 * 16 < BUC_MIN_CSD16 ? BUC_MIN_CSD16 : (CSD + 15) / 16 * 16;
     this->max_batch0    = bucketer->_max_batch0;
-    this->out_max_size  = traits::l0_out_max_size_ratio(alpha0, bucketer->_pool->ESD, CSD) * traits::taskVecs + 64;
+    this->out_max_size  = __buc_out_max_size(bucketer);
     this->gbuc_freq     = traits::l0_gbuc_freq(alpha0, CSD);
-
-    if (bucketer->_reducer->_strategy == Reducer_t::strategy_bgj3 || 
-        bucketer->_reducer->_strategy == Reducer_t::strategy_bgj3l) {
-        double size_ratio = bucketer->_reducer->_strategy == Reducer_t::strategy_bgj3 ? 
-                            BGJ3_SIZE_RATIO : BGJ3L_SIZE_RATIO;
-        double expect_pool_size = size_ratio * pow(4./3., CSD * .5);
-        this->out_max_size = (1.1 * pow(2.0, 0.17286844935741618734 * CSD + 0.27598874612316492971) / expect_pool_size) * traits::taskVecs + 64;
+    this->gpu_native    = bucketer->_bwc->gpu_native_enabled();
+    { const char *e = getenv("HD_GPU_NATIVE_BWC_VERIFY");
+      const long verify_value = e ? atol(e) : 0;
+      this->gpu_native_verify_enabled = gpu_native && verify_value != 0;
+      this->gpu_native_verify_stride = verify_value > 1 ? verify_value : 1; }
+    if (gpu_native && hw::gpu_num > 1) {
+        const char *e = getenv("HD_GPU_NATIVE_BWC_BOUNCE_MB");
+        long bounce_mb = e ? atol(e) : 16;
+        if (bounce_mb < 1) bounce_mb = 1;
+        if (bounce_mb > 256) bounce_mb = 256;
+        this->gpu_write_bounce_nbytes = (size_t)bounce_mb << 20;
     }
     
     /// thread & device info
@@ -916,7 +1018,13 @@ buc_buffer_holder_t::buc_buffer_holder_t(Bucketer_t *bucketer) {
     long nbytes_h_center16 = ceil256(max_batch0 * CSD16 * sizeof(int8_t));
     long nbytes_h_norm     = ceil256(traits::taskVecs * sizeof(int32_t));
     long nbytes_h_out      = ceil256(max_batch0 * (out_max_size + 1) * sizeof(uint32_t));
-    long nbytes_pinned = nbytes_task_vecs + nbytes_h_center16 + (nbytes_h_norm + nbytes_h_out) * num_threads;
+    long nbytes_h_gpu_write = gpu_native ?
+        ceil256(max_batch0 * sizeof(bwc_gpu_write_desc_t)) : 0;
+    long nbytes_h_gpu_bounce = gpu_native ?
+        ceil256(gpu_write_bounce_nbytes) : 0;
+    long nbytes_pinned = nbytes_task_vecs + nbytes_h_center16 +
+                         (nbytes_h_norm + nbytes_h_out + nbytes_h_gpu_write +
+                          nbytes_h_gpu_bounce) * num_threads;
     nbytes_pinned = ((nbytes_pinned + 4095L) / 4096L) * 4096L;
     char *pinned_buf = NULL;
     if (_gpu_numa_host_alloc((void **)&pinned_buf, 4096, nbytes_pinned)) {
@@ -933,11 +1041,59 @@ buc_buffer_holder_t::buc_buffer_holder_t(Bucketer_t *bucketer) {
     d_n        = (int32_t **)  malloc(num_threads * sizeof(int32_t *));
     h_out      = (uint32_t **) malloc(num_threads * sizeof(uint32_t *));
     d_out      = (uint32_t **) malloc(num_threads * sizeof(uint32_t *));
+    if (gpu_native) {
+        // run() chooses the largest power-of-two batch that fits the remaining
+        // logical-bucket limit.  Even with no ready buckets it therefore cannot
+        // exceed this value; sizing for max_batch0 (usually 2048) wastes several
+        // GiB at high dimensions where only tens or hundreds of buckets fit.
+        long stage_batch0 = max_batch0;
+        if (bucketer->_num_buc_slimit > 0) {
+            const long live_batch0 = traits::l0_max_batch0_under(
+                bucketer->_num_buc_slimit);
+            if (stage_batch0 > live_batch0) stage_batch0 = live_batch0;
+        }
+        gpu_write_stage_capacity = (size_t)stage_batch0 * out_max_size;
+        printf("[GPU-BWC] per-worker staging covers %ld buckets (%zu vectors)\n",
+               stage_batch0, gpu_write_stage_capacity);
+        fflush(stdout);
+        h_gpu_write = (bwc_gpu_write_desc_t **)malloc(
+            num_threads * sizeof(bwc_gpu_write_desc_t *));
+        d_gpu_write = (bwc_gpu_write_desc_t **)malloc(
+            num_threads * sizeof(bwc_gpu_write_desc_t *));
+        d_gpu_write_norm = (int32_t **)malloc(num_threads * sizeof(int32_t *));
+        d_gpu_write_vec = (int8_t **)malloc(num_threads * sizeof(int8_t *));
+        d_gpu_peer_write = (bwc_gpu_write_desc_t **)calloc(
+            num_threads * num_devices, sizeof(bwc_gpu_write_desc_t *));
+        d_gpu_peer_norm = (int32_t **)calloc(
+            num_threads * num_devices, sizeof(int32_t *));
+        d_gpu_peer_vec = (int8_t **)calloc(
+            num_threads * num_devices, sizeof(int8_t *));
+        h_gpu_peer_bounce = (uint8_t **)calloc(
+            num_threads, sizeof(uint8_t *));
+        gpu_write_start = (cudaEvent_t *)malloc(num_threads * sizeof(cudaEvent_t));
+        gpu_write_stop = (cudaEvent_t *)malloc(num_threads * sizeof(cudaEvent_t));
+        gpu_write_peer_streams = (cudaStream_t *)calloc(
+            num_threads * num_devices, sizeof(cudaStream_t));
+        gpu_write_pending = (int32_t *)calloc(num_threads, sizeof(int32_t));
+    }
     
     /// host init
     for (int i = 0; i < num_threads; i++) {
         h_norm[i] = (int32_t *) (pinned_buf + nbytes_task_vecs + nbytes_h_center16 + i * nbytes_h_norm);
         h_out[i]  = (uint32_t *)(pinned_buf + nbytes_task_vecs + nbytes_h_center16 + num_threads * nbytes_h_norm + i * nbytes_h_out);
+        if (gpu_native) {
+            h_gpu_write[i] = (bwc_gpu_write_desc_t *)(
+                pinned_buf + nbytes_task_vecs + nbytes_h_center16 +
+                num_threads * (nbytes_h_norm + nbytes_h_out) +
+                i * nbytes_h_gpu_write);
+            if (nbytes_h_gpu_bounce) {
+                h_gpu_peer_bounce[i] = (uint8_t *)(
+                    pinned_buf + nbytes_task_vecs + nbytes_h_center16 +
+                    num_threads * (nbytes_h_norm + nbytes_h_out +
+                                   nbytes_h_gpu_write) +
+                    i * nbytes_h_gpu_bounce);
+            }
+        }
     }
 }
 
@@ -960,6 +1116,28 @@ buc_buffer_holder_t::~buc_buffer_holder_t() {
     free(d_n);
     free(h_out);
     free(d_out);
+    if (gpu_native) {
+        const double gib = 1.0 / (double)(1ULL << 30);
+        printf("[GPU-BWC] materialized %.3f GiB local + %.3f GiB remote "
+               "(host staged) in %.3f s of source-path GPU time%s\n",
+               gpu_native_local_nbytes.load(std::memory_order_relaxed) * gib,
+               gpu_native_peer_nbytes.load(std::memory_order_relaxed) * gib,
+               gpu_native_kernel_us.load(std::memory_order_relaxed) / 1e6,
+               gpu_native_verify_enabled ? " (verified)" : "");
+        fflush(stdout);
+        free(h_gpu_write);
+        free(d_gpu_write);
+        free(d_gpu_write_norm);
+        free(d_gpu_write_vec);
+        free(d_gpu_peer_write);
+        free(d_gpu_peer_norm);
+        free(d_gpu_peer_vec);
+        free(h_gpu_peer_bounce);
+        free(gpu_write_start);
+        free(gpu_write_stop);
+        free(gpu_write_peer_streams);
+        free(gpu_write_pending);
+    }
 }
 
 int buc_buffer_holder_t::device_init(int tid) {
@@ -984,6 +1162,33 @@ int buc_buffer_holder_t::device_init(int tid) {
     CHECK_CUDA_ERR(cudaMalloc(&d_vec[tid], traits::taskVecs * CSD16 * sizeof(int8_t)));
     CHECK_CUDA_ERR(cudaMalloc(&d_n[tid], sizeof(int32_t)));
     CHECK_CUDA_ERR(cudaMalloc(&d_out[tid], max_batch0 * (out_max_size + 1L) * sizeof(uint32_t)));
+    if (gpu_native) {
+        CHECK_CUDA_ERR(cudaMalloc(&d_gpu_write[tid],
+                                  max_batch0 * sizeof(bwc_gpu_write_desc_t)));
+        CHECK_CUDA_ERR(cudaMalloc(&d_gpu_write_norm[tid],
+                                  gpu_write_stage_capacity * sizeof(int32_t)));
+        CHECK_CUDA_ERR(cudaMalloc(&d_gpu_write_vec[tid],
+                                  gpu_write_stage_capacity * CSD));
+        CHECK_CUDA_ERR(cudaEventCreate(&gpu_write_start[tid]));
+        CHECK_CUDA_ERR(cudaEventCreate(&gpu_write_stop[tid]));
+        for (int peer = 0; peer < num_devices; peer++) {
+            if (peer == device_ptr) continue;
+            CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[peer]));
+            const int peer_index = tid * num_devices + peer;
+            CHECK_CUDA_ERR(cudaMalloc(&d_gpu_peer_write[peer_index],
+                                      max_batch0 *
+                                          sizeof(bwc_gpu_write_desc_t)));
+            CHECK_CUDA_ERR(cudaMalloc(&d_gpu_peer_norm[peer_index],
+                                      gpu_write_stage_capacity *
+                                          sizeof(int32_t)));
+            CHECK_CUDA_ERR(cudaMalloc(&d_gpu_peer_vec[peer_index],
+                                      gpu_write_stage_capacity * CSD));
+            CHECK_CUDA_ERR(cudaStreamCreateWithFlags(
+                &gpu_write_peer_streams[peer_index],
+                cudaStreamNonBlocking));
+        }
+        CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[device_ptr]));
+    }
     
     
     if (tid == 0) {
@@ -1002,6 +1207,17 @@ int buc_buffer_holder_t::device_init(int tid) {
     used_gram[device_ptr] += traits::taskVecs * CSD16 * sizeof(int8_t);
     used_gram[device_ptr] += sizeof(int32_t);
     used_gram[device_ptr] += max_batch0 * (out_max_size + 1) * sizeof(uint32_t);
+    if (gpu_native) {
+        used_gram[device_ptr] += max_batch0 * sizeof(bwc_gpu_write_desc_t) +
+                                 gpu_write_stage_capacity *
+                                     (CSD + sizeof(int32_t));
+        for (int peer = 0; peer < num_devices; peer++) {
+            if (peer == device_ptr) continue;
+            used_gram[peer] += max_batch0 * sizeof(bwc_gpu_write_desc_t) +
+                               gpu_write_stage_capacity *
+                                   (CSD + sizeof(int32_t));
+        }
+    }
     pthread_spin_unlock(&gram_lock);
 
     if (used_gram[device_ptr] > bucketer->_gram_slimit) {
@@ -1032,6 +1248,24 @@ int buc_buffer_holder_t::device_done(int tid) {
     CHECK_CUDA_ERR(cudaFree(d_norm[tid]));
     CHECK_CUDA_ERR(cudaFree(d_n[tid]));
     CHECK_CUDA_ERR(cudaFree(d_out[tid]));
+    if (gpu_native) {
+        CHECK_CUDA_ERR(cudaFree(d_gpu_write[tid]));
+        CHECK_CUDA_ERR(cudaFree(d_gpu_write_norm[tid]));
+        CHECK_CUDA_ERR(cudaFree(d_gpu_write_vec[tid]));
+        CHECK_CUDA_ERR(cudaEventDestroy(gpu_write_start[tid]));
+        CHECK_CUDA_ERR(cudaEventDestroy(gpu_write_stop[tid]));
+        for (int peer = 0; peer < num_devices; peer++) {
+            if (peer == device_ptr) continue;
+            CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[peer]));
+            const int peer_index = tid * num_devices + peer;
+            CHECK_CUDA_ERR(cudaFree(d_gpu_peer_write[peer_index]));
+            CHECK_CUDA_ERR(cudaFree(d_gpu_peer_norm[peer_index]));
+            CHECK_CUDA_ERR(cudaFree(d_gpu_peer_vec[peer_index]));
+            CHECK_CUDA_ERR(cudaStreamDestroy(
+                gpu_write_peer_streams[peer_index]));
+        }
+        CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[device_ptr]));
+    }
     
     if (tid == 0) CHECK_CUDA_ERR(cudaFree(state));
     
@@ -1044,6 +1278,17 @@ int buc_buffer_holder_t::device_done(int tid) {
     used_gram[device_ptr] -= traits::taskVecs * CSD16 * sizeof(int8_t);
     used_gram[device_ptr] -= sizeof(int32_t);
     used_gram[device_ptr] -= max_batch0 * (out_max_size + 1) * sizeof(uint32_t);
+    if (gpu_native) {
+        used_gram[device_ptr] -= max_batch0 * sizeof(bwc_gpu_write_desc_t) +
+                                 gpu_write_stage_capacity *
+                                     (CSD + sizeof(int32_t));
+        for (int peer = 0; peer < num_devices; peer++) {
+            if (peer == device_ptr) continue;
+            used_gram[peer] -= max_batch0 * sizeof(bwc_gpu_write_desc_t) +
+                               gpu_write_stage_capacity *
+                                   (CSD + sizeof(int32_t));
+        }
+    }
     pthread_spin_unlock(&gram_lock);
 
     return 0;
@@ -1163,6 +1408,254 @@ int buc_buffer_holder_t::out(int tid, int bid, int *num, int **entry) {
 
     *num = h_out[tid][bid];
     *entry = (int *)(h_out[tid] + curr_batch0 + out_max_size * bid);
+    return 0;
+}
+
+bool buc_buffer_holder_t::gpu_native_reserve(int tid, int bid, int bucket_id,
+                                              int entry_size) {
+    if (!gpu_native || tid < 0 || tid >= num_threads ||
+        bid < 0 || bid >= curr_batch0) return false;
+    return bucketer->_bwc->reserve_gpu_native_write(
+        bucket_id, entry_size, &h_gpu_write[tid][bid]);
+}
+
+int buc_buffer_holder_t::gpu_native_begin(int tid) {
+    if (!gpu_native || tid < 0 || tid >= num_threads) return 0;
+    bool have_work = false;
+    const int source_device = hw::gpu_ptr(tid, num_threads);
+    int32_t peer_begin[MAX_NUM_DEVICE] = {};
+    int32_t peer_size[MAX_NUM_DEVICE] = {};
+    int32_t stage_size = 0;
+    for (int peer = 0; peer < num_devices; peer++) {
+        peer_begin[peer] = stage_size;
+        for (int bid = 0; bid < curr_batch0; bid++) {
+            bwc_gpu_write_desc_t &desc = h_gpu_write[tid][bid];
+            if (!desc.enabled || desc.write_size <= 0 ||
+                desc.device_ptr != peer) continue;
+            have_work = true;
+            desc.stage_begin = stage_size;
+            stage_size += desc.write_size;
+            const uint64_t nbytes =
+                (uint64_t)desc.write_size * (CSD + sizeof(int32_t));
+            if (peer == source_device)
+                gpu_native_local_nbytes.fetch_add(
+                    nbytes, std::memory_order_relaxed);
+            else
+                gpu_native_peer_nbytes.fetch_add(
+                    nbytes, std::memory_order_relaxed);
+        }
+        peer_size[peer] = stage_size - peer_begin[peer];
+    }
+    if (!have_work) return 0;
+    if ((size_t)stage_size > gpu_write_stage_capacity) {
+        fprintf(stderr,
+                "[GPU-BWC] fatal staging overflow: %d vectors exceeds %zu\n",
+                stage_size, gpu_write_stage_capacity);
+        abort();
+    }
+
+    CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[source_device]));
+    CHECK_CUDA_ERR(cudaEventRecord(gpu_write_start[tid], streams[tid]));
+    CHECK_CUDA_ERR(cudaMemcpyAsync(
+        d_gpu_write[tid], h_gpu_write[tid],
+        curr_batch0 * sizeof(bwc_gpu_write_desc_t),
+        cudaMemcpyHostToDevice, streams[tid]));
+    __materialize_exact_buckets<<<curr_batch0, 256, 0, streams[tid]>>>(
+        d_gpu_write[tid], d_out[tid], out_max_size, curr_batch0,
+        d_norm[tid], d_vec[tid], d_gpu_write_norm[tid],
+        d_gpu_write_vec[tid], CSD);
+    CHECK_LAST_ERR;
+    // Source staging is complete before any destination stream consumes it.
+    // CUDA peer copies are not reliable under concurrent two-GPU load on this
+    // PCIe machine, so remote ranges cross a bounded pinned-host bounce buffer.
+    // The final scatter still runs on the owning GPU and all transfers remain
+    // coalesced instead of falling back to per-vector CPU materialization.
+    CHECK_CUDA_ERR(cudaStreamSynchronize(streams[tid]));
+    for (int peer = 0; peer < num_devices; peer++) {
+        if (peer == source_device || peer_size[peer] == 0) continue;
+        const int peer_index = tid * num_devices + peer;
+        const size_t begin = peer_begin[peer];
+        const size_t count = peer_size[peer];
+        cudaStream_t peer_stream = gpu_write_peer_streams[peer_index];
+        auto bounce_copy = [&](void *dst, const void *src, size_t nbytes) {
+            size_t offset = 0;
+            while (offset < nbytes) {
+                const size_t step =
+                    nbytes - offset < gpu_write_bounce_nbytes ?
+                    nbytes - offset : gpu_write_bounce_nbytes;
+                CHECK_CUDA_ERR(cudaSetDevice(
+                    hw::gpu_id_list[source_device]));
+                CHECK_CUDA_ERR(cudaMemcpyAsync(
+                    h_gpu_peer_bounce[tid],
+                    (const uint8_t *)src + offset, step,
+                    cudaMemcpyDeviceToHost, streams[tid]));
+                CHECK_CUDA_ERR(cudaStreamSynchronize(streams[tid]));
+                CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[peer]));
+                CHECK_CUDA_ERR(cudaMemcpyAsync(
+                    (uint8_t *)dst + offset, h_gpu_peer_bounce[tid], step,
+                    cudaMemcpyHostToDevice, peer_stream));
+                // The buffer is private to this worker but reused for the next
+                // chunk immediately, so complete the H2D leg before refilling.
+                CHECK_CUDA_ERR(cudaStreamSynchronize(peer_stream));
+                offset += step;
+            }
+        };
+        bounce_copy(d_gpu_peer_norm[peer_index] + begin,
+                    d_gpu_write_norm[tid] + begin,
+                    count * sizeof(int32_t));
+        bounce_copy(d_gpu_peer_vec[peer_index] + begin * CSD,
+                    d_gpu_write_vec[tid] + begin * CSD, count * CSD);
+
+        CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[peer]));
+        CHECK_CUDA_ERR(cudaMemcpyAsync(
+            d_gpu_peer_write[peer_index], h_gpu_write[tid],
+            curr_batch0 * sizeof(bwc_gpu_write_desc_t),
+            cudaMemcpyHostToDevice, peer_stream));
+        __scatter_exact_buckets<<<curr_batch0, 256, 0, peer_stream>>>(
+            d_gpu_peer_write[peer_index], d_gpu_peer_norm[peer_index],
+            d_gpu_peer_vec[peer_index], curr_batch0, peer, CSD);
+        CHECK_LAST_ERR;
+    }
+
+    CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[source_device]));
+    __scatter_exact_buckets<<<curr_batch0, 256, 0, streams[tid]>>>(
+        d_gpu_write[tid], d_gpu_write_norm[tid], d_gpu_write_vec[tid],
+        curr_batch0, source_device, CSD);
+    CHECK_LAST_ERR;
+    CHECK_CUDA_ERR(cudaEventRecord(gpu_write_stop[tid], streams[tid]));
+    gpu_write_pending[tid] = 1;
+    return 0;
+}
+
+int buc_buffer_holder_t::gpu_native_wait(int tid) {
+    if (!gpu_native || tid < 0 || tid >= num_threads ||
+        !gpu_write_pending[tid]) return 0;
+    const int source_device = hw::gpu_ptr(tid, num_threads);
+    CHECK_CUDA_ERR(cudaStreamSynchronize(streams[tid]));
+    for (int peer = 0; peer < num_devices; peer++) {
+        if (peer == source_device) continue;
+        bool have_peer_work = false;
+        for (int bid = 0; bid < curr_batch0; bid++) {
+            const bwc_gpu_write_desc_t &desc = h_gpu_write[tid][bid];
+            if (desc.enabled && desc.write_size > 0 &&
+                desc.device_ptr == peer) {
+                have_peer_work = true;
+                break;
+            }
+        }
+        if (!have_peer_work) continue;
+        CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[peer]));
+        CHECK_CUDA_ERR(cudaStreamSynchronize(
+            gpu_write_peer_streams[tid * num_devices + peer]));
+    }
+    CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[source_device]));
+    float elapsed_ms = 0.0f;
+    CHECK_CUDA_ERR(cudaEventElapsedTime(&elapsed_ms, gpu_write_start[tid],
+                                        gpu_write_stop[tid]));
+    gpu_native_kernel_us.fetch_add((uint64_t)(elapsed_ms * 1000.0f),
+                                   std::memory_order_relaxed);
+    gpu_write_pending[tid] = 0;
+    return 0;
+}
+
+int buc_buffer_holder_t::gpu_native_verify(
+        int tid, int bid, chunk_t **working_chunk, int task_chunks,
+        const int32_t *working_chunk_size) {
+    if (!gpu_native_verify_enabled || tid < 0 || tid >= num_threads ||
+        bid < 0 || bid >= curr_batch0) return 0;
+    const bwc_gpu_write_desc_t &desc = h_gpu_write[tid][bid];
+    if (!desc.enabled || desc.write_size <= 0) return 0;
+
+    int32_t *norm = (int32_t *)malloc((size_t)desc.write_size * sizeof(int32_t));
+    int8_t *vec = (int8_t *)malloc((size_t)desc.write_size * CSD);
+    if (!norm || !vec) {
+        fprintf(stderr, "[GPU-BWC] verification allocation failed\n");
+        abort();
+    }
+    CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[desc.device_ptr]));
+    int begin = 0;
+    for (int span = 0; span < desc.num_spans; span++) {
+        const int end = desc.span_end[span];
+        const int size = end - begin;
+        CHECK_CUDA_ERR(cudaMemcpy(norm + begin, desc.d_norm[span],
+                                  (size_t)size * sizeof(int32_t),
+                                  cudaMemcpyDeviceToHost));
+        CHECK_CUDA_ERR(cudaMemcpy(vec + (size_t)begin * CSD, desc.d_vec[span],
+                                  (size_t)size * CSD,
+                                  cudaMemcpyDeviceToHost));
+        begin = end;
+    }
+
+    const uint32_t *entries = h_out[tid] + curr_batch0 + out_max_size * bid;
+    for (int out_pos = 0; out_pos < desc.write_size; out_pos++) {
+        const uint32_t entry = entries[desc.entry_size - 1 - out_pos];
+        const int flat_pos = entry >> 1;
+        int pos = flat_pos;
+        const int sign = entry & 1;
+        int chunk_ptr = 0;
+        while (chunk_ptr < task_chunks && pos >= working_chunk_size[chunk_ptr]) {
+            pos -= working_chunk_size[chunk_ptr++];
+        }
+        if (chunk_ptr >= task_chunks ||
+            norm[out_pos] != working_chunk[chunk_ptr]->norm[pos]) {
+            int32_t source_gpu_norm = -1, stage_gpu_norm = -1;
+            int32_t peer_stage_norm = -1;
+            bwc_gpu_write_desc_t peer_desc = {};
+            const int source_device = hw::gpu_ptr(tid, num_threads);
+            if (desc.device_ptr != source_device) {
+                const int peer_index = tid * num_devices + desc.device_ptr;
+                CHECK_CUDA_ERR(cudaSetDevice(
+                    hw::gpu_id_list[desc.device_ptr]));
+                CHECK_CUDA_ERR(cudaMemcpy(
+                    &peer_stage_norm,
+                    d_gpu_peer_norm[peer_index] + desc.stage_begin + out_pos,
+                    sizeof(peer_stage_norm), cudaMemcpyDeviceToHost));
+                CHECK_CUDA_ERR(cudaMemcpy(
+                    &peer_desc, d_gpu_peer_write[peer_index] + bid,
+                    sizeof(peer_desc), cudaMemcpyDeviceToHost));
+            }
+            CHECK_CUDA_ERR(cudaSetDevice(
+                hw::gpu_id_list[source_device]));
+            CHECK_CUDA_ERR(cudaMemcpy(&source_gpu_norm, d_norm[tid] + flat_pos,
+                                      sizeof(source_gpu_norm),
+                                      cudaMemcpyDeviceToHost));
+            CHECK_CUDA_ERR(cudaMemcpy(
+                &stage_gpu_norm,
+                d_gpu_write_norm[tid] + desc.stage_begin + out_pos,
+                sizeof(stage_gpu_norm), cudaMemcpyDeviceToHost));
+            fprintf(stderr,
+                    "[GPU-BWC] verification failed at tid %d bucket %d entry %d "
+                    "flat-position %d encoded 0x%08x: got norm %d, host %d, "
+                    "source GPU %d, staging %d, peer staging %d; source device "
+                    "%d, owner %d, spans %d, write %d/%d; peer descriptor "
+                    "enabled %d owner %d stage %d write %d\n",
+                    tid, bid, out_pos, flat_pos, entry, norm[out_pos],
+                    chunk_ptr < task_chunks ?
+                        working_chunk[chunk_ptr]->norm[pos] : -1,
+                    source_gpu_norm, stage_gpu_norm, peer_stage_norm,
+                    source_device,
+                    desc.device_ptr, desc.num_spans, desc.write_size,
+                    desc.entry_size, peer_desc.enabled, peer_desc.device_ptr,
+                    peer_desc.stage_begin, peer_desc.write_size);
+            abort();
+        }
+        const int8_t *src = working_chunk[chunk_ptr]->vec + (size_t)pos * CSD;
+        const int8_t *dst = vec + (size_t)out_pos * CSD;
+        for (int c = 0; c < CSD; c++) {
+            int8_t expected = src[c];
+            if (sign) expected = (int8_t)(-(int)expected);
+            if (dst[c] != expected) {
+                fprintf(stderr,
+                        "[GPU-BWC] verification failed at tid %d bucket %d "
+                        "entry %d coordinate %d: got %d expected %d\n",
+                        tid, bid, out_pos, c, (int)dst[c], (int)expected);
+                abort();
+            }
+        }
+    }
+    free(norm);
+    free(vec);
+    CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[hw::gpu_ptr(tid, num_threads)]));
     return 0;
 }
 
@@ -1487,13 +1980,24 @@ static inline void __int4_roundtrip(int8_t *v, int CSD, int bits) {
 
 int Bucketer_t::run() {
     if (_buc_buf) delete _buc_buf;
-    _buc_buf = new buc_buffer_holder_t(this);
 
     /// prepare runtime data
     flag = 0;
     buc_id = (int32_t *) malloc(_max_batch0 * sizeof(int32_t));
     ctr_record = (int8_t *) malloc(BWC_MAX_BUCKETS * Pool_hd_t::vec_nbytes);
     buc_iter = new buc_iterator_t(this);
+    // Every full task consumes taskChunks pool chunks; only the final task of
+    // each worker may be partial.  Combined with the kernel's per-task output
+    // cap, this is a strict upper bound for one logical bucket.  Reserving it
+    // up front lets a bucket use either the exact GPU path or the unchanged
+    // host path, never a lossy mixture after HBM exhaustion.
+    const long max_task_batches =
+        (buc_iter->num_chunk_limit + traits::taskChunks - 1) /
+            traits::taskChunks + _num_threads;
+    const long gpu_native_bucket_capacity =
+        max_task_batches * __buc_out_max_size(this);
+    _bwc->configure_gpu_native_buckets(true, gpu_native_bucket_capacity);
+    _buc_buf = new buc_buffer_holder_t(this);
     pthread_spin_init(&score_stat_lock, PTHREAD_PROCESS_SHARED);
 
     { const char *e = getenv("HD_INT4_BUCKETS"); _int4_buckets = e ? atol(e) : 0; }
@@ -1681,6 +2185,7 @@ int Bucketer_t::run() {
 
     delete _buc_buf;
     _buc_buf = NULL;
+    _bwc->report_gpu_native();
 
     if (_measure_stale) {
         long hits = 0, ow = 0;
@@ -1836,9 +2341,48 @@ int Bucketer_t::_batch(int tid, int replace_th, int batch0) {
             int32_t working_chunk_size[taskChunks] = {};
             for (int i = 0; i < task_chunks; i++) working_chunk_size[i] = working_chunk[i]->size;
             random_interval_iter_t iiter(batch0);
+            int32_t host_bucket_order[BGJ_L0_MAX_BATCH0];
+            int32_t num_host_buckets = 0;
+            if (_buc_buf->gpu_native)
+                memset(_buc_buf->h_gpu_write[tid], 0,
+                       batch0 * sizeof(bwc_gpu_write_desc_t));
 
             for (int _i = 0; _i < batch0; _i++) {
                 int i = iiter.pop();
+                int to_add, *entry;
+                _buc_buf->out(tid, i, &to_add, &entry);
+                if (_buc_buf->gpu_native_reserve(tid, i, buc_id[i], to_add)) {
+                    // Keep the indexed-bucket staleness probe semantically
+                    // identical even when exact coordinates bypass the CPU.
+                    if (_measure_stale) {
+                        for (int j = 0; j < to_add; j++) {
+                            int pos = entry[j] >> 1;
+                            int working_chunk_id = 0;
+                            while (working_chunk_id < task_chunks &&
+                                   pos >= working_chunk_size[working_chunk_id]) {
+                                pos -= working_chunk_size[working_chunk_id++];
+                            }
+                            if (working_chunk_id < task_chunks) {
+                                chunk_t *_src = working_chunk[working_chunk_id];
+                                long gs = (long)_src->id *
+                                          Pool_hd_t::chunk_max_nvecs + pos;
+                                if (gs >= 0 && gs < _stale_slot_capacity)
+                                    _stale_slot_batch[gs] = (uint8_t)_cur_batch;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                host_bucket_order[num_host_buckets++] = i;
+            }
+
+            // One descriptor upload and one kernel materialize all direct
+            // buckets for this task.  Let it overlap CPU scatter for buckets
+            // that could not reserve their complete worst-case HBM capacity.
+            _buc_buf->gpu_native_begin(tid);
+
+            for (int _i = 0; _i < num_host_buckets; _i++) {
+                int i = host_bucket_order[_i];
                 int to_add, *entry;
                 _buc_buf->out(tid, i, &to_add, &entry);
                 while (to_add > 0) {
@@ -1882,6 +2426,15 @@ int Bucketer_t::_batch(int tid, int replace_th, int batch0) {
                     _dst->size += to_move;
                     _bwc->write_done(_dst, buc_id[i]);
                 }
+            }
+
+            _buc_buf->gpu_native_wait(tid);
+            if (_buc_buf->gpu_native_verify_enabled) {
+                for (int i = 0; i < batch0;
+                     i += _buc_buf->gpu_native_verify_stride)
+                    _buc_buf->gpu_native_verify(tid, i, working_chunk,
+                                                task_chunks,
+                                                working_chunk_size);
             }
 
             for (int i = 0; i < task_chunks; i++) {

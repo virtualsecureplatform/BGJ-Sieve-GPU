@@ -91,6 +91,11 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
     // the reducer strategy is known; a zero/failed allocation leaves the
     // existing host/NVMe path unchanged.
     void configure_hbm_cache(bool enable);
+    void configure_gpu_native_buckets(bool enable, long max_bucket_nvecs);
+    bool gpu_native_enabled() const { return _gpu_native_enabled; }
+    bool reserve_gpu_native_write(long bucket_id, int entry_size,
+                                  bwc_gpu_write_desc_t *desc);
+    void report_gpu_native();
     bool bucket_in_hbm(long bucket_id);
     bool fetch_hbm_for_read(long bucket_id, int device_ptr, int *size,
                             const int32_t **d_norm, const int8_t **d_vec,
@@ -116,6 +121,7 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
         static constexpr uint32_t _bk_reading   = 0x20000000;
         static constexpr uint32_t _bk_caching   = 0x10000000;
         static constexpr uint32_t _bk_hbm       = 0x08000000;
+        static constexpr uint32_t _bk_gpu_write = 0x04000000;
         
         uint32_t status = 0;
         int32_t num_chunks = 0;
@@ -123,6 +129,9 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
         int16_t *hbm_sizes = NULL;
         chunk_t *writing_chunk = NULL;
         int16_t hbm_device = -1;
+        int32_t hbm_reserved_chunks = 0;
+        int32_t hbm_nvecs = 0;
+        int32_t hbm_capacity_nvecs = 0;
 
         inline int init() {
             int ret = 0;
@@ -139,8 +148,29 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
             num_chunks = 0;
             writing_chunk = NULL;
             hbm_device = -1;
+            hbm_reserved_chunks = 0;
+            hbm_nvecs = 0;
+            hbm_capacity_nvecs = 0;
             alloc_size = l0_bucket_t::init_alloc_chunks;
             return ret;
+        }
+
+        inline int reserve_chunks(int32_t size) {
+            if (size <= alloc_size) return 0;
+            int32_t new_size = alloc_size;
+            while (new_size < size) new_size *= 2;
+            int32_t *new_chunk_ids =
+                (int32_t *)realloc(chunk_ids, sizeof(int32_t) * new_size);
+            int16_t *new_hbm_sizes =
+                (int16_t *)realloc(hbm_sizes, sizeof(int16_t) * new_size);
+            if (new_chunk_ids == NULL || new_hbm_sizes == NULL) {
+                fprintf(stderr, "[Error] bwc_manager_t::l0_bucket_t::reserve_chunks: realloc failed\n");
+                abort();
+            }
+            chunk_ids = new_chunk_ids;
+            hbm_sizes = new_hbm_sizes;
+            alloc_size = new_size;
+            return 0;
         }
 
         inline int add_chunk(int32_t chunk_id) {
@@ -187,10 +217,19 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
     };
     hbm_arena_t _hbm[MAX_NUM_DEVICE];
     bool _hbm_enabled = false;
+    bool _gpu_native_enabled = false;
+    int32_t _gpu_native_max_nvecs = 0;
+    int32_t _gpu_native_max_chunks = 0;
+    std::atomic<uint64_t> _gpu_native_buckets{0};
+    std::atomic<uint64_t> _gpu_native_host_fallbacks{0};
+    std::atomic<uint64_t> _gpu_native_entries{0};
+    std::atomic<uint64_t> _gpu_native_overflows{0};
     void __destroy_hbm_cache();
     int __hbm_alloc(int device_ptr);
+    bool __hbm_reserve(int device_ptr, int32_t num_slots, int32_t *slots);
     void __hbm_release(int device_ptr, int slot_id);
     int8_t *__hbm_slot(int device_ptr, int slot_id);
+    bool __start_gpu_native_bucket(int32_t bucket_id);
     bool __stage_bucket_to_hbm(int32_t bucket_id);
 
     void __prefetch_for_writing();
