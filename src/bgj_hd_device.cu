@@ -4653,6 +4653,20 @@ int Reducer_t::auto_bgj_params_set(int bgj) {
         lg_warn("limit from bwc #cache %d < expected num threads %d", ram_limit, expect_num_threads);
         expect_num_threads = ram_limit;
     }
+    const char *bgj2_threads_env = getenv("HD_BGJ2_REDUCER_THREADS");
+    if (_strategy == strategy_bgj2 && bgj2_threads_env && bgj2_threads_env[0]) {
+        char *end = NULL;
+        long requested = strtol(bgj2_threads_env, &end, 10);
+        if (end && *end == '\0' && requested >= hw::gpu_num &&
+            requested <= RED_MAX_NUM_THREADS && requested % hw::gpu_num == 0) {
+            expect_num_threads = (int)requested;
+            lg_dbg("using HD_BGJ2_REDUCER_THREADS=%ld (%ld workers per GPU)",
+                   requested, requested / hw::gpu_num);
+        } else {
+            lg_warn("ignoring invalid HD_BGJ2_REDUCER_THREADS='%s' (expected an even value in [%d, %d])",
+                    bgj2_threads_env, hw::gpu_num, RED_MAX_NUM_THREADS);
+        }
+    }
     if (expect_num_threads < 1) expect_num_threads = 1;
     if (!this->_num_threads) this->set_num_threads(expect_num_threads);
     for (int device_ptr = 0; device_ptr < hw::gpu_num; device_ptr++) {

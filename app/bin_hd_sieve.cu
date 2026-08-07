@@ -4,7 +4,53 @@
 #include <string>
 #include <vector>
 
+#include <cuda.h>
+
 #include "../include/pool_hd.h"
+
+static int configure_cuda_wait_policy() {
+    const char *blocking_env = getenv("HD_CUDA_BLOCKING_SYNC");
+    if (blocking_env && atoi(blocking_env) == 0) return 0;
+
+    CUresult ret = cuInit(0);
+    if (ret != CUDA_SUCCESS) {
+        const char *name = NULL;
+        cuGetErrorName(ret, &name);
+        fprintf(stderr, "[Error] cuInit failed while enabling blocking sync: %s\n",
+                name ? name : "unknown CUDA driver error");
+        return -1;
+    }
+
+    for (int i = 0; i < hw::gpu_num; i++) {
+        CUdevice device;
+        ret = cuDeviceGet(&device, hw::gpu_id_list[i]);
+        if (ret == CUDA_SUCCESS) {
+            unsigned int flags = 0;
+            int active = 0;
+            ret = cuDevicePrimaryCtxGetState(device, &flags, &active);
+            if (ret == CUDA_SUCCESS && active) {
+                fprintf(stderr,
+                        "[Error] GPU %d primary context is already active; blocking sync must be configured before CUDA initialization\n",
+                        hw::gpu_id_list[i]);
+                return -1;
+            }
+            if (ret == CUDA_SUCCESS) {
+                flags = (flags & ~CU_CTX_SCHED_MASK) | CU_CTX_SCHED_BLOCKING_SYNC;
+                ret = cuDevicePrimaryCtxSetFlags(device, flags);
+            }
+        }
+        if (ret != CUDA_SUCCESS) {
+            const char *name = NULL;
+            cuGetErrorName(ret, &name);
+            fprintf(stderr, "[Error] failed to enable blocking sync on GPU %d: %s\n",
+                    hw::gpu_id_list[i], name ? name : "unknown CUDA driver error");
+            return -1;
+        }
+    }
+
+    printf("CUDA primary contexts configured for blocking synchronization\n");
+    return 0;
+}
 
 struct task_config_t {
     static constexpr int task_final_sieve = 1;
@@ -89,6 +135,8 @@ void run_command_file(const char* filename) {
 }
 
 int main(int argc, char** argv) {
+    if (configure_cuda_wait_policy()) return 1;
+
     if (argc == 2 && strstr(argv[1], ".cmd")) {
         run_command_file(argv[1]);
         _destory_ck_allocator();

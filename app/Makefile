@@ -1,7 +1,7 @@
 CUBIN = $(patsubst bin_%.cu,%, $(wildcard *.cu))
 CXX = g++
 CFLAGS = -O3 -g -fopenmp -march=native -pthread -Wno-unused-result -Wno-format-truncation
-LIBS = -L../src -lllib -lntl -lgmp -lm
+LIBS = -L../src -lllib -lntl -lgmp -lm -lcuda
 INC_DIR =
 
 SURP = -diag-suppress 549,550,815,1650 -Wno-deprecated-gpu-targets -gencode arch=compute_80,code=sm_80 -static-global-template-stub=false
