@@ -85,6 +85,14 @@ $ ./hd_sieve --input INPUT_FILE --task sieve --TSD 110
 
 Before running any serious tasks, generally you should adjust `config.h` to match your hardware and get the best performance. You can control both the computational and storage resources used by `hd_sieve`. Compile again after modifying `config.h` to apply the changes.
 
+### Reproducing the SVP-138 seed-2 result
+
+The pinned, end-to-end recipe in
+[`reproduce/svp138-seed2`](reproduce/svp138-seed2/README.md) starts from the
+official Darmstadt online lattice generator, performs the recorded fplll
+LLL/BKZ-60 preprocessing, builds the SVP-140 cache profile, runs sieve seed 0,
+and independently verifies the resulting vector.
+
 ### Example: Reproducing the LWE Challenge
 
 This section gives a step-by-step example for reproducing the solution of one LWE challenge from the paper. Many of the concrete parameters here are not strict: adjusting them slightly will usually not make the overall computation dramatically faster or slower. The full process is expected to take a few days, depending on your machine configuration.
@@ -126,4 +134,3 @@ After obtaining the short vector, you can easily recover the secret:
 ```text
 [1635 312 1536 1180 158 319 1028 117 1113 760 649 12 1383 411 35 323 1399 97 168 1666 796 724 1451 1670 1830 1031 1863 165 52 614 146 813 1492 616 119 1331 1595 1803 1226 1095 1326 847 963 1085 2016]
 ```
-
