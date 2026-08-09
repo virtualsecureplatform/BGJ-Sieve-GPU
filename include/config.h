@@ -10,8 +10,8 @@ struct hw {
     static inline const char *ssd_name(int chunk_id) {
         return (chunk_id & 1) ? "1" : "0";
     }
-    static constexpr int gpu_num = 2;
-    static constexpr const int gpu_id_list[gpu_num] = {0, 1};
+    static constexpr int gpu_num = 4;
+    static constexpr const int gpu_id_list[gpu_num] = {0, 1, 2, 3};
     static inline int gpu_ptr(int tid, int num_threads) {
         return (tid * gpu_num) / num_threads;
     }

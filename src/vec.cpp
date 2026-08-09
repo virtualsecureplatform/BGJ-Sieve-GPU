@@ -1,4 +1,5 @@
 #include "../include/vec.h"
+#include <cstring>
 
 
 /* aligned double vec operations, n should be divided by 8. */
@@ -599,26 +600,11 @@ double tri_dot_slow(double *a, double *b, double *c, long n){
 }
 
 void vec_collect(int8_t *dst, int8_t **src_list, int n, int CSD, int CSD16) {
-    const __mmask64 m0 = CSD > 64 ?  0xffffffffffffffffULL : (1ULL << CSD) - 1;
-    const __mmask64 m1 = CSD >= 128 ? 0xffffffffffffffffULL : CSD > 64 ? (1ULL << (CSD - 64)) - 1 : 0;
-    const __mmask64 m2 = CSD > 128 ? (1ULL << (CSD - 128)) - 1 : 0;
-    
-    // needed in both BGJL_HOST_UPK settings: referenced (possibly in dead
-    // ternary branches) below
-    const __mmask64 wm0 = CSD16 > 64 ?  0xffffffffffffffffULL : (1ULL << CSD16) - 1;
-    const __mmask64 wm1 = CSD16 >= 128 ? 0xffffffffffffffffULL : CSD16 > 64 ? (1ULL << (CSD16 - 64)) - 1 : 0;
-    const __mmask64 wm2 = CSD16 > 128 ? (1ULL << (CSD16 - 128)) - 1 : 0;
-
-    #pragma unroll
+    const int dst_stride = BGJL_HOST_UPK ? CSD16 : CSD;
     for (int j = 0; j < n; j++) {
-        int8_t *_dst = dst + j * (BGJL_HOST_UPK ? CSD16 : CSD);
+        int8_t *_dst = dst + j * dst_stride;
         int8_t *_src = src_list[j];
-        __m512i v0 = _mm512_maskz_loadu_epi8(m0, _src);
-        __m512i v1 = _mm512_maskz_loadu_epi8(m1, _src + 64);
-        __m512i v2 = _mm512_maskz_loadu_epi8(m2, _src + 128);
-        _mm512_mask_storeu_epi8(_dst, (BGJL_HOST_UPK ? wm0 : m0), v0);
-        _mm512_mask_storeu_epi8(_dst + 64, (BGJL_HOST_UPK ? wm1 : m1), v1);
-        _mm512_mask_storeu_epi8(_dst + 128, (BGJL_HOST_UPK ? wm2 : m2), v2);
+        memcpy(_dst, _src, CSD);
+        if (dst_stride > CSD) memset(_dst + CSD, 0, dst_stride - CSD);
     }
 }
-                    

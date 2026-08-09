@@ -1446,33 +1446,48 @@ extern int _normalize_chunk(chunk_t *chunk, int CSD) {
 }
 
 extern int pop_check_vec_err(int8_t *src1, int8_t *src2, int CSD) {
-    __mmask64 m0 = CSD >= 64 ? 0xffffffff : ((1UL << CSD) - 1);
-    __mmask64 m1 = CSD < 64 ? 0 : (CSD > 128 ? 0xffffffff : ((1UL << (CSD - 64)) - 1));
-    __mmask64 m2 = CSD < 128 ? 0 : ((1UL << (CSD - 128)) - 1);
-    __m512i x0 = _mm512_maskz_loadu_epi8(m0, (__m512i *) src1);
-    __m512i x1 = _mm512_maskz_loadu_epi8(m1, (__m512i *) src1 + 64);
-    __m512i x2 = _mm512_maskz_loadu_epi8(m2, (__m512i *) src1 + 128);
-    __m512i y0 = _mm512_maskz_loadu_epi8(m0, (__m512i *) src2);
-    __m512i y1 = _mm512_maskz_loadu_epi8(m1, (__m512i *) src2 + 64);
-    __m512i y2 = _mm512_maskz_loadu_epi8(m2, (__m512i *) src2 + 128);
-    __m512i d0 = _mm512_abs_epi8(_mm512_sub_epi8(x0, y0));
-    __m512i d1 = _mm512_abs_epi8(_mm512_sub_epi8(x1, y1));
-    __m512i d2 = _mm512_abs_epi8(_mm512_sub_epi8(x2, y2));
-    __m512i dm = _mm512_max_epi8(_mm512_max_epi8(d0, d1), d2);
-    #ifndef _mm256_reduce_max_epi8
-    #define _mm256_reduce_max_epi8(_v) ({ \
-        __m128i _v128_low = _mm256_castsi256_si128(_v); \
-        __m128i _v128_high = _mm256_extracti128_si256(_v, 1); \
-        __m128i _max128 = _mm_max_epi8(_v128_low, _v128_high); \
-        _max128 = _mm_max_epi8(_max128, _mm_srli_si128(_max128, 8)); \
-        _max128 = _mm_max_epi8(_max128, _mm_srli_si128(_max128, 4)); \
-        _max128 = _mm_max_epi8(_max128, _mm_srli_si128(_max128, 2)); \
-        _max128 = _mm_max_epi8(_max128, _mm_srli_si128(_max128, 1)); \
-        _mm_extract_epi8(_max128, 0); \
-    })
-    #endif
-    int vec_err = _mm256_reduce_max_epi8(_mm256_max_epi8(_mm512_castsi512_si256(dm), _mm512_extracti64x4_epi64(dm, 1)));
-    vec_err = vec_err > 3 ? 3 : vec_err;
-
+#if defined(__AVX2__)
+    const __m256i two = _mm256_set1_epi16(2);
+    __m256i vmax = _mm256_setzero_si256();
+    int i = 0;
+    for (; i + 32 <= CSD; i += 32) {
+        const __m256i a8 = _mm256_loadu_si256((const __m256i *)(src1 + i));
+        const __m256i b8 = _mm256_loadu_si256((const __m256i *)(src2 + i));
+        const __m256i alo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(a8));
+        const __m256i ahi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a8, 1));
+        const __m256i blo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(b8));
+        const __m256i bhi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(b8, 1));
+        const __m256i dlo = _mm256_abs_epi16(_mm256_sub_epi16(alo, blo));
+        const __m256i dhi = _mm256_abs_epi16(_mm256_sub_epi16(ahi, bhi));
+        if (_mm256_movemask_epi8(_mm256_cmpgt_epi16(dlo, two)) ||
+            _mm256_movemask_epi8(_mm256_cmpgt_epi16(dhi, two)))
+            return 3;
+        vmax = _mm256_max_epi16(vmax, _mm256_max_epi16(dlo, dhi));
+    }
+    alignas(32) int16_t lanes[16];
+    _mm256_store_si256((__m256i *)lanes, vmax);
+    int vec_err = 0;
+    for (int lane = 0; lane < 16; lane++)
+        if (lanes[lane] > vec_err) vec_err = lanes[lane];
+    for (; i < CSD; i++) {
+        int diff = (int)src1[i] - (int)src2[i];
+        if (diff < 0) diff = -diff;
+        if (diff > vec_err) {
+            vec_err = diff;
+            if (vec_err >= 3) return 3;
+        }
+    }
     return vec_err;
+#else
+    int vec_err = 0;
+    for (int i = 0; i < CSD; i++) {
+        int diff = (int)src1[i] - (int)src2[i];
+        if (diff < 0) diff = -diff;
+        if (diff > vec_err) {
+            vec_err = diff;
+            if (vec_err >= 3) return 3;
+        }
+    }
+    return vec_err;
+#endif
 }
