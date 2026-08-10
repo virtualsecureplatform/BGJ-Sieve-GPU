@@ -1,0 +1,59 @@
+Bootstrap: docker
+From: nvidia/cuda:13.3.0-devel-ubuntu24.04
+
+%labels
+    CUDA 13.3.0
+    GPU A100 (sm_80)
+    fplll 5.5.0
+    Purpose BGJ-Sieve-GPU build and preprocessing environment
+
+%files
+    dep/fplll /opt/src/fplll
+    dep/BLASter /opt/src/BLASter
+
+%environment
+    export PATH=/usr/local/cuda/bin:/usr/local/bin:$PATH
+    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/lib:${LD_LIBRARY_PATH:-}
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        autoconf \
+        automake \
+        build-essential \
+        ca-certificates \
+        cython3 \
+        git \
+        libeigen3-dev \
+        libgmp-dev \
+        libmpfr-dev \
+        libnuma-dev \
+        libntl-dev \
+        libtool \
+        libtool-bin \
+        pkg-config \
+        python3 \
+        python3-cysignals-bare \
+        python3-dev \
+        python3-matplotlib \
+        python3-numpy \
+        python3-setuptools
+    rm -rf /var/lib/apt/lists/*
+
+    cd /opt/src/fplll
+    ./autogen.sh
+    ./configure --prefix=/usr/local --disable-static
+    make -j"$(nproc)"
+    make install
+    ldconfig
+    test "$(/usr/local/bin/fplll --version)" = "fplll 5.5.0"
+
+%test
+    nvcc --version
+    g++ --version
+    test "$(command -v fplll)" = "/usr/local/bin/fplll"
+    test "$(fplll --version)" = "fplll 5.5.0"
+    test -f /usr/local/share/fplll/strategies/default.json
+    python3 -c 'import Cython, cysignals, matplotlib, numpy'
+    dpkg-query -W libeigen3-dev libntl-dev libgmp-dev libmpfr-dev libnuma-dev

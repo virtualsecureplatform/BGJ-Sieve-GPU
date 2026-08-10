@@ -35,7 +35,7 @@ TARGET_NORM2 = 9_075_417
 GENERATOR_URL = "https://www.latticechallenge.org/svp-challenge/generator.php"
 RAW_SHA256 = "bd449bb1bccbd9c927a2895bf1ca1f5d62a7864c0c4e7e305f1da854dca96674"
 STRATEGY_SHA256 = "f516b0a6f0c580cff72e1e2c3562c44dc6f17e8f99613e9e4020e35481b27a18"
-DEFAULT_STRATEGY = Path("/usr/share/libfplll9/strategies/default.json")
+DEFAULT_STRATEGY = Path("/usr/local/share/fplll/strategies/default.json")
 HERE = Path(__file__).resolve().parent
 KNOWN_VECTOR = HERE / "known-vector.txt"
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -156,13 +156,13 @@ def verify_vector_text(text: str, raw: Path) -> dict[str, object]:
 
 
 def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
-    raw = download_raw(input_dir)
-    _, lll, pre, manifest_path = input_paths(input_dir)
     version = fplll_version()
     if version != "fplll 5.5.0":
         raise ReproductionError(f"requires fplll 5.5.0, found {version or 'unknown'}")
     if not strategy.is_file() or sha256(strategy) != STRATEGY_SHA256:
         raise ReproductionError(f"unexpected or missing fplll strategy: {strategy}")
+    raw = download_raw(input_dir)
+    _, lll, pre, manifest_path = input_paths(input_dir)
 
     expected = {
         "dimension": DIMENSION,

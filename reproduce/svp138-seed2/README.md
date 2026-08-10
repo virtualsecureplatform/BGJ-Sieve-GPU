@@ -56,7 +56,7 @@ python3 reproduce/svp138-seed2/reproduce.py all --binary app/hd_sieve_140P
 ## Requirements
 
 - `fplll 5.5.0` and
-  `/usr/share/libfplll9/strategies/default.json`. The script checks the version
+  `/usr/local/share/fplll/strategies/default.json`. The script checks the version
   and the strategy SHA-256 before preprocessing.
 - `make`, `g++`, `nvcc`, NTL, GMP, libnuma, and the CUDA driver library to build.
   The recipe looks for `nvcc` on `PATH` and under `/usr/local/cuda*`.
