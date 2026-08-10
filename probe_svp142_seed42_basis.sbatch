@@ -20,6 +20,7 @@ mkdir -p "$INPUT_DIR"
 apptainer exec --bind "$LARGE_BASE:$LARGE_BASE" --pwd "$SOURCE" "$IMAGE" \
     "$BUILDER" "$PREFIX" "$ARCHIVE" "$GENERATOR_SOURCE"
 RAW_TMP="${INPUT_DIR}/L_142_42.raw.tmp-${SLURM_JOB_ID}"
-"${PREFIX}/bin/svp_challenge_generator" 142 42 > "$RAW_TMP"
+apptainer exec --bind "$LARGE_BASE:$LARGE_BASE" "$IMAGE" \
+    "${PREFIX}/bin/svp_challenge_generator" 142 42 > "$RAW_TMP"
 mv -f "$RAW_TMP" "${INPUT_DIR}/L_142_42.raw"
 sha256sum "${INPUT_DIR}/L_142_42.raw"
