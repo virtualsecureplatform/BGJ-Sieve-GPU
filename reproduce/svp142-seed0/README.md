@@ -2,8 +2,9 @@
 
 This recipe targets the official seed-0 vector with exact squared norm
 `9075417` (displayed norm `3013`). The preprocessing path is deliberately
-LLL followed by fplll BKZ-60 with its pruned default strategy and at most eight
-loops. The final sieve uses seed 0, MLD 118, and TSD 132 by default.
+LLL followed by BKZ-60 from the current pinned `dep/fplll` revision, using its
+pruned default strategy and at most eight loops. The final sieve uses seed 0,
+MLD 118, and TSD 132 by default.
 
 Submit from the repository root with:
 
@@ -12,5 +13,7 @@ Submit from the repository root with:
 ```
 
 The wrapper first submits a one-GPU preparation/build job, then a dependent
-four-GPU solve job. All generated bases, binaries, and sieve files are stored
+four-GPU solve job. The preparation job builds and caches its private fplll
+Git revision and MPFR dependency under `/LARGE0`; the SIF does not need to
+provide or install fplll. All generated bases, binaries, and sieve files are stored
 under `/LARGE0/gr20116/$USER/BGJ-Sieve-GPU`; no generated data is put in home.

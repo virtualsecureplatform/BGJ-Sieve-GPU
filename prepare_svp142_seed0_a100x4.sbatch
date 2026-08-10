@@ -2,7 +2,7 @@
 #SBATCH --job-name=svp142-prep
 #SBATCH --partition=gr20100g
 #SBATCH --rsc=g=1
-#SBATCH --time=00:30:00
+#SBATCH --time=00:45:00
 #SBATCH --output=svp142-prep_%j.log
 
 set -euo pipefail
@@ -19,6 +19,9 @@ BINARY="${BGJ_BINARY:-${BINARY_ROOT}/hd_sieve-${SOURCE_COMMIT}-svp142-500g-ftv${
 MANIFEST="${BINARY}.manifest"
 REPRO="${SOURCE}/reproduce/svp142-seed0/reproduce.py"
 DEFINES="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_FILTER_TASK_VECS=${FILTER_TASK_VECS}"
+FPLLL_COMMIT="$(git -C "${SOURCE}/dep/fplll" rev-parse HEAD)"
+FPLLL_PREFIX="${BGJ_FPLLL_PREFIX:-${LARGE_BASE}/deps/fplll-${FPLLL_COMMIT:0:12}-mpfr-4.2.1}"
+FPLLL_BUILDER="${SOURCE}/tools/build_fplll.sh"
 
 if [[ "$ACTUAL_SOURCE_COMMIT" != "$SOURCE_COMMIT" ]]; then
     echo "Source moved after submission: expected $SOURCE_COMMIT, found $ACTUAL_SOURCE_COMMIT" >&2
@@ -42,13 +45,25 @@ echo "node=$(hostname) job=${SLURM_JOB_ID} source_commit=${SOURCE_COMMIT}"
 echo "image=${IMAGE}"
 echo "input_dir=${INPUT_DIR}"
 echo "binary=${BINARY}"
+echo "fplll_commit=${FPLLL_COMMIT} fplll_prefix=${FPLLL_PREFIX}"
 
-# Download and both fplll stages execute only inside this Slurm allocation and
-# inside the pinned container. The generated bases are small and live on LARGE0.
+# Build the current vendored fplll revision under LARGE0 if it is not cached. This
+# keeps the immutable container unchanged while pinning the actual CLI used by
+# preprocessing. Download, build, and both fplll stages stay in this allocation.
 apptainer exec --nv \
     --bind "$LARGE_BASE:$LARGE_BASE" \
     --pwd "$SOURCE" \
-    "$IMAGE" python3 "$REPRO" prepare --input-dir "$INPUT_DIR"
+    "$IMAGE" "$FPLLL_BUILDER" "$FPLLL_PREFIX" "${SOURCE}/dep/fplll" "$FPLLL_COMMIT"
+
+export APPTAINERENV_PATH="${FPLLL_PREFIX}/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
+export APPTAINERENV_LD_LIBRARY_PATH="${FPLLL_PREFIX}/lib:/usr/local/cuda/lib64"
+export APPTAINERENV_BGJ_FPLLL_COMMIT="$FPLLL_COMMIT"
+apptainer exec --nv \
+    --bind "$LARGE_BASE:$LARGE_BASE" \
+    --pwd "$SOURCE" \
+    "$IMAGE" python3 "$REPRO" prepare \
+        --input-dir "$INPUT_DIR" \
+        --strategy "${FPLLL_PREFIX}/share/fplll/strategies/default.json"
 
 if [[ -x "$BINARY" && -f "$MANIFEST" ]] &&
    grep -Fqx "source_commit=${SOURCE_COMMIT}" "$MANIFEST" &&

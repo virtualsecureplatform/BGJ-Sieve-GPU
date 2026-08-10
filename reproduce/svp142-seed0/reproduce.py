@@ -157,8 +157,11 @@ def verify_vector_text(text: str, raw: Path) -> dict[str, object]:
 
 def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
     version = fplll_version()
-    if version != "fplll 5.5.0":
-        raise ReproductionError(f"requires fplll 5.5.0, found {version or 'unknown'}")
+    if not version.startswith("fplll "):
+        raise ReproductionError(f"unexpected fplll version output: {version or 'unknown'}")
+    fplll_commit = os.environ.get("BGJ_FPLLL_COMMIT", "")
+    if not re.fullmatch(r"[0-9a-f]{40}", fplll_commit):
+        raise ReproductionError("BGJ_FPLLL_COMMIT must identify the vendored fplll revision")
     if not strategy.is_file() or sha256(strategy) != STRATEGY_SHA256:
         raise ReproductionError(f"unexpected or missing fplll strategy: {strategy}")
     raw = download_raw(input_dir)
@@ -169,6 +172,7 @@ def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
         "lattice_seed": LATTICE_SEED,
         "raw_sha256": RAW_SHA256,
         "fplll_version": version,
+        "fplll_commit": fplll_commit,
         "strategy_sha256": STRATEGY_SHA256,
         "pipeline": "LLL -> BKZ-60 (pruned fplll strategy, max 8 loops)",
         "bkz_beta": BKZ_BETA,
@@ -348,7 +352,8 @@ def run_sieve(
 def show_plan(input_dir: Path, run_dir: Path) -> None:
     print(f"""SVP-142 seed-0 plan
 1. Download and hash-pin the official 142x142 seed-0 basis in {input_dir}.
-2. Preprocess with fplll 5.5.0: LLL -> pruned BKZ-60, maximum 8 loops.
+2. Build the current vendored fplll revision, then run LLL -> pruned BKZ-60,
+   maximum 8 loops.
 3. Build the four-A100 binary with the 112/96/24 GiB host-cache profile.
 4. Sieve from MLD 118 through TSD 132 in {run_dir}.
 5. Stop after independently verifying a lattice vector with norm^2 <= {TARGET_NORM2}.
