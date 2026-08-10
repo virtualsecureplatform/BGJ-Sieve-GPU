@@ -25,7 +25,7 @@ if [[ "$ACTUAL_COMMIT" != "$EXPECTED_COMMIT" ]]; then
     echo "fplll source moved: expected $EXPECTED_COMMIT, found $ACTUAL_COMMIT" >&2
     exit 2
 fi
-for tool in autoreconf automake libtoolize make g++ pkg-config; do
+for tool in autoreconf automake libtoolize make gcc g++ pkg-config; do
     if ! command -v "$tool" >/dev/null; then
         echo "Missing container build prerequisite: $tool" >&2
         exit 2
@@ -64,6 +64,10 @@ if (( BUILD_JOBS > 16 )); then
 fi
 (
     cd "${STAGE}/fplll-src"
+    # Cluster module environments may export CC=nvc even inside Apptainer.
+    # Use the Ubuntu toolchain whose headers and libraries are in this image.
+    export CC=gcc
+    export CXX=g++
     ./autogen.sh
     ./configure --prefix="$BUILD_PREFIX" --disable-static --enable-shared
     make -j"$BUILD_JOBS"
