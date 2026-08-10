@@ -18,6 +18,7 @@ BINARY="${SOURCE}/app/hd_sieve"
 BUILD="${BUILD:-1}"
 POOL_THREADS="${POOL_THREADS:-8}"
 POOL_BUFFER_CACHE="${POOL_BUFFER_CACHE:-0}"
+PRE_SHA256="${SVP138_PRE_SHA256:-f902fd5b8b72171b084f8d62202c31a05ef18b9547fe99b23eb39446d355faeb}"
 
 mkdir -p "$WORK"
 cp "$INPUT_SOURCE/svp138-seed2.raw.basis" "$WORK/L_138_2.raw"
@@ -71,5 +72,6 @@ apptainer exec --nv \
     "$IMAGE" python3 "$REPRO" run \
         --workdir "$WORK" \
         --binary "$BINARY" \
+        --pre-sha256 "$PRE_SHA256" \
         --timeout 6900 \
         --stale 0
