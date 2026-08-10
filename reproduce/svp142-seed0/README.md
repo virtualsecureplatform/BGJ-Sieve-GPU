@@ -14,6 +14,6 @@ Submit from the repository root with:
 
 The wrapper first submits a one-GPU preparation/build job, then a dependent
 four-GPU solve job. The preparation job builds and caches its private fplll
-Git revision and MPFR dependency under `/LARGE0`; the SIF does not need to
-provide or install fplll. All generated bases, binaries, and sieve files are stored
+Git revision under `/LARGE0`; the SIF provides build prerequisites but does not
+install fplll itself. All generated bases, binaries, and sieve files are stored
 under `/LARGE0/gr20116/$USER/BGJ-Sieve-GPU`; no generated data is put in home.

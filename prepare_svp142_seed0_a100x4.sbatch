@@ -20,7 +20,7 @@ MANIFEST="${BINARY}.manifest"
 REPRO="${SOURCE}/reproduce/svp142-seed0/reproduce.py"
 DEFINES="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_FILTER_TASK_VECS=${FILTER_TASK_VECS}"
 FPLLL_COMMIT="$(git -C "${SOURCE}/dep/fplll" rev-parse HEAD)"
-FPLLL_PREFIX="${BGJ_FPLLL_PREFIX:-${LARGE_BASE}/deps/fplll-${FPLLL_COMMIT:0:12}-mpfr-4.2.1}"
+FPLLL_PREFIX="${BGJ_FPLLL_PREFIX:-${LARGE_BASE}/deps/fplll-${FPLLL_COMMIT:0:12}}"
 FPLLL_BUILDER="${SOURCE}/tools/build_fplll.sh"
 
 if [[ "$ACTUAL_SOURCE_COMMIT" != "$SOURCE_COMMIT" ]]; then
