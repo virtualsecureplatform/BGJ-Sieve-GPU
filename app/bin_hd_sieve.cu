@@ -5,6 +5,29 @@
 #include <vector>
 
 #include "../include/pool_hd.h"
+#include "../include/pool_hd_device.h"
+
+static long configured_pool_threads() {
+    static long threads = 0;
+    if (threads) return threads;
+    threads = 8;
+    const char *env = getenv("HD_POOL_THREADS");
+    if (env) {
+        char *end = NULL;
+        long value = strtol(env, &end, 10);
+        if (!*env || *end || value < hw::gpu_num || value > 64 ||
+            value % hw::gpu_num) {
+            fprintf(stderr,
+                    "[Error] HD_POOL_THREADS must be a multiple of %d in [%d, 64]\n",
+                    hw::gpu_num, hw::gpu_num);
+            exit(2);
+        }
+        threads = value;
+    }
+    printf("Pool device workers: %ld (HD_POOL_BUFFER_CACHE=%s)\n", threads,
+           getenv("HD_POOL_BUFFER_CACHE") ? getenv("HD_POOL_BUFFER_CACHE") : "0");
+    return threads;
+}
 
 struct task_config_t {
     static constexpr int task_final_sieve = 1;
@@ -91,6 +114,7 @@ void run_command_file(const char* filename) {
 int main(int argc, char** argv) {
     if (argc == 2 && strstr(argv[1], ".cmd")) {
         run_command_file(argv[1]);
+        _destroy_pool_hd_device_buffers();
         _destory_ck_allocator();
         return 0;
     }
@@ -106,6 +130,7 @@ int main(int argc, char** argv) {
         task.run();
     }
     
+    _destroy_pool_hd_device_buffers();
     _destory_ck_allocator();
 
     return 0;
@@ -602,7 +627,7 @@ int task_config_t::_run_final_sieve() {
     if (pool.set_sieving_context(L.NumRows() - current_sieving_dim, L.NumRows())) return -1;
     pool.set_boost_depth(0);
 
-    pool.set_num_threads(8);
+    pool.set_num_threads(configured_pool_threads());
 
     if (need_sample) {
         pool.sampling(3.2 * pow(4./3., pool.CSD * .5) - 5);
@@ -714,7 +739,7 @@ int task_config_t::_run_local_pump() {
     if (pool.set_sieving_context(L_locs.NumRows() - start_sieving_dim, L_locs.NumRows())) return -1;
     pool.set_boost_depth(0);
 
-    pool.set_num_threads(8);
+    pool.set_num_threads(configured_pool_threads());
 
     pool.sampling(BGJ1_SIZE_RATIO * pow(4./3., pool.CSD * .5) - 5);
 
@@ -829,7 +854,7 @@ int task_config_t::_run_dual_hash() {
     if (pool.set_sieving_context(real_ind_l, real_ind_r)) return -1;
     pool.set_boost_depth(0);
 
-    pool.set_num_threads(8);
+    pool.set_num_threads(configured_pool_threads());
 
     if (real_hash) {
         pool.basis_hash = real_hash;

@@ -16,6 +16,94 @@ void copy(float *dst, float *src, long n);
 
 static std::atomic<int> ck_allocator_started{0};
 
+namespace {
+constexpr int pool_device_buffer_cache_slots = 64;
+
+struct pool_device_buffer_cache_entry_t {
+    int device = -1;
+    size_t buffer_nbytes = 0;
+    size_t pack_nbytes = 0;
+    int8_t *d_buffer = NULL;
+    int8_t *pack_buffer = NULL;
+    int8_t *h_buffer = NULL;
+};
+
+pool_device_buffer_cache_entry_t
+    pool_device_buffer_cache[pool_device_buffer_cache_slots];
+
+bool pool_device_buffer_cache_enabled() {
+    static const bool enabled = []() {
+        const char *env = getenv("HD_POOL_BUFFER_CACHE");
+        return env && atoi(env) != 0;
+    }();
+    return enabled;
+}
+}  // namespace
+
+void _pool_hd_device_buffers_acquire(int cache_slot, size_t buffer_nbytes,
+                                     size_t pack_nbytes, int8_t *&d_buffer,
+                                     int8_t *&pack_buffer, int8_t *&h_buffer,
+                                     bool &cached) {
+    cached = pool_device_buffer_cache_enabled() && cache_slot >= 0 &&
+             cache_slot < pool_device_buffer_cache_slots;
+    if (!cached) {
+        CHECK_CUDA_ERR(cudaMallocHost(&h_buffer, buffer_nbytes));
+        CHECK_CUDA_ERR(cudaMalloc(&d_buffer, buffer_nbytes));
+        CHECK_CUDA_ERR(cudaMalloc(&pack_buffer, pack_nbytes));
+        return;
+    }
+
+    int device = -1;
+    CHECK_CUDA_ERR(cudaGetDevice(&device));
+    pool_device_buffer_cache_entry_t &entry =
+        pool_device_buffer_cache[cache_slot];
+    if (entry.d_buffer &&
+        (entry.device != device || entry.buffer_nbytes != buffer_nbytes ||
+         entry.pack_nbytes != pack_nbytes)) {
+        CHECK_CUDA_ERR(cudaSetDevice(entry.device));
+        CHECK_CUDA_ERR(cudaFree(entry.d_buffer));
+        CHECK_CUDA_ERR(cudaFree(entry.pack_buffer));
+        CHECK_CUDA_ERR(cudaFreeHost(entry.h_buffer));
+        CHECK_CUDA_ERR(cudaSetDevice(device));
+        entry = {};
+    }
+    if (!entry.d_buffer) {
+        entry.device = device;
+        entry.buffer_nbytes = buffer_nbytes;
+        entry.pack_nbytes = pack_nbytes;
+        CHECK_CUDA_ERR(cudaMallocHost(&entry.h_buffer, buffer_nbytes));
+        CHECK_CUDA_ERR(cudaMalloc(&entry.d_buffer, buffer_nbytes));
+        CHECK_CUDA_ERR(cudaMalloc(&entry.pack_buffer, pack_nbytes));
+    }
+    d_buffer = entry.d_buffer;
+    pack_buffer = entry.pack_buffer;
+    h_buffer = entry.h_buffer;
+}
+
+void _pool_hd_device_buffers_release(int8_t *d_buffer, int8_t *pack_buffer,
+                                     int8_t *h_buffer, bool cached) {
+    if (cached) return;
+    CHECK_CUDA_ERR(cudaFree(d_buffer));
+    CHECK_CUDA_ERR(cudaFree(pack_buffer));
+    CHECK_CUDA_ERR(cudaFreeHost(h_buffer));
+}
+
+void _destroy_pool_hd_device_buffers() {
+    int original_device = -1;
+    cudaGetDevice(&original_device);
+    for (int i = 0; i < pool_device_buffer_cache_slots; i++) {
+        pool_device_buffer_cache_entry_t &entry =
+            pool_device_buffer_cache[i];
+        if (!entry.d_buffer) continue;
+        CHECK_CUDA_ERR(cudaSetDevice(entry.device));
+        CHECK_CUDA_ERR(cudaFree(entry.d_buffer));
+        CHECK_CUDA_ERR(cudaFree(entry.pack_buffer));
+        CHECK_CUDA_ERR(cudaFreeHost(entry.h_buffer));
+        entry = {};
+    }
+    if (original_device >= 0) CHECK_CUDA_ERR(cudaSetDevice(original_device));
+}
+
 #include <numa.h>
 #include <numaif.h>
 #include <sys/mman.h>
@@ -1084,7 +1172,7 @@ int Pool_hd_t::stream_task_template(int num_devices, cudaDeviceProp device_props
         int8_t *h_buffer, *d_buffer, *pack_buffer;
         uint16_t *h_buffer_score; int32_t *h_buffer_norm; uint64_t *h_buffer_u;
         typename traits::pool_hd_buffer_holder_t 
-        buffer_holder(stream, d_buffer, pack_buffer, h_buffer, h_buffer_score, h_buffer_norm, h_buffer_u);
+        buffer_holder(thread, stream, d_buffer, pack_buffer, h_buffer, h_buffer_score, h_buffer_norm, h_buffer_u);
 
         #if ENABLE_PROFILING
         cudaEvent_t ev[taskChunks * 2 + 5];
@@ -1238,7 +1326,7 @@ int Pool_hd_t::stream_stat_template(int num_devices, cudaDeviceProp device_props
         int8_t *h_buffer, *d_buffer, *pack_buffer;
         uint16_t *h_buffer_score; int32_t *h_buffer_norm; uint64_t *h_buffer_u;
         typename traits::pool_hd_buffer_holder_t 
-        buffer_holder(stream, d_buffer, pack_buffer, h_buffer, h_buffer_score, h_buffer_norm, h_buffer_u);
+        buffer_holder(thread, stream, d_buffer, pack_buffer, h_buffer, h_buffer_score, h_buffer_norm, h_buffer_u);
 
         #if ENABLE_PROFILING
         cudaEvent_t ev[2 * taskChunks + 3];

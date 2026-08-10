@@ -10,6 +10,14 @@
 
 using namespace nvcuda;
 
+void _pool_hd_device_buffers_acquire(int cache_slot, size_t buffer_nbytes,
+                                     size_t pack_nbytes, int8_t *&d_buffer,
+                                     int8_t *&pack_buffer, int8_t *&h_buffer,
+                                     bool &cached);
+void _pool_hd_device_buffers_release(int8_t *d_buffer, int8_t *pack_buffer,
+                                     int8_t *h_buffer, bool cached);
+void _destroy_pool_hd_device_buffers();
+
 struct local_data_t {
     static constexpr unsigned int vec_nbytes    = Pool_hd_t::vec_nbytes;
     static constexpr unsigned int max_boost_dim = boost_data_t::max_boost_dim;
@@ -455,11 +463,13 @@ struct pdev_traits_t {
 
     struct pool_hd_buffer_holder_t {
         public:
-        pool_hd_buffer_holder_t(cudaStream_t &stream, int8_t *&d_buffer, int8_t *&pack_buffer, int8_t *&h_buffer, 
+        pool_hd_buffer_holder_t(int cache_slot, cudaStream_t &stream, int8_t *&d_buffer, int8_t *&pack_buffer, int8_t *&h_buffer,
                                                     uint16_t *&h_buffer_score, int32_t *&h_buffer_norm, uint64_t *&h_buffer_u) {
-            CHECK_CUDA_ERR(cudaMallocHost(&h_buffer, taskVecs * (vec_nbytes + 2 + 4 + 8)));
-            CHECK_CUDA_ERR(cudaMalloc(&d_buffer, taskVecs * (vec_nbytes + 2 + 4 + 8)));
-            CHECK_CUDA_ERR(cudaMalloc(&pack_buffer, taskVecs * vec_nbytes));
+            _pool_hd_device_buffers_acquire(cache_slot,
+                                            taskVecs * (vec_nbytes + 2 + 4 + 8),
+                                            taskVecs * vec_nbytes,
+                                            d_buffer, pack_buffer, h_buffer,
+                                            _cached);
             CHECK_CUDA_ERR(cudaMemsetAsync(d_buffer, 0, taskVecs * vec_nbytes, stream));
             CHECK_CUDA_ERR(cudaMemsetAsync(pack_buffer, 0, taskVecs * vec_nbytes, stream));
             memset(h_buffer, 0, taskVecs * vec_nbytes);
@@ -472,14 +482,14 @@ struct pdev_traits_t {
             h_buffer_u          = (uint64_t *)(h_buffer + taskVecs * (vec_nbytes + 2 + 4));
         }
         ~pool_hd_buffer_holder_t() {
-            CHECK_CUDA_ERR(cudaFree(_d_buffer));
-            CHECK_CUDA_ERR(cudaFree(_pack_buffer));
-            CHECK_CUDA_ERR(cudaFreeHost(_h_buffer));
+            _pool_hd_device_buffers_release(_d_buffer, _pack_buffer, _h_buffer,
+                                            _cached);
         }
         // input and output buffer (vec, score, norm, uid in order)
         int8_t *_d_buffer;
         int8_t *_h_buffer;
         int8_t *_pack_buffer;
+        bool _cached = false;
     };
 
     static void init_shared_mem_limit() {
