@@ -366,18 +366,25 @@ def run_sieve(
         "--MLD",
         str(MLD),
     ]
+    reducer_threads = os.environ.get("HD_BGJ2_REDUCER_THREADS", "48")
+    try:
+        reducer_thread_count = int(reducer_threads)
+    except ValueError as exc:
+        raise ReproductionError("HD_BGJ2_REDUCER_THREADS must be an integer") from exc
+    if reducer_thread_count < 4 or reducer_thread_count > 64 or reducer_thread_count % 4:
+        raise ReproductionError(
+            "HD_BGJ2_REDUCER_THREADS must be a multiple of 4 in [4, 64]"
+        )
     env = dict(os.environ)
     env.update(
         {
             "HD_SIEVE_SEED": SIEVE_SEED,
-            # These restore the behavior of successful commit c586b64 when
-            # running the newer compatibility commit 6a89ef9.
             "HD_CUDA_BLOCKING_SYNC": "0",
-            "HD_BGJ2_REDUCER_THREADS": "32",
+            "HD_BGJ2_REDUCER_THREADS": str(reducer_thread_count),
         }
     )
     display = (
-        "HD_SIEVE_SEED=0 HD_CUDA_BLOCKING_SYNC=0 HD_BGJ2_REDUCER_THREADS=32 "
+        f"HD_SIEVE_SEED=0 HD_CUDA_BLOCKING_SYNC=0 HD_BGJ2_REDUCER_THREADS={reducer_thread_count} "
         + " ".join(command)
     )
     print(f"[reproduce] run directory: {run_dir}")
@@ -389,6 +396,7 @@ def run_sieve(
         "dimension": DIMENSION,
         "lattice_seed": LATTICE_SEED,
         "sieve_seed": int(SIEVE_SEED),
+        "bgj2_reducer_threads": reducer_thread_count,
         "tsd": TSD,
         "mld": MLD,
         "target_norm2": TARGET_NORM2,

@@ -93,6 +93,18 @@ official Darmstadt online lattice generator, performs the recorded fplll
 LLL/BKZ-60 preprocessing, builds the SVP-140 cache profile, runs sieve seed 0,
 and independently verifies the resulting vector.
 
+For the four-A100-80GB Slurm profile, submit from the repository root with:
+
+```bash
+./submit_svp138_a100x4.sh
+```
+
+This submits a one-GPU build job followed by the four-GPU sieve with an
+`afterok` dependency. The binary is keyed by source commit and filter-batch
+size under `/LARGE0`, so later runs reuse the compute-built binary with
+`BUILD=0`. The tuned defaults are 48 BGJ2 reducer workers, a 524288-vector
+filter/packing batch, eight pool workers, and persistent pool buffers.
+
 ### Example: Reproducing the LWE Challenge
 
 This section gives a step-by-step example for reproducing the solution of one LWE challenge from the paper. Many of the concrete parameters here are not strict: adjusting them slightly will usually not make the overall computation dramatically faster or slower. The full process is expected to take a few days, depending on your machine configuration.

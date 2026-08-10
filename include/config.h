@@ -119,11 +119,11 @@ struct hw {
 
 ///////////////// red config /////////////////
 #define RED_MIN_CSD16                   128     /* change with kernel choosing code tegother */
-#define RED_MAX_NUM_THREADS             32             
+#define RED_MAX_NUM_THREADS             64
 #define RED_GRAM_SLIMIT                 (22ULL << 30)
 
 #define BGJ1_RED_DEFAULT_NUM_THREADS    32
-#define BGJ2_RED_DEFAULT_NUM_THREADS    32
+#define BGJ2_RED_DEFAULT_NUM_THREADS    48
 #define BGJ3_RED_DEFAULT_NUM_THREADS    16
 #define BGJ3L_RED_DEFAULT_NUM_THREADS   6
 #define BGJ4_RED_DEFAULT_NUM_THREADS    4

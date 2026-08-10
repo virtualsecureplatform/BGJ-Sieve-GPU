@@ -56,9 +56,10 @@ python3 reproduce/svp138-seed2/reproduce.py all --binary app/hd_sieve_140P
   `result.json`.
 
 The successful run used source commit `c586b64` and took about 3852 seconds to
-reach the vector on two A100-PCIE-40GB GPUs. The current compatibility wrapper
-sets `HD_CUDA_BLOCKING_SYNC=0` and `HD_BGJ2_REDUCER_THREADS=32` to retain that
-commit's runtime behavior after the later CPU-bottleneck defaults changed.
+reach the vector on two A100-PCIE-40GB GPUs. The compatibility wrapper sets
+`HD_CUDA_BLOCKING_SYNC=0`; `HD_BGJ2_REDUCER_THREADS` is runtime configurable
+and defaults to 48 in the four-A100 workflow (set it to 32 to replay the older
+two-GPU concurrency setting).
 GPU scheduling, drivers, compiler versions, and hardware can still affect
 timing; the recipe pins inputs, algorithm parameters, and RNG selection, but
 does not promise identical wall-clock time.

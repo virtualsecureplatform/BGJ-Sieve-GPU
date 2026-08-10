@@ -294,6 +294,19 @@ int red_traits_t::num_threads(int CSD, int ESD, int strategy) {
         exp_gram_per_thread += taskVecs * 176 + _buc_max_size * 176 + d_norm_vecs * 4;
         exp_gram_per_thread += batch1 * 176 + batch1 * _bk1_max_size * 8;
         limit = BGJ2_RED_DEFAULT_NUM_THREADS;
+        const char *env = getenv("HD_BGJ2_REDUCER_THREADS");
+        if (env) {
+            char *end = NULL;
+            long requested = strtol(env, &end, 10);
+            if (!*env || *end || requested < hw::gpu_num ||
+                requested > RED_MAX_NUM_THREADS || requested % hw::gpu_num) {
+                fprintf(stderr,
+                        "[Error] HD_BGJ2_REDUCER_THREADS must be a multiple of %d in [%d, %d]\n",
+                        hw::gpu_num, hw::gpu_num, RED_MAX_NUM_THREADS);
+                exit(2);
+            }
+            limit = (int)requested;
+        }
     }
     if (strategy == Reducer_t::strategy_bgj3) {
         double tpb = BGJ3_DEFAULT_THREADS_PER_BUC;
@@ -336,6 +349,11 @@ int red_traits_t::num_threads(int CSD, int ESD, int strategy) {
     }    
 
     if (limit < ret) ret = limit;
+    if (strategy == Reducer_t::strategy_bgj2 && ret < limit) {
+        fprintf(stderr,
+                "[Warning] BGJ2 reducer workers limited to %d by the %.2f GiB/GPU memory budget (requested %d)\n",
+                ret, RED_GRAM_SLIMIT / (double)(1ULL << 30), limit);
+    }
     return ret;
 }
 

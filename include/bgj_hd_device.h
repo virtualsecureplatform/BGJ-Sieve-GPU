@@ -28,7 +28,13 @@ __global__ void _multi_reduce_kernel(int *out, int *num_out, int out_max_size, c
                                     int32_t *__restrict__ vids, int *n_ptr, int buc_max_size, int32_t goal_norm);
 #endif
 
-constexpr int filter_taskVecs   = 262144;
+#ifndef HD_FILTER_TASK_VECS
+#define HD_FILTER_TASK_VECS 524288
+#endif
+static_assert(HD_FILTER_TASK_VECS >= 65536 &&
+              (HD_FILTER_TASK_VECS & (HD_FILTER_TASK_VECS - 1)) == 0,
+              "HD_FILTER_TASK_VECS must be a power of two >= 65536");
+constexpr int filter_taskVecs   = HD_FILTER_TASK_VECS;
 constexpr int fpv_shmem         = 68608;
 constexpr int fpv_blocks        = 64;
 constexpr int fpv_threads       = 256;
