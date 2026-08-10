@@ -17,6 +17,8 @@ PREFIX="$1"
 FPLLL_SOURCE="$2"
 EXPECTED_COMMIT="$3"
 DEPS_ROOT="$(dirname -- "$PREFIX")"
+M4_URL="https://ftp.gnu.org/gnu/m4/m4-1.4.19.tar.xz"
+M4_SHA256="63aede5c6d33b6d9b13511cd0be2cac046f2e70fd0a07aa9573a04a82783af96"
 AUTOCONF_URL="https://ftp.gnu.org/gnu/autoconf/autoconf-2.72.tar.xz"
 AUTOCONF_SHA256="ba885c1319578d6c94d46e9b0dceb4014caafe2490e437a0dbca3f270a223f5a"
 AUTOMAKE_URL="https://ftp.gnu.org/gnu/automake/automake-1.16.5.tar.xz"
@@ -70,16 +72,19 @@ with urllib.request.urlopen(request, timeout=120) as response, open(sys.argv[2],
 PY
 }
 
+download "$M4_URL" "${STAGE}/m4-1.4.19.tar.xz"
 download "$AUTOCONF_URL" "${STAGE}/autoconf-2.72.tar.xz"
 download "$AUTOMAKE_URL" "${STAGE}/automake-1.16.5.tar.xz"
 download "$LIBTOOL_URL" "${STAGE}/libtool-2.4.7.tar.xz"
 download "$MPFR_URL" "${STAGE}/mpfr-4.2.1.tar.xz"
 (
     cd "$STAGE"
+    echo "${M4_SHA256}  m4-1.4.19.tar.xz" | sha256sum -c -
     echo "${AUTOCONF_SHA256}  autoconf-2.72.tar.xz" | sha256sum -c -
     echo "${AUTOMAKE_SHA256}  automake-1.16.5.tar.xz" | sha256sum -c -
     echo "${LIBTOOL_SHA256}  libtool-2.4.7.tar.xz" | sha256sum -c -
     echo "${MPFR_SHA256}  mpfr-4.2.1.tar.xz" | sha256sum -c -
+    tar -xf m4-1.4.19.tar.xz
     tar -xf autoconf-2.72.tar.xz
     tar -xf automake-1.16.5.tar.xz
     tar -xf libtool-2.4.7.tar.xz
@@ -93,7 +98,7 @@ if (( BUILD_JOBS > 16 )); then
     BUILD_JOBS=16
 fi
 
-for package in autoconf-2.72 automake-1.16.5 libtool-2.4.7; do
+for package in m4-1.4.19 autoconf-2.72 automake-1.16.5 libtool-2.4.7; do
     (
         cd "${STAGE}/${package}"
         PATH="${TOOLS_PREFIX}/bin:${PATH}" ./configure --prefix="$TOOLS_PREFIX"
