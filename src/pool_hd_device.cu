@@ -1877,7 +1877,7 @@ int Pool_hd_t::check(int log_level) {
         int8_t *h_buffer, *d_buffer, *pack_buffer;
         uint16_t *h_buffer_score; int32_t *h_buffer_norm; uint64_t *h_buffer_u;
         traits::pool_hd_buffer_holder_t 
-        buffer_holder(stream, d_buffer, pack_buffer, h_buffer, h_buffer_score, h_buffer_norm, h_buffer_u);
+        buffer_holder(thread, stream, d_buffer, pack_buffer, h_buffer, h_buffer_score, h_buffer_norm, h_buffer_u);
 
         for (int i = 0; i < taskChunks; i++) pwc_manager->prefetch(begin_ind * taskChunks + i);
 
@@ -2439,7 +2439,7 @@ int Pool_hd_t::load(long log_level) {
         int8_t *h_buffer, *d_buffer, *pack_buffer;
         uint16_t *h_buffer_score; int32_t *h_buffer_norm; uint64_t *h_buffer_u;
         traits::pool_hd_buffer_holder_t 
-        buffer_holder(stream, d_buffer, pack_buffer, h_buffer, h_buffer_score, h_buffer_norm, h_buffer_u);
+        buffer_holder(thread, stream, d_buffer, pack_buffer, h_buffer, h_buffer_score, h_buffer_norm, h_buffer_u);
 
         chunk_t working_chunk[taskChunks];
         for (int i = 0; i < taskChunks; i++) _malloc_chunk(&working_chunk[i]);
