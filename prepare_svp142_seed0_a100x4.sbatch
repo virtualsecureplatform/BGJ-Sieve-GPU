@@ -17,7 +17,8 @@ INSTANCE="${SVP_INSTANCE:-svp142-seed${LATTICE_SEED}}"
 IMAGE="${BGJ_IMAGE:-${LARGE_BASE}/bgj-sieve-gpu-cuda13.3.sif}"
 INPUT_DIR="${SVP142_INPUT_DIR:-${LARGE_BASE}/inputs/${INSTANCE}}"
 BINARY_ROOT="${BGJ_BINARY_ROOT:-${LARGE_BASE}/builds}"
-BINARY="${BGJ_BINARY:-${BINARY_ROOT}/hd_sieve-${SOURCE_COMMIT}-svp142-500g-ftv${FILTER_TASK_VECS}}"
+SOLVER_KEY="$("${SOURCE}/tools/solver_cache_key.sh" "$SOURCE" "$SOURCE_COMMIT" "$FILTER_TASK_VECS" | sha256sum | awk '{print $1}')"
+BINARY="${BGJ_BINARY:-${BINARY_ROOT}/hd_sieve-${SOLVER_KEY}-a100x4-ftv${FILTER_TASK_VECS}}"
 MANIFEST="${BINARY}.manifest"
 REPRO="${SVP142_REPRO:-${SOURCE}/reproduce/svp142-seed${LATTICE_SEED}/reproduce.py}"
 DEFINES="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_FILTER_TASK_VECS=${FILTER_TASK_VECS}"
@@ -52,6 +53,7 @@ echo "node=$(hostname) job=${SLURM_JOB_ID} source_commit=${SOURCE_COMMIT}"
 echo "image=${IMAGE}"
 echo "input_dir=${INPUT_DIR}"
 echo "binary=${BINARY}"
+echo "solver_key=${SOLVER_KEY}"
 echo "fplll_commit=${FPLLL_COMMIT} fplll_prefix=${FPLLL_PREFIX}"
 
 if [[ "$LATTICE_SEED" != "0" ]]; then
@@ -81,13 +83,41 @@ apptainer exec --nv \
         --strategy "${FPLLL_PREFIX}/share/fplll/strategies/default.json"
 
 if [[ -x "$BINARY" && -f "$MANIFEST" ]] &&
-   grep -Fqx "source_commit=${SOURCE_COMMIT}" "$MANIFEST" &&
+   grep -Fqx "solver_key=${SOLVER_KEY}" "$MANIFEST" &&
    grep -Fqx "filter_task_vecs=${FILTER_TASK_VECS}" "$MANIFEST" &&
    grep -Fqx "cache_profile=svp142-500g" "$MANIFEST"; then
     echo "Reusing existing verified compute-built binary"
     sha256sum "$BINARY"
     exit 0
 fi
+
+# Promote a verified commit-keyed binary when its actual solver trees and
+# compile configuration match. This makes the new content cache effective
+# immediately without recompiling unchanged CUDA/C++ sources.
+for old_manifest in "${BINARY_ROOT}"/hd_sieve-*-svp142-500g-ftv"${FILTER_TASK_VECS}".manifest; do
+    [[ -f "$old_manifest" ]] || continue
+    old_commit="$(sed -n 's/^source_commit=//p' "$old_manifest" | head -1)"
+    [[ "$old_commit" =~ ^[0-9a-f]{40}$ ]] || continue
+    old_key="$("${SOURCE}/tools/solver_cache_key.sh" "$SOURCE" "$old_commit" "$FILTER_TASK_VECS" 2>/dev/null | sha256sum | awk '{print $1}')" || continue
+    [[ "$old_key" == "$SOLVER_KEY" ]] || continue
+    old_binary="${old_manifest%.manifest}"
+    [[ -x "$old_binary" ]] || continue
+    expected_sha="$(tail -1 "$old_manifest" | awk '{print $1}')"
+    [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || continue
+    [[ "$(sha256sum "$old_binary" | awk '{print $1}')" == "$expected_sha" ]] || continue
+    cp "$old_binary" "$BINARY"
+    chmod 0755 "$BINARY"
+    {
+        echo "solver_key=${SOLVER_KEY}"
+        echo "source_commit_built=${old_commit}"
+        echo "filter_task_vecs=${FILTER_TASK_VECS}"
+        echo "cache_profile=svp142-500g"
+        sha256sum "$BINARY"
+    } > "$MANIFEST"
+    echo "Promoted matching verified binary from ${old_binary}"
+    sha256sum "$BINARY"
+    exit 0
+done
 
 apptainer exec --nv \
     --bind "$LARGE_BASE:$LARGE_BASE" \
@@ -106,7 +136,8 @@ cp "$SOURCE/app/hd_sieve" "$BINARY_TMP"
 chmod 0755 "$BINARY_TMP"
 mv -f "$BINARY_TMP" "$BINARY"
 {
-    echo "source_commit=${SOURCE_COMMIT}"
+    echo "solver_key=${SOLVER_KEY}"
+    echo "source_commit_built=${SOURCE_COMMIT}"
     echo "filter_task_vecs=${FILTER_TASK_VECS}"
     echo "cache_profile=svp142-500g"
     sha256sum "$BINARY"
