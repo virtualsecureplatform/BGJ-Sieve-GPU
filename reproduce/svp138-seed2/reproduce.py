@@ -331,11 +331,19 @@ def stop_process(proc: subprocess.Popen[str]) -> None:
         pass
 
 
-def run_sieve(workdir: Path, binary: Path, timeout: float, stale: float) -> int:
+def run_sieve(
+    workdir: Path,
+    binary: Path,
+    timeout: float,
+    stale: float,
+    expected_pre_sha256: str = PRE_SHA256,
+) -> int:
     raw, _, pre = paths(workdir)
     if not checked_file(raw, RAW_SHA256, "official raw lattice"):
         raise ReproductionError(f"raw lattice is missing; run the prepare stage first: {raw}")
-    if not checked_file(pre, PRE_SHA256, "BKZ-60 basis"):
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_pre_sha256):
+        raise ReproductionError("--pre-sha256 must be 64 lowercase hexadecimal characters")
+    if not checked_file(pre, expected_pre_sha256, "BKZ-60 basis"):
         raise ReproductionError(f"BKZ basis is missing; run the prepare stage first: {pre}")
     preflight(binary, workdir)
 
@@ -387,7 +395,7 @@ def run_sieve(workdir: Path, binary: Path, timeout: float, stale: float) -> int:
         "repo_commit": git_state(),
         "successful_commit": SUCCESS_COMMIT,
         "raw_sha256": RAW_SHA256,
-        "pre_sha256": PRE_SHA256,
+        "pre_sha256": expected_pre_sha256,
         "binary_sha256": sha256(binary),
         "progression": [],
     }
@@ -517,12 +525,14 @@ def main() -> int:
     run_parser.add_argument("--binary", type=Path)
     run_parser.add_argument("--timeout", type=float, default=TIMEOUT_SECONDS)
     run_parser.add_argument("--stale", type=float, default=STALE_SECONDS)
+    run_parser.add_argument("--pre-sha256", default=PRE_SHA256)
 
     all_parser = subparsers.add_parser("all", help="download, prepare, build, and run")
     common_options(all_parser)
     all_parser.add_argument("--binary", type=Path, help="use this binary instead of building")
     all_parser.add_argument("--timeout", type=float, default=TIMEOUT_SECONDS)
     all_parser.add_argument("--stale", type=float, default=STALE_SECONDS)
+    all_parser.add_argument("--pre-sha256", default=PRE_SHA256)
 
     args = parser.parse_args()
     workdir = args.workdir.resolve()
@@ -545,13 +555,15 @@ def main() -> int:
         if args.action == "all":
             prepare(workdir, strategy)
             binary = args.binary.resolve() if args.binary else build(workdir)
-            return run_sieve(workdir, binary, args.timeout, args.stale)
+            return run_sieve(workdir, binary, args.timeout, args.stale, args.pre_sha256)
         if args.action == "run":
             binary = args.binary
             if binary is None:
                 built = workdir / "hd_sieve_svp140"
                 binary = built if built.exists() else REPO / "app" / "hd_sieve_140P"
-            return run_sieve(workdir, binary.resolve(), args.timeout, args.stale)
+            return run_sieve(
+                workdir, binary.resolve(), args.timeout, args.stale, args.pre_sha256
+            )
     except (OSError, ReproductionError, subprocess.CalledProcessError) as exc:
         print(f"[reproduce] error: {exc}", file=sys.stderr)
         return 2
