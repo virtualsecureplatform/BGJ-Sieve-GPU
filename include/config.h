@@ -78,12 +78,26 @@ struct hw {
 // Fast persistence behavior is the DEFAULT (single-SSD tuning): lazy sync
 // on, pool persisted every 6th dim, no between-sieve pwc borrow. Restore
 // stock behavior with HD_LAZY_SYNC=0 HD_SYNC_EVERY=1 HD_PWC_NO_GROW=0.
-// Build with -DHD_SVP140_CACHE_PROFILE=1 for the 47/32/8 GB profile.
+//   A100x4 500GB profile: 112/96/24 GB — enough slot-resident headroom for
+//   the CSD132 pool used by SVP-142 while leaving over half the node RAM for
+//   reducer staging, queues, the OS, and transient allocations.
+// Build with -DHD_SVP140_CACHE_PROFILE=1 for the 47/32/8 GB profile, or
+// -DHD_A100X4_500G_CACHE_PROFILE=1 for the 112/96/24 GB profile.
 #define ONE_TIME_IO                     1
 #ifndef HD_SVP140_CACHE_PROFILE
 #define HD_SVP140_CACHE_PROFILE         0
 #endif
-#if HD_SVP140_CACHE_PROFILE
+#ifndef HD_A100X4_500G_CACHE_PROFILE
+#define HD_A100X4_500G_CACHE_PROFILE    0
+#endif
+#if HD_SVP140_CACHE_PROFILE && HD_A100X4_500G_CACHE_PROFILE
+#error "select only one host cache profile"
+#endif
+#if HD_A100X4_500G_CACHE_PROFILE
+#define PWC_DRAM_SLIMIT                 (112ULL << 30)
+#define BWC_DRAM_SLIMIT                 (96ULL << 30)
+#define SWC_DRAM_SLIMIT                 (24ULL << 30)
+#elif HD_SVP140_CACHE_PROFILE
 #define PWC_DRAM_SLIMIT                 (47ULL << 30)
 #define BWC_DRAM_SLIMIT                 (32ULL << 30)
 #define SWC_DRAM_SLIMIT                 (8ULL << 30)
@@ -120,7 +134,11 @@ struct hw {
 ///////////////// red config /////////////////
 #define RED_MIN_CSD16                   128     /* change with kernel choosing code tegother */
 #define RED_MAX_NUM_THREADS             64
+#if HD_A100X4_500G_CACHE_PROFILE
+#define RED_GRAM_SLIMIT                 (48ULL << 30)
+#else
 #define RED_GRAM_SLIMIT                 (22ULL << 30)
+#endif
 
 #define BGJ1_RED_DEFAULT_NUM_THREADS    32
 #define BGJ2_RED_DEFAULT_NUM_THREADS    48
