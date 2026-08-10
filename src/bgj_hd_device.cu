@@ -4,6 +4,7 @@
 #include "../include/bgj_hd.h"
 #include "../include/pool_hd_device.h"
 #include "../include/bgj_hd_device.h"
+#include <strings.h>
 
 #if ENABLE_PROFILING
 static bool detailed_bucket_profile_enabled() {
@@ -4561,6 +4562,14 @@ Reducer_t::Reducer_t(Pool_hd_t *pool, bwc_manager_t *bwc, swc_manager_t *swc, ut
 
     const char *backpressure_env = getenv("HD_ADAPTIVE_BACKPRESSURE");
     _adaptive_backpressure = !backpressure_env || atoi(backpressure_env) != 0;
+    const char *backpressure_profile = getenv("HD_BACKPRESSURE_PROFILE");
+    if (backpressure_profile && !strcasecmp(backpressure_profile, "smooth")) {
+        _smooth_backpressure = true;
+    } else if (backpressure_profile &&
+               strcasecmp(backpressure_profile, "tiered")) {
+        lg_warn("ignoring invalid HD_BACKPRESSURE_PROFILE='%s' (expected tiered or smooth)",
+                backpressure_profile);
+    }
 
     this->set_pool(pool);
     this->set_bwc_manager(bwc);
@@ -4687,11 +4696,19 @@ int Reducer_t::auto_bgj_params_set(int bgj) {
         _device_workers[device_ptr] = 0;
         _active_reducers[device_ptr] = 0;
         _backpressure_tier[device_ptr] = 0;
+        _backpressure_limit[device_ptr] = 0;
+        _backpressure_pressure_ema[device_ptr] = 0.0;
     }
     for (int tid = 0; tid < _num_threads; tid++)
         _device_workers[hw::gpu_ptr(tid, _num_threads)]++;
-    if (_strategy == strategy_bgj2 && _adaptive_backpressure)
-        lg_dbg("adaptive reducer backpressure enabled (SWC tiers 80/90/97%%)");
+    for (int device_ptr = 0; device_ptr < hw::gpu_num; device_ptr++)
+        _backpressure_limit[device_ptr] = _device_workers[device_ptr];
+    if (_strategy == strategy_bgj2 && _adaptive_backpressure) {
+        if (_smooth_backpressure)
+            lg_dbg("smooth reducer backpressure enabled (SWC 70-98%% continuous range)");
+        else
+            lg_dbg("adaptive reducer backpressure enabled (SWC tiers 80/90/97%%)");
+    }
 
     // Large-bucket strategies still require host chunk pointers for their CPU
     // preprocessing. Small/medium strategies can consume exact ready chunks
@@ -4901,6 +4918,27 @@ int Reducer_t::_adaptive_reduce_limit(int device_ptr) {
     const long using_chunks = _swc->num_using();
     int pressure_pct = (int)(100 * using_chunks / _num_sol_chunks_slimit);
     if (pressure_pct > 100) pressure_pct = 100;
+
+    if (_smooth_backpressure) {
+        double &ema = _backpressure_pressure_ema[device_ptr];
+        if (ema == 0.0) ema = pressure_pct;
+        else ema = 0.98 * ema + 0.02 * pressure_pct;
+
+        const int min_limit = std::max(1, (workers + 3) / 4);
+        int limit = workers;
+        if (ema > 70.0) {
+            const double fraction = std::min(1.0, (ema - 70.0) / 28.0);
+            limit = workers - (int)ceil(fraction * (workers - min_limit));
+            if (limit < min_limit) limit = min_limit;
+        }
+        if (limit != _backpressure_limit[device_ptr]) {
+            _backpressure_limit[device_ptr] = limit;
+            lg_dbg("GPU %d smooth reducer limit %d/%d, SWC %ld/%ld chunks (%d%%, ema %.1f%%)",
+                   hw::gpu_id_list[device_ptr], limit, workers, using_chunks,
+                   (long)_num_sol_chunks_slimit, pressure_pct, ema);
+        }
+        return limit;
+    }
 
     static constexpr int up[3] = {80, 90, 97};
     static constexpr int down[3] = {75, 85, 92};

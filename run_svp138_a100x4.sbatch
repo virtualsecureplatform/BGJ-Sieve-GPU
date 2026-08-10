@@ -18,6 +18,10 @@ ACTUAL_SOURCE_COMMIT="$(git -C "$SOURCE" rev-parse HEAD)"
 SOURCE_COMMIT="${SOURCE_COMMIT:-${ACTUAL_SOURCE_COMMIT}}"
 FILTER_TASK_VECS="${FILTER_TASK_VECS:-524288}"
 BGJ2_REDUCER_THREADS="${BGJ2_REDUCER_THREADS:-48}"
+TARGET_SIEVING_DIM="${TARGET_SIEVING_DIM:-128}"
+CONTINUE_AFTER_TARGET="${CONTINUE_AFTER_TARGET:-0}"
+GPU_UID_SHARED_LOAD_PCT="${GPU_UID_SHARED_LOAD_PCT:-60}"
+BACKPRESSURE_PROFILE="${BACKPRESSURE_PROFILE:-tiered}"
 BINARY_ROOT="${BGJ_BINARY_ROOT:-${LARGE_BASE}/builds}"
 BINARY="${BGJ_BINARY:-${BINARY_ROOT}/hd_sieve-${SOURCE_COMMIT}-ftv${FILTER_TASK_VECS}}"
 BINARY_MANIFEST="${BINARY}.manifest"
@@ -46,6 +50,22 @@ if [[ ! "$BGJ2_REDUCER_THREADS" =~ ^[0-9]+$ ]] || (( BGJ2_REDUCER_THREADS < 4 ||
     echo "BGJ2_REDUCER_THREADS must be a multiple of 4 in [4, 64]" >&2
     exit 2
 fi
+if [[ ! "$TARGET_SIEVING_DIM" =~ ^[0-9]+$ ]] || (( TARGET_SIEVING_DIM < 114 || TARGET_SIEVING_DIM > 138 )); then
+    echo "TARGET_SIEVING_DIM must be in [114, 138]" >&2
+    exit 2
+fi
+if [[ "$CONTINUE_AFTER_TARGET" != 0 && "$CONTINUE_AFTER_TARGET" != 1 ]]; then
+    echo "CONTINUE_AFTER_TARGET must be 0 or 1" >&2
+    exit 2
+fi
+if [[ ! "$GPU_UID_SHARED_LOAD_PCT" =~ ^[0-9]+$ ]] || (( GPU_UID_SHARED_LOAD_PCT < 25 || GPU_UID_SHARED_LOAD_PCT > 80 )); then
+    echo "GPU_UID_SHARED_LOAD_PCT must be in [25, 80]" >&2
+    exit 2
+fi
+if [[ "$BACKPRESSURE_PROFILE" != tiered && "$BACKPRESSURE_PROFILE" != smooth ]]; then
+    echo "BACKPRESSURE_PROFILE must be tiered or smooth" >&2
+    exit 2
+fi
 if [[ ! "$FILTER_TASK_VECS" =~ ^[0-9]+$ ]] || (( FILTER_TASK_VECS < 65536 || (FILTER_TASK_VECS & (FILTER_TASK_VECS - 1)) != 0 )); then
     echo "FILTER_TASK_VECS must be a power of two >= 65536" >&2
     exit 2
@@ -60,7 +80,7 @@ cp "$INPUT_SOURCE/svp138-seed2.raw.basis" "$WORK/L_138_2.raw"
 cp "$INPUT_SOURCE/svp138-seed2.lll.basis" "$WORK/L_138_2.lll"
 cp "$INPUT_SOURCE/svp138-seed2.bkz60.basis" "$WORK/L_138_2.p60l8.pre"
 
-echo "node=$(hostname) job=${SLURM_JOB_ID} visible_gpus=${CUDA_VISIBLE_DEVICES:-unset} build=${BUILD} pool_threads=${POOL_THREADS} pool_buffer_cache=${POOL_BUFFER_CACHE} reducer_threads=${BGJ2_REDUCER_THREADS} filter_task_vecs=${FILTER_TASK_VECS}"
+echo "node=$(hostname) job=${SLURM_JOB_ID} visible_gpus=${CUDA_VISIBLE_DEVICES:-unset} build=${BUILD} pool_threads=${POOL_THREADS} pool_buffer_cache=${POOL_BUFFER_CACHE} reducer_threads=${BGJ2_REDUCER_THREADS} filter_task_vecs=${FILTER_TASK_VECS} tsd=${TARGET_SIEVING_DIM} continue_after_target=${CONTINUE_AFTER_TARGET} uid_load_pct=${GPU_UID_SHARED_LOAD_PCT} backpressure=${BACKPRESSURE_PROFILE}"
 echo "source=${SOURCE}"
 echo "source_commit=${SOURCE_COMMIT}"
 echo "binary=${BINARY}"
@@ -111,13 +131,23 @@ export APPTAINERENV_HD_PROFILE_BUCKET_STATS=0
 export APPTAINERENV_HD_POOL_THREADS="$POOL_THREADS"
 export APPTAINERENV_HD_POOL_BUFFER_CACHE="$POOL_BUFFER_CACHE"
 export APPTAINERENV_HD_BGJ2_REDUCER_THREADS="$BGJ2_REDUCER_THREADS"
+export APPTAINERENV_HD_GPU_UID_SHARED_LOAD_PCT="$GPU_UID_SHARED_LOAD_PCT"
+export APPTAINERENV_HD_BACKPRESSURE_PROFILE="$BACKPRESSURE_PROFILE"
+
+reproduce_args=(
+    run
+    --workdir "$WORK"
+    --binary "$BINARY"
+    --pre-sha256 "$PRE_SHA256"
+    --timeout 6900
+    --stale 0
+    --tsd "$TARGET_SIEVING_DIM"
+)
+if [[ "$CONTINUE_AFTER_TARGET" == 1 ]]; then
+    reproduce_args+=(--continue-after-target)
+fi
 
 apptainer exec --nv \
     --bind "$LARGE_BASE:$LARGE_BASE" \
     --pwd "$REPRO_SOURCE" \
-    "$IMAGE" python3 "$REPRO" run \
-        --workdir "$WORK" \
-        --binary "$BINARY" \
-        --pre-sha256 "$PRE_SHA256" \
-        --timeout 6900 \
-        --stale 0
+    "$IMAGE" python3 "$REPRO" "${reproduce_args[@]}"

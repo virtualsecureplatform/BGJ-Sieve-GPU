@@ -718,9 +718,12 @@ struct Reducer_t {
     // follows SWC occupancy with hysteresis so UID checking and pool insertion
     // retain CPU and memory bandwidth when solutions backlog.
     bool _adaptive_backpressure = true;
+    bool _smooth_backpressure = false;
     int _active_reducers[MAX_NUM_DEVICE] = {};
     int _device_workers[MAX_NUM_DEVICE] = {};
     int _backpressure_tier[MAX_NUM_DEVICE] = {};
+    int _backpressure_limit[MAX_NUM_DEVICE] = {};
+    double _backpressure_pressure_ema[MAX_NUM_DEVICE] = {};
 
     // A GPU-deduplicated output must be guaranteed room in SWC: otherwise a
     // UID could be remembered for a candidate that the bounded queue drops.

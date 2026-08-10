@@ -337,7 +337,13 @@ def run_sieve(
     timeout: float,
     stale: float,
     expected_pre_sha256: str = PRE_SHA256,
+    target_sieving_dim: int = TSD,
+    continue_after_target: bool = False,
 ) -> int:
+    if target_sieving_dim < MLD or target_sieving_dim > DIMENSION:
+        raise ReproductionError(
+            f"--tsd must be in [{MLD}, {DIMENSION}], found {target_sieving_dim}"
+        )
     raw, _, pre = paths(workdir)
     if not checked_file(raw, RAW_SHA256, "official raw lattice"):
         raise ReproductionError(f"raw lattice is missing; run the prepare stage first: {raw}")
@@ -362,7 +368,7 @@ def run_sieve(
         "--input",
         str(pre.resolve()),
         "--TSD",
-        str(TSD),
+        str(target_sieving_dim),
         "--MLD",
         str(MLD),
     ]
@@ -397,9 +403,11 @@ def run_sieve(
         "lattice_seed": LATTICE_SEED,
         "sieve_seed": int(SIEVE_SEED),
         "bgj2_reducer_threads": reducer_thread_count,
-        "tsd": TSD,
+        "tsd": target_sieving_dim,
         "mld": MLD,
         "target_norm2": TARGET_NORM2,
+        "strictly_shorter_norm2": TARGET_NORM2 - 1,
+        "continue_after_target": continue_after_target,
         "repo_commit": git_state(),
         "successful_commit": SUCCESS_COMMIT,
         "raw_sha256": RAW_SHA256,
@@ -410,6 +418,8 @@ def run_sieve(
     started = time.monotonic()
     best_length: float | None = None
     best_time: float | None = None
+    best_verification: dict[str, object] | None = None
+    first_target_time: float | None = None
     proc = subprocess.Popen(
         command,
         cwd=run_dir,
@@ -466,15 +476,31 @@ def run_sieve(
                     # of using that estimate as a correctness prefilter.
                     if pos == 0:
                         verification = verify_vector_text(match.group(4), raw)
-                        if verification["ok"]:
-                            result.update(
-                                status="solved",
-                                t_solution=round(elapsed, 2),
-                                verification=verification,
-                            )
-                            break
+                        if verification["in_lattice"] and (
+                            best_verification is None
+                            or verification["norm2"] < best_verification["norm2"]
+                        ):
+                            best_verification = verification
+                            result["best_verification"] = verification
+                            result["t_best"] = round(elapsed, 2)
+                        if verification["ok"] and first_target_time is None:
+                            first_target_time = elapsed
+                            result["t_solution"] = round(elapsed, 2)
+                            result["verification"] = verification
+                            if not continue_after_target:
+                                result["status"] = "solved"
+                                break
         if result["status"] == "running":
-            result["status"] = f"exited_rc{proc.returncode}"
+            returncode = proc.wait()
+            if continue_after_target and returncode == 0 and best_verification:
+                if best_verification["norm2"] < TARGET_NORM2:
+                    result["status"] = "shorter"
+                elif best_verification["norm2"] == TARGET_NORM2:
+                    result["status"] = "target-only"
+                else:
+                    result["status"] = "completed-no-target"
+            else:
+                result["status"] = f"exited_rc{returncode}"
     finally:
         stop_process(proc)
         proc.wait()
@@ -485,7 +511,7 @@ def run_sieve(
     result_path.write_text(json.dumps(result, indent=2) + "\n")
     print(f"[reproduce] {result['status']}; result: {result_path}")
     print("[reproduce] run data was preserved; remove the run directory manually when finished")
-    return 0 if result["status"] == "solved" else 1
+    return 0 if result["status"] in {"solved", "shorter", "target-only"} else 1
 
 
 def show_plan(workdir: Path, strategy: Path) -> None:
@@ -534,6 +560,12 @@ def main() -> int:
     run_parser.add_argument("--timeout", type=float, default=TIMEOUT_SECONDS)
     run_parser.add_argument("--stale", type=float, default=STALE_SECONDS)
     run_parser.add_argument("--pre-sha256", default=PRE_SHA256)
+    run_parser.add_argument("--tsd", type=int, default=TSD)
+    run_parser.add_argument(
+        "--continue-after-target",
+        action="store_true",
+        help="record the known target but continue through --tsd looking for a shorter vector",
+    )
 
     all_parser = subparsers.add_parser("all", help="download, prepare, build, and run")
     common_options(all_parser)
@@ -541,6 +573,8 @@ def main() -> int:
     all_parser.add_argument("--timeout", type=float, default=TIMEOUT_SECONDS)
     all_parser.add_argument("--stale", type=float, default=STALE_SECONDS)
     all_parser.add_argument("--pre-sha256", default=PRE_SHA256)
+    all_parser.add_argument("--tsd", type=int, default=TSD)
+    all_parser.add_argument("--continue-after-target", action="store_true")
 
     args = parser.parse_args()
     workdir = args.workdir.resolve()
@@ -563,14 +597,28 @@ def main() -> int:
         if args.action == "all":
             prepare(workdir, strategy)
             binary = args.binary.resolve() if args.binary else build(workdir)
-            return run_sieve(workdir, binary, args.timeout, args.stale, args.pre_sha256)
+            return run_sieve(
+                workdir,
+                binary,
+                args.timeout,
+                args.stale,
+                args.pre_sha256,
+                args.tsd,
+                args.continue_after_target,
+            )
         if args.action == "run":
             binary = args.binary
             if binary is None:
                 built = workdir / "hd_sieve_svp140"
                 binary = built if built.exists() else REPO / "app" / "hd_sieve_140P"
             return run_sieve(
-                workdir, binary.resolve(), args.timeout, args.stale, args.pre_sha256
+                workdir,
+                binary.resolve(),
+                args.timeout,
+                args.stale,
+                args.pre_sha256,
+                args.tsd,
+                args.continue_after_target,
             )
     except (OSError, ReproductionError, subprocess.CalledProcessError) as exc:
         print(f"[reproduce] error: {exc}", file=sys.stderr)

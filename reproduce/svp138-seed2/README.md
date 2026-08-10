@@ -29,6 +29,18 @@ python3 reproduce/svp138-seed2/reproduce.py build
 python3 reproduce/svp138-seed2/reproduce.py run
 ```
 
+By default the verifier stops as soon as it reproduces squared norm
+`8496181`. To retain that result and continue through CSD127 looking for a
+strictly shorter vector, use:
+
+```bash
+python3 reproduce/svp138-seed2/reproduce.py run \
+    --tsd 127 --continue-after-target
+```
+
+The resulting status is `shorter`, `target-only`, or `completed-no-target`;
+every candidate is checked in the original lattice with integer arithmetic.
+
 Or run the whole workflow. `all` deliberately starts by acquiring the lattice:
 
 ```bash

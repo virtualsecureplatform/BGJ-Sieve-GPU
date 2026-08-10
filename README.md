@@ -104,6 +104,11 @@ This submits a one-GPU build job followed by the four-GPU sieve with an
 size under `/LARGE0`, so later runs reuse the compute-built binary with
 `BUILD=0`. The tuned defaults are 48 BGJ2 reducer workers, a 524288-vector
 filter/packing batch, eight pool workers, and persistent pool buffers.
+Set `TARGET_SIEVING_DIM=127 CONTINUE_AFTER_TARGET=1` to keep the verified
+target and finish CSD127 in search of a strictly shorter vector. Experimental
+A100 controls include `FILTER_TASK_VECS=1048576` for a larger HBM-resident
+filter batch and `BACKPRESSURE_PROFILE=smooth` for continuous rather than
+four-tier reducer throttling.
 
 ### Example: Reproducing the LWE Challenge
 
