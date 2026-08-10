@@ -31,6 +31,9 @@ DEFAULT_TSD = 132
 DEFAULT_MLD = 118
 BKZ_BETA = 60
 BKZ_LOOPS = 8
+PREPROCESS_MODE = os.environ.get("SVP_PREPROCESS_MODE", "lll-bkz")
+DEEPLLL_DEPTH = int(os.environ.get("SVP_DEEPLLL_DEPTH", "4"))
+BLASTER_APP = os.environ.get("SVP_BLASTER_APP", "")
 TARGET_NORM2 = int(os.environ.get("SVP142_TARGET_NORM2", "9075417"))
 GENERATOR_URL = "https://www.latticechallenge.org/svp-challenge/generator.php"
 RAW_SHA256 = os.environ.get(
@@ -62,11 +65,12 @@ def sha256(path: Path) -> str:
 
 
 def input_paths(input_dir: Path) -> tuple[Path, Path, Path, Path]:
+    suffix = f"d{DEEPLLL_DEPTH}.p60l8" if PREPROCESS_MODE == "lll-deeplll-bkz" else "p60l8"
     return (
         input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.raw",
         input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.lll",
-        input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.p60l8.pre",
-        input_dir / "preprocess-manifest.json",
+        input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.{suffix}.pre",
+        input_dir / f"preprocess-manifest-{PREPROCESS_MODE}.json",
     )
 
 
@@ -151,6 +155,24 @@ def run_to_file(command: list[str], output: Path, accept_nonzero: bool = False) 
     return proc.returncode
 
 
+def run_deeplll(source: Path, output: Path) -> None:
+    app = Path(BLASTER_APP)
+    if not app.is_file() or DEEPLLL_DEPTH < 1:
+        raise ReproductionError("DeepLLL requires SVP_BLASTER_APP and positive depth")
+    tmp = output.with_name(f"{output.name}.tmp.{os.getpid()}")
+    command = [
+        sys.executable, str(app), "--depth", str(DEEPLLL_DEPTH), "--delta", "0.99",
+        "--lll_size", "64", "--cores", "32", "--input", str(source),
+        "--output", str(tmp),
+    ]
+    print("[svp142] " + " ".join(command))
+    proc = subprocess.run(command, check=False)
+    if proc.returncode:
+        raise ReproductionError(f"BLASter DeepLLL exited {proc.returncode}")
+    validate_matrix(tmp)
+    tmp.replace(output)
+
+
 def verify_vector_text(text: str, raw: Path) -> dict[str, object]:
     values = text.strip()
     if values.startswith("[") and values.endswith("]"):
@@ -177,6 +199,8 @@ def verify_vector_text(text: str, raw: Path) -> dict[str, object]:
 
 
 def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
+    if PREPROCESS_MODE not in {"lll-bkz", "lll-deeplll-bkz"}:
+        raise ReproductionError(f"unsupported preprocessing mode: {PREPROCESS_MODE}")
     version = fplll_version()
     if not version.startswith("fplll "):
         raise ReproductionError(f"unexpected fplll version output: {version or 'unknown'}")
@@ -188,6 +212,9 @@ def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
     raw = download_raw(input_dir)
     _, lll, pre, manifest_path = input_paths(input_dir)
 
+    blaster_commit = os.environ.get("BGJ_BLASTER_COMMIT", "")
+    if PREPROCESS_MODE == "lll-deeplll-bkz" and not re.fullmatch(r"[0-9a-f]{40}", blaster_commit):
+        raise ReproductionError("BGJ_BLASTER_COMMIT must identify the vendored BLASter revision")
     expected = {
         "dimension": DIMENSION,
         "lattice_seed": LATTICE_SEED,
@@ -195,7 +222,13 @@ def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
         "fplll_version": version,
         "fplll_commit": fplll_commit,
         "strategy_sha256": STRATEGY_SHA256,
-        "pipeline": "LLL -> BKZ-60 (pruned fplll strategy, max 8 loops)",
+        "pipeline": (
+            "LLL -> BLASter DeepLLL-4 -> BKZ-60 (pruned fplll strategy, max 8 loops)"
+            if PREPROCESS_MODE == "lll-deeplll-bkz"
+            else "LLL -> BKZ-60 (pruned fplll strategy, max 8 loops)"
+        ),
+        "preprocess_mode": PREPROCESS_MODE,
+        "blaster_commit": blaster_commit if PREPROCESS_MODE == "lll-deeplll-bkz" else None,
         "bkz_beta": BKZ_BETA,
         "bkz_max_loops": BKZ_LOOPS,
     }
@@ -209,10 +242,15 @@ def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
                 return pre
 
     run_to_file(["fplll", "-a", "lll", str(raw)], lll)
+    pre_bkz = lll
+    if PREPROCESS_MODE == "lll-deeplll-bkz":
+        deep = input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.deeplll{DEEPLLL_DEPTH}"
+        run_deeplll(lll, deep)
+        pre_bkz = deep
     rc = run_to_file(
         [
             "fplll", "-a", "bkz", "-b", str(BKZ_BETA), "-s", str(strategy),
-            "-bkzmaxloops", str(BKZ_LOOPS), str(lll),
+            "-bkzmaxloops", str(BKZ_LOOPS), str(pre_bkz),
         ],
         pre,
         accept_nonzero=True,

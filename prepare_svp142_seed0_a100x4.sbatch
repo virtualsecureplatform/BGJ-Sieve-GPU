@@ -15,6 +15,7 @@ FILTER_TASK_VECS="${FILTER_TASK_VECS:-524288}"
 LATTICE_SEED="${SVP142_LATTICE_SEED:-0}"
 INSTANCE="${SVP_INSTANCE:-svp142-seed${LATTICE_SEED}}"
 IMAGE="${BGJ_IMAGE:-${LARGE_BASE}/bgj-sieve-gpu-cuda13.3.sif}"
+PREPROCESS_IMAGE="${SVP_PREPROCESS_IMAGE:-${IMAGE}}"
 INPUT_DIR="${SVP142_INPUT_DIR:-${LARGE_BASE}/inputs/${INSTANCE}}"
 BINARY_ROOT="${BGJ_BINARY_ROOT:-${LARGE_BASE}/builds}"
 SOLVER_KEY="$("${SOURCE}/tools/solver_cache_key.sh" "$SOURCE" "$SOURCE_COMMIT" "$FILTER_TASK_VECS" | sha256sum | awk '{print $1}')"
@@ -26,6 +27,9 @@ FPLLL_COMMIT="$(git -C "${SOURCE}/dep/fplll" rev-parse HEAD)"
 FPLLL_PREFIX="${BGJ_FPLLL_PREFIX:-${LARGE_BASE}/deps/fplll-${FPLLL_COMMIT:0:12}}"
 FPLLL_BUILDER="${SOURCE}/tools/build_fplll.sh"
 LEGACY_NTL_PREFIX="${LARGE_BASE}/deps/ntl-9.3.0-svp-generator"
+PREPROCESS_MODE="${SVP_PREPROCESS_MODE:-lll-bkz}"
+BLASTER_COMMIT="$(git -C "${SOURCE}/dep/BLASter" rev-parse HEAD)"
+BLASTER_PREFIX="${LARGE_BASE}/deps/BLASter-${BLASTER_COMMIT:0:12}"
 
 if [[ "$ACTUAL_SOURCE_COMMIT" != "$SOURCE_COMMIT" ]]; then
     echo "Source moved after submission: expected $SOURCE_COMMIT, found $ACTUAL_SOURCE_COMMIT" >&2
@@ -51,6 +55,7 @@ fi
 mkdir -p "$INPUT_DIR" "$BINARY_ROOT"
 echo "node=$(hostname) job=${SLURM_JOB_ID} source_commit=${SOURCE_COMMIT}"
 echo "image=${IMAGE}"
+echo "preprocess_image=${PREPROCESS_IMAGE} preprocess_mode=${PREPROCESS_MODE}"
 echo "input_dir=${INPUT_DIR}"
 echo "binary=${BINARY}"
 echo "solver_key=${SOLVER_KEY}"
@@ -62,6 +67,14 @@ if [[ "$LATTICE_SEED" != "0" ]]; then
         "$LEGACY_NTL_PREFIX" "${SOURCE}/dep/dist/ntl-9.3.0.tar.gz" \
         "${SOURCE}/tools/svp_challenge_generator.cpp"
     export APPTAINERENV_SVP142_LEGACY_GENERATOR="${LEGACY_NTL_PREFIX}/bin/svp_challenge_generator"
+fi
+if [[ "$PREPROCESS_MODE" == "lll-deeplll-bkz" ]]; then
+    apptainer exec --bind "$LARGE_BASE:$LARGE_BASE" --pwd "$SOURCE" "$PREPROCESS_IMAGE" \
+        "${SOURCE}/tools/build_blaster.sh" "$BLASTER_PREFIX" \
+        "${SOURCE}/dep/BLASter" "$BLASTER_COMMIT"
+    export APPTAINERENV_PYTHONPATH="${BLASTER_PREFIX}:${SOURCE}/dep/BLASter/src"
+    export APPTAINERENV_BGJ_BLASTER_COMMIT="$BLASTER_COMMIT"
+    export APPTAINERENV_SVP_BLASTER_APP="${SOURCE}/dep/BLASter/src/app.py"
 fi
 
 # Build the current vendored fplll revision under LARGE0 if it is not cached. This
@@ -78,7 +91,7 @@ export APPTAINERENV_BGJ_FPLLL_COMMIT="$FPLLL_COMMIT"
 apptainer exec --nv \
     --bind "$LARGE_BASE:$LARGE_BASE" \
     --pwd "$SOURCE" \
-    "$IMAGE" python3 "$REPRO" prepare \
+    "$PREPROCESS_IMAGE" python3 "$REPRO" prepare \
         --input-dir "$INPUT_DIR" \
         --strategy "${FPLLL_PREFIX}/share/fplll/strategies/default.json"
 
