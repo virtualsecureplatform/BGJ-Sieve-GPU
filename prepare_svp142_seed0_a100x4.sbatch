@@ -74,7 +74,7 @@ if [[ "$PREPROCESS_MODE" == "lll-deeplll-bkz" ]]; then
         "${SOURCE}/dep/BLASter" "$BLASTER_COMMIT"
     export APPTAINERENV_PYTHONPATH="${BLASTER_PREFIX}:${SOURCE}/dep/BLASter/src"
     export APPTAINERENV_BGJ_BLASTER_COMMIT="$BLASTER_COMMIT"
-    export APPTAINERENV_SVP_BLASTER_APP="${SOURCE}/dep/BLASter/src/app.py"
+    export APPTAINERENV_SVP_BLASTER_APP="${BLASTER_PREFIX}/app.py"
 fi
 
 # Build the current vendored fplll revision under LARGE0 if it is not cached. This
