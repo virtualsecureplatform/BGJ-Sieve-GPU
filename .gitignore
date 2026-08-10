@@ -4,3 +4,6 @@ app/hd_sieve
 app/hd_sieve_*
 app/bin_hd_sieve_dbg.cu
 app/hd_sieve_dbg
+
+# Apptainer build artifacts are large and reproducible from container/*.def.
+*.sif

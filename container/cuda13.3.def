@@ -4,7 +4,7 @@ From: nvidia/cuda:13.3.0-devel-ubuntu24.04
 %labels
     CUDA 13.3.0
     GPU A100 (sm_80)
-    Purpose BGJ-Sieve-GPU build environment
+    Purpose BGJ-Sieve-GPU development and build environment
 
 %environment
     export PATH=/usr/local/cuda/bin:$PATH
@@ -12,15 +12,13 @@ From: nvidia/cuda:13.3.0-devel-ubuntu24.04
 
 %post
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y --no-install-recommends \
+    apt-get update \
+    && apt-get install -y --no-install-recommends \
         autoconf \
         automake \
         build-essential \
         ca-certificates \
-        cython3 \
         git \
-        libeigen3-dev \
         libgmp-dev \
         libmpfr-dev \
         libnuma-dev \
@@ -29,17 +27,17 @@ From: nvidia/cuda:13.3.0-devel-ubuntu24.04
         libtool-bin \
         pkg-config \
         python3 \
-        python3-cysignals-bare \
-        python3-dev \
-        python3-matplotlib \
-        python3-numpy \
-        python3-setuptools
-    rm -rf /var/lib/apt/lists/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 
 %test
     nvcc --version
     g++ --version
     command -v autoreconf
+    command -v libtoolize
+    command -v pkg-config
+    test -f /usr/include/gmp.h
     test -f /usr/include/mpfr.h
-    python3 -c 'import Cython, cysignals, matplotlib, numpy'
-    dpkg-query -W autoconf automake libtool libmpfr-dev libeigen3-dev libntl-dev libgmp-dev libnuma-dev
+    test -f /usr/include/NTL/LLL.h
+    test -f /usr/include/numa.h
+    python3 --version

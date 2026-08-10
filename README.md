@@ -32,6 +32,37 @@ make
 
 Compilation may take a few minutes. After it finishes, the `hd_sieve` binary will be generated in `app/`.
 
+#### Apptainer
+
+The repository includes a minimal CUDA development image definition. It does
+not contain this project or fplll, so both remain editable on the host and are
+used through a bind mount. Build the image on a machine with Apptainer and
+root or fakeroot support:
+
+```bash
+apptainer build --fakeroot bgj-sieve-gpu-cuda13.3.sif container/cuda13.3.def
+```
+
+Build fplll into a host-side prefix, then build this project in the same image:
+
+```bash
+mkdir -p .deps
+fplll_commit="$(git -C dep/fplll rev-parse HEAD)"
+fplll_container_prefix="/workspace/.deps/fplll-${fplll_commit:0:12}"
+
+apptainer exec --nv --bind "$PWD:/workspace" --pwd /workspace \
+  bgj-sieve-gpu-cuda13.3.sif \
+  tools/build_fplll.sh "$fplll_container_prefix" /workspace/dep/fplll "$fplll_commit"
+
+apptainer exec --nv --bind "$PWD:/workspace" --pwd /workspace \
+  --env PATH="$fplll_container_prefix/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin" \
+  --env LD_LIBRARY_PATH="$fplll_container_prefix/lib:/usr/local/cuda/lib64" \
+  bgj-sieve-gpu-cuda13.3.sif bash -lc 'make -C src && make -C app hd_sieve'
+```
+
+The SIF is intentionally not part of the repository; commit the small `.def`
+file and rebuild the image when its base CUDA tag or package list changes.
+
 ### Usage
 
 `hd_sieve` is the main executable for sieving-related workflows. It uses the same input and output lattice-basis format as `BGJ-Sieve-AMX`. Run it without arguments to see the help message:

@@ -1,13 +1,10 @@
 #!/bin/bash
 
-# Build the current dep/fplll revision privately on a compute node. The SIF
-# supplies only ordinary build prerequisites; fplll itself comes from Git.
+# Build the current dep/fplll revision in a private prefix. The container
+# supplies only ordinary build prerequisites; fplll itself comes from the
+# checked-out source tree. This works both in a Slurm allocation and locally.
 set -euo pipefail
 
-if [[ -z "${SLURM_JOB_ID:-}" ]]; then
-    echo "Refusing to build fplll outside a Slurm allocation" >&2
-    exit 2
-fi
 if (( $# != 3 )); then
     echo "usage: $0 PREFIX FPLLL_SOURCE EXPECTED_COMMIT" >&2
     exit 2
@@ -50,7 +47,7 @@ if [[ -x "${PREFIX}/bin/fplll" && -f "${PREFIX}/build-manifest.txt" ]] &&
     exit 0
 fi
 
-STAGE="$(mktemp -d "${DEPS_ROOT}/.build-fplll.${SLURM_JOB_ID}.XXXXXX")"
+STAGE="$(mktemp -d "${DEPS_ROOT}/.build-fplll.${SLURM_JOB_ID:-local}.XXXXXX")"
 cleanup() {
     case "$STAGE" in
         "${DEPS_ROOT}"/.build-fplll.*) rm -rf -- "$STAGE" ;;
@@ -61,7 +58,7 @@ trap cleanup EXIT
 
 cp -a "$FPLLL_SOURCE" "${STAGE}/fplll-src"
 BUILD_PREFIX="${STAGE}/prefix"
-BUILD_JOBS="${SLURM_CPUS_ON_NODE:-16}"
+BUILD_JOBS="${SLURM_CPUS_ON_NODE:-$(nproc)}"
 if (( BUILD_JOBS > 16 )); then
     BUILD_JOBS=16
 fi
