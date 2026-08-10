@@ -25,7 +25,7 @@ static long configured_pool_threads() {
         threads = value;
     }
     printf("Pool device workers: %ld (HD_POOL_BUFFER_CACHE=%s)\n", threads,
-           getenv("HD_POOL_BUFFER_CACHE") ? getenv("HD_POOL_BUFFER_CACHE") : "0");
+           getenv("HD_POOL_BUFFER_CACHE") ? getenv("HD_POOL_BUFFER_CACHE") : "1");
     return threads;
 }
 

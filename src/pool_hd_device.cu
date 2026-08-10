@@ -34,7 +34,7 @@ pool_device_buffer_cache_entry_t
 bool pool_device_buffer_cache_enabled() {
     static const bool enabled = []() {
         const char *env = getenv("HD_POOL_BUFFER_CACHE");
-        return env && atoi(env) != 0;
+        return !env || atoi(env) != 0;
     }();
     return enabled;
 }
