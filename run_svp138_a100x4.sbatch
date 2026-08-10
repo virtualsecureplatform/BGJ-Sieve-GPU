@@ -15,31 +15,42 @@ INPUT_SOURCE="${SVP138_INPUT_DIR:-${LARGE_BASE}/runs/svp138-seed2-289059}"
 WORK="${LARGE_BASE}/c586-a100x4-repro/job-${SLURM_JOB_ID}"
 REPRO="${REPRO_SOURCE}/reproduce/svp138-seed2/reproduce.py"
 BINARY="${SOURCE}/app/hd_sieve"
+BUILD="${BUILD:-1}"
 
 mkdir -p "$WORK"
 cp "$INPUT_SOURCE/svp138-seed2.raw.basis" "$WORK/L_138_2.raw"
 cp "$INPUT_SOURCE/svp138-seed2.lll.basis" "$WORK/L_138_2.lll"
 cp "$INPUT_SOURCE/svp138-seed2.bkz60.basis" "$WORK/L_138_2.p60l8.pre"
 
-echo "node=$(hostname) job=${SLURM_JOB_ID} visible_gpus=${CUDA_VISIBLE_DEVICES:-unset}"
+echo "node=$(hostname) job=${SLURM_JOB_ID} visible_gpus=${CUDA_VISIBLE_DEVICES:-unset} build=${BUILD}"
 echo "source=${SOURCE}"
 echo "work=${WORK}"
 sha256sum "$WORK/L_138_2.raw" "$WORK/L_138_2.lll" "$WORK/L_138_2.p60l8.pre"
 
-# Compilation and the sieve both run only inside the GPU allocation.
-apptainer exec --nv \
-    --bind "$LARGE_BASE:$LARGE_BASE" \
-    --pwd "$SOURCE" \
-    "$IMAGE" bash -lc '
-        set -euo pipefail
-        make -C src clean NVCC=nvcc
-        make -C app clean NVCC=nvcc
-        make -C src INC_DIR=-DHD_SVP140_CACHE_PROFILE=1 NVCC=nvcc
-        make -C app hd_sieve INC_DIR=-DHD_SVP140_CACHE_PROFILE=1 NVCC=nvcc
-    '
+# Compilation and the sieve both run only inside the GPU allocation. Set
+# BUILD=0 only after this exact source/configuration has been built once.
+if [[ "$BUILD" == 1 ]]; then
+    apptainer exec --nv \
+        --bind "$LARGE_BASE:$LARGE_BASE" \
+        --pwd "$SOURCE" \
+        "$IMAGE" bash -lc '
+            set -euo pipefail
+            make -C src clean NVCC=nvcc
+            make -C app clean NVCC=nvcc
+            make -C src INC_DIR=-DHD_SVP140_CACHE_PROFILE=1 NVCC=nvcc
+            make -C app hd_sieve INC_DIR=-DHD_SVP140_CACHE_PROFILE=1 NVCC=nvcc
+        '
+elif [[ "$BUILD" != 0 ]]; then
+    echo "BUILD must be 0 or 1" >&2
+    exit 2
+fi
 
 sha256sum "$BINARY"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
+
+# Summary profiling remains enabled; omit only the per-bucket D2H copy and
+# stream synchronization that the verified production experiment disabled.
+export APPTAINERENV_HD_PROFILE_BUCKET_STATS=0
 
 apptainer exec --nv \
     --bind "$LARGE_BASE:$LARGE_BASE" \

@@ -5,6 +5,16 @@
 #include "../include/pool_hd_device.h"
 #include "../include/bgj_hd_device.h"
 
+#if ENABLE_PROFILING
+static bool detailed_bucket_profile_enabled() {
+    static const bool enabled = []() {
+        const char *env = getenv("HD_PROFILE_BUCKET_STATS");
+        return !env || atoi(env) != 0;
+    }();
+    return enabled;
+}
+#endif
+
 static bool __sieve_rng_base_seed(uint64_t *seed) {
     const char *env = getenv("HD_SIEVE_SEED");
     if (!env || !env[0]) return false;
@@ -5226,7 +5236,7 @@ int Reducer_t::_ld_sbuc(int tid, int bucket_id) {
                 used = 0;
             }
         }
-        
+
         if (_strategy == strategy_bgj1) {
             _red_buf->bgjs_upk(tid);
         }
@@ -5238,10 +5248,11 @@ int Reducer_t::_ld_sbuc(int tid, int bucket_id) {
     }
 
     #if ENABLE_PROFILING
+    if (detailed_bucket_profile_enabled()) {
     int bk0_size = _red_buf->buc_vecs[tid];
     int bk1_size[BGJ3_DEFAULT_BATCH1 + BGJ2_DEFAULT_BATCH1];
     if (_strategy == strategy_bgj2 || _strategy == strategy_bgj3) {
-        CHECK_CUDA_ERR(cudaMemcpyAsync(bk1_size, _red_buf->d_bk1[tid], _batch1 * sizeof(int), 
+        CHECK_CUDA_ERR(cudaMemcpyAsync(bk1_size, _red_buf->d_bk1[tid], _batch1 * sizeof(int),
                        cudaMemcpyDeviceToHost, _red_buf->streams[tid]));
         CHECK_CUDA_ERR(cudaStreamSynchronize(_red_buf->streams[tid]));
         logger->ev_bk1_num += _batch1;
@@ -5260,6 +5271,7 @@ int Reducer_t::_ld_sbuc(int tid, int bucket_id) {
     logger->ev_bk0_ssum += bk0_size;
     logger->ev_bk0_max   = std::max((int)logger->ev_bk0_max.load(), bk0_size);
     logger->ev_bk1_vmmas += ceil(bk0_size / 16.0) * ceil(_batch1 / 16.0);
+    }
     #endif
 
     return 0;
@@ -5313,6 +5325,7 @@ int Reducer_t::_ld_hbm_sbuc(int tid, int bucket_id) {
     }
 
     #if ENABLE_PROFILING
+    if (detailed_bucket_profile_enabled()) {
     int bk0_size = _red_buf->buc_vecs[tid];
     int bk1_size[BGJ3_DEFAULT_BATCH1 + BGJ2_DEFAULT_BATCH1];
     if (_strategy == strategy_bgj2 || _strategy == strategy_bgj3) {
@@ -5335,6 +5348,7 @@ int Reducer_t::_ld_hbm_sbuc(int tid, int bucket_id) {
     logger->ev_bk0_ssum += bk0_size;
     logger->ev_bk0_max = std::max((int)logger->ev_bk0_max.load(), bk0_size);
     logger->ev_bk1_vmmas += ceil(bk0_size / 16.0) * ceil(_batch1 / 16.0);
+    }
     #endif
     return 0;
 }
