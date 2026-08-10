@@ -18,7 +18,7 @@ INPUT_DIR="${SVP142_INPUT_DIR:-${LARGE_BASE}/inputs/svp142-seed${LATTICE_SEED}}"
 BINARY_ROOT="${BGJ_BINARY_ROOT:-${LARGE_BASE}/builds}"
 BINARY="${BGJ_BINARY:-${BINARY_ROOT}/hd_sieve-${SOURCE_COMMIT}-svp142-500g-ftv${FILTER_TASK_VECS}}"
 MANIFEST="${BINARY}.manifest"
-REPRO="${SOURCE}/reproduce/svp142-seed${LATTICE_SEED}/reproduce.py"
+REPRO="${SVP142_REPRO:-${SOURCE}/reproduce/svp142-seed${LATTICE_SEED}/reproduce.py}"
 DEFINES="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_FILTER_TASK_VECS=${FILTER_TASK_VECS}"
 FPLLL_COMMIT="$(git -C "${SOURCE}/dep/fplll" rev-parse HEAD)"
 FPLLL_PREFIX="${BGJ_FPLLL_PREFIX:-${LARGE_BASE}/deps/fplll-${FPLLL_COMMIT:0:12}}"
@@ -41,8 +41,8 @@ if [[ ! -f "$IMAGE" ]]; then
     echo "Missing Apptainer image: $IMAGE" >&2
     exit 2
 fi
-if [[ "$LATTICE_SEED" != "0" && "$LATTICE_SEED" != "42" ]]; then
-    echo "SVP142_LATTICE_SEED must be 0 or 42" >&2
+if [[ ! "$LATTICE_SEED" =~ ^[0-9]+$ ]]; then
+    echo "SVP142_LATTICE_SEED must be a nonnegative integer" >&2
     exit 2
 fi
 
@@ -53,7 +53,7 @@ echo "input_dir=${INPUT_DIR}"
 echo "binary=${BINARY}"
 echo "fplll_commit=${FPLLL_COMMIT} fplll_prefix=${FPLLL_PREFIX}"
 
-if [[ "$LATTICE_SEED" == "42" ]]; then
+if [[ "$LATTICE_SEED" != "0" ]]; then
     apptainer exec --bind "$LARGE_BASE:$LARGE_BASE" --pwd "$SOURCE" "$IMAGE" \
         "${SOURCE}/tools/build_legacy_ntl_generator.sh" \
         "$LEGACY_NTL_PREFIX" "${SOURCE}/dep/dist/ntl-9.3.0.tar.gz" \

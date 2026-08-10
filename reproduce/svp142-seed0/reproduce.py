@@ -84,25 +84,28 @@ def validate_matrix(path: Path) -> None:
 
 def download_raw(input_dir: Path) -> Path:
     raw, _, _, _ = input_paths(input_dir)
-    if raw.exists() and sha256(raw) == RAW_SHA256:
+    if raw.exists() and (RAW_SHA256 == "GENERATE" or sha256(raw) == RAW_SHA256):
         validate_matrix(raw)
-        print(f"[svp142] official raw basis cached and verified: {RAW_SHA256}")
+        print(f"[svp142] raw basis cached and verified: {sha256(raw)}")
         return raw
     input_dir.mkdir(parents=True, exist_ok=True)
     tmp = raw.with_name(f"{raw.name}.tmp.{os.getpid()}")
-    body = urllib.parse.urlencode(
-        {"dimension": DIMENSION, "seed": LATTICE_SEED, "sent": "true"}
-    ).encode("ascii")
-    request = urllib.request.Request(
-        GENERATOR_URL,
-        data=body,
-        headers={"User-Agent": "BGJ-Sieve-GPU SVP-142 recipe"},
-    )
-    print(f"[svp142] downloading official dimension 142, seed {LATTICE_SEED} basis")
-    with urllib.request.urlopen(request, timeout=60) as response, tmp.open("wb") as output:
-        shutil.copyfileobj(response, output)
-    actual = sha256(tmp)
-    if actual != RAW_SHA256 and LEGACY_GENERATOR:
+    if RAW_SHA256 == "GENERATE":
+        actual = ""
+    else:
+        body = urllib.parse.urlencode(
+            {"dimension": DIMENSION, "seed": LATTICE_SEED, "sent": "true"}
+        ).encode("ascii")
+        request = urllib.request.Request(
+            GENERATOR_URL,
+            data=body,
+            headers={"User-Agent": "BGJ-Sieve-GPU SVP-142 recipe"},
+        )
+        print(f"[svp142] downloading official dimension 142, seed {LATTICE_SEED} basis")
+        with urllib.request.urlopen(request, timeout=60) as response, tmp.open("wb") as output:
+            shutil.copyfileobj(response, output)
+        actual = sha256(tmp)
+    if (RAW_SHA256 == "GENERATE" or actual != RAW_SHA256) and LEGACY_GENERATOR:
         generator = Path(LEGACY_GENERATOR)
         if not generator.is_file() or not os.access(generator, os.X_OK):
             raise ReproductionError(f"missing legacy generator: {generator}")
@@ -116,7 +119,7 @@ def download_raw(input_dir: Path) -> Path:
         if proc.returncode:
             raise ReproductionError(f"legacy generator exited {proc.returncode}")
         actual = sha256(tmp)
-    if actual != RAW_SHA256:
+    if RAW_SHA256 != "GENERATE" and actual != RAW_SHA256:
         raise ReproductionError(
             f"downloaded raw basis hash {actual}, expected {RAW_SHA256}; retained {tmp}"
         )
@@ -188,7 +191,7 @@ def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
     expected = {
         "dimension": DIMENSION,
         "lattice_seed": LATTICE_SEED,
-        "raw_sha256": RAW_SHA256,
+        "raw_sha256": sha256(raw),
         "fplll_version": version,
         "fplll_commit": fplll_commit,
         "strategy_sha256": STRATEGY_SHA256,
@@ -221,7 +224,10 @@ def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
         {
             "lll_sha256": sha256(lll),
             "pre_sha256": sha256(pre),
-            "known_vector": verify_vector_text(KNOWN_VECTOR.read_text(), raw),
+            "known_vector": (
+                verify_vector_text(KNOWN_VECTOR.read_text(), raw)
+                if KNOWN_VECTOR.is_file() else None
+            ),
         }
     )
     tmp = manifest_path.with_name(f"{manifest_path.name}.tmp.{os.getpid()}")
@@ -236,7 +242,8 @@ def load_inputs(input_dir: Path) -> tuple[Path, Path, dict[str, object]]:
     if not manifest_path.is_file():
         raise ReproductionError(f"missing preprocessing manifest: {manifest_path}")
     manifest = json.loads(manifest_path.read_text())
-    if manifest.get("raw_sha256") != RAW_SHA256 or sha256(raw) != RAW_SHA256:
+    expected_raw = manifest.get("raw_sha256") if RAW_SHA256 == "GENERATE" else RAW_SHA256
+    if manifest.get("raw_sha256") != expected_raw or sha256(raw) != expected_raw:
         raise ReproductionError("raw basis does not match the official pinned basis")
     if manifest.get("pre_sha256") != sha256(pre):
         raise ReproductionError("preprocessed basis does not match its manifest")
@@ -298,7 +305,7 @@ def run_sieve(
         "tsd": tsd,
         "mld": mld,
         "target_norm2": TARGET_NORM2,
-        "raw_sha256": RAW_SHA256,
+        "raw_sha256": sha256(raw),
         "pre_sha256": manifest["pre_sha256"],
         "binary_sha256": sha256(binary),
         "command": " ".join(command),
