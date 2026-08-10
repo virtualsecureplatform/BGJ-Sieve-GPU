@@ -25,19 +25,23 @@ import urllib.request
 
 
 DIMENSION = 142
-LATTICE_SEED = 0
+LATTICE_SEED = int(os.environ.get("SVP142_LATTICE_SEED", "0"))
 SIEVE_SEED = "0"
 DEFAULT_TSD = 132
 DEFAULT_MLD = 118
 BKZ_BETA = 60
 BKZ_LOOPS = 8
-TARGET_NORM2 = 9_075_417
+TARGET_NORM2 = int(os.environ.get("SVP142_TARGET_NORM2", "9075417"))
 GENERATOR_URL = "https://www.latticechallenge.org/svp-challenge/generator.php"
-RAW_SHA256 = "bd449bb1bccbd9c927a2895bf1ca1f5d62a7864c0c4e7e305f1da854dca96674"
+RAW_SHA256 = os.environ.get(
+    "SVP142_RAW_SHA256",
+    "bd449bb1bccbd9c927a2895bf1ca1f5d62a7864c0c4e7e305f1da854dca96674",
+)
 STRATEGY_SHA256 = "f516b0a6f0c580cff72e1e2c3562c44dc6f17e8f99613e9e4020e35481b27a18"
 DEFAULT_STRATEGY = Path("/usr/local/share/fplll/strategies/default.json")
 HERE = Path(__file__).resolve().parent
-KNOWN_VECTOR = HERE / "known-vector.txt"
+KNOWN_VECTOR = Path(os.environ.get("SVP142_KNOWN_VECTOR", str(HERE / "known-vector.txt")))
+LEGACY_GENERATOR = os.environ.get("SVP142_LEGACY_GENERATOR", "")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 SOL_RE = re.compile(
     r"\[pos (\d+)\] length = ([0-9.]+)\(([0-9.]+) gh, [0-9.eE+-]+ old\), "
@@ -59,9 +63,9 @@ def sha256(path: Path) -> str:
 
 def input_paths(input_dir: Path) -> tuple[Path, Path, Path, Path]:
     return (
-        input_dir / "L_142_0.raw",
-        input_dir / "L_142_0.lll",
-        input_dir / "L_142_0.p60l8.pre",
+        input_dir / f"L_142_{LATTICE_SEED}.raw",
+        input_dir / f"L_142_{LATTICE_SEED}.lll",
+        input_dir / f"L_142_{LATTICE_SEED}.p60l8.pre",
         input_dir / "preprocess-manifest.json",
     )
 
@@ -94,10 +98,24 @@ def download_raw(input_dir: Path) -> Path:
         data=body,
         headers={"User-Agent": "BGJ-Sieve-GPU SVP-142 recipe"},
     )
-    print("[svp142] downloading official dimension 142, seed 0 basis")
+    print(f"[svp142] downloading official dimension 142, seed {LATTICE_SEED} basis")
     with urllib.request.urlopen(request, timeout=60) as response, tmp.open("wb") as output:
         shutil.copyfileobj(response, output)
     actual = sha256(tmp)
+    if actual != RAW_SHA256 and LEGACY_GENERATOR:
+        generator = Path(LEGACY_GENERATOR)
+        if not generator.is_file() or not os.access(generator, os.X_OK):
+            raise ReproductionError(f"missing legacy generator: {generator}")
+        print(f"[svp142] official response unusable ({actual}); using pinned NTL 9.3 generator")
+        with tmp.open("wb") as output:
+            proc = subprocess.run(
+                [str(generator), str(DIMENSION), str(LATTICE_SEED)],
+                stdout=output,
+                check=False,
+            )
+        if proc.returncode:
+            raise ReproductionError(f"legacy generator exited {proc.returncode}")
+        actual = sha256(tmp)
     if actual != RAW_SHA256:
         raise ReproductionError(
             f"downloaded raw basis hash {actual}, expected {RAW_SHA256}; retained {tmp}"
@@ -350,8 +368,8 @@ def run_sieve(
 
 
 def show_plan(input_dir: Path, run_dir: Path) -> None:
-    print(f"""SVP-142 seed-0 plan
-1. Download and hash-pin the official 142x142 seed-0 basis in {input_dir}.
+    print(f"""SVP-142 seed-{LATTICE_SEED} plan
+1. Obtain and hash-pin the official 142x142 seed-{LATTICE_SEED} basis in {input_dir}.
 2. Build the current vendored fplll revision, then run LLL -> pruned BKZ-60,
    maximum 8 loops.
 3. Build the four-A100 binary with the 112/96/24 GiB host-cache profile.
