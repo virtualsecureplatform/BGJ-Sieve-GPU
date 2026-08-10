@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 
 
-DIMENSION = 142
+DIMENSION = int(os.environ.get("SVP_DIMENSION", "142"))
 LATTICE_SEED = int(os.environ.get("SVP142_LATTICE_SEED", "0"))
 SIEVE_SEED = "0"
 DEFAULT_TSD = 132
@@ -63,9 +63,9 @@ def sha256(path: Path) -> str:
 
 def input_paths(input_dir: Path) -> tuple[Path, Path, Path, Path]:
     return (
-        input_dir / f"L_142_{LATTICE_SEED}.raw",
-        input_dir / f"L_142_{LATTICE_SEED}.lll",
-        input_dir / f"L_142_{LATTICE_SEED}.p60l8.pre",
+        input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.raw",
+        input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.lll",
+        input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.p60l8.pre",
         input_dir / "preprocess-manifest.json",
     )
 
@@ -101,7 +101,7 @@ def download_raw(input_dir: Path) -> Path:
             data=body,
             headers={"User-Agent": "BGJ-Sieve-GPU SVP-142 recipe"},
         )
-        print(f"[svp142] downloading official dimension 142, seed {LATTICE_SEED} basis")
+        print(f"[svp142] downloading official dimension {DIMENSION}, seed {LATTICE_SEED} basis")
         with urllib.request.urlopen(request, timeout=60) as response, tmp.open("wb") as output:
             shutil.copyfileobj(response, output)
         actual = sha256(tmp)
@@ -375,8 +375,8 @@ def run_sieve(
 
 
 def show_plan(input_dir: Path, run_dir: Path) -> None:
-    print(f"""SVP-142 seed-{LATTICE_SEED} plan
-1. Obtain and hash-pin the official 142x142 seed-{LATTICE_SEED} basis in {input_dir}.
+    print(f"""SVP-{DIMENSION} seed-{LATTICE_SEED} plan
+1. Obtain and hash-pin the official {DIMENSION}x{DIMENSION} seed-{LATTICE_SEED} basis in {input_dir}.
 2. Build the current vendored fplll revision, then run LLL -> pruned BKZ-60,
    maximum 8 loops.
 3. Build the four-A100 binary with the 112/96/24 GiB host-cache profile.
