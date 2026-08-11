@@ -26,11 +26,11 @@ import urllib.request
 
 DIMENSION = int(os.environ.get("SVP_DIMENSION", "142"))
 LATTICE_SEED = int(os.environ.get("SVP142_LATTICE_SEED", "0"))
-SIEVE_SEED = "0"
+SIEVE_SEED = os.environ.get("SVP_SIEVE_SEED", "0")
 DEFAULT_TSD = 132
 DEFAULT_MLD = 118
-BKZ_BETA = 60
-BKZ_LOOPS = 8
+BKZ_BETA = int(os.environ.get("SVP_BKZ_BETA", "60"))
+BKZ_LOOPS = int(os.environ.get("SVP_BKZ_LOOPS", "8"))
 PREPROCESS_MODE = os.environ.get("SVP_PREPROCESS_MODE", "lll-bkz")
 DEEPLLL_DEPTH = int(os.environ.get("SVP_DEEPLLL_DEPTH", "4"))
 BLASTER_APP = os.environ.get("SVP_BLASTER_APP", "")
@@ -65,7 +65,11 @@ def sha256(path: Path) -> str:
 
 
 def input_paths(input_dir: Path) -> tuple[Path, Path, Path, Path]:
-    suffix = f"d{DEEPLLL_DEPTH}.p60l8" if PREPROCESS_MODE == "lll-deeplll-bkz" else "p60l8"
+    suffix = (
+        f"d{DEEPLLL_DEPTH}.p{BKZ_BETA}l{BKZ_LOOPS}"
+        if PREPROCESS_MODE == "lll-deeplll-bkz"
+        else f"p{BKZ_BETA}l{BKZ_LOOPS}"
+    )
     return (
         input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.raw",
         input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.lll",
@@ -223,9 +227,10 @@ def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
         "fplll_commit": fplll_commit,
         "strategy_sha256": STRATEGY_SHA256,
         "pipeline": (
-            "LLL -> BLASter DeepLLL-4 -> BKZ-60 (pruned fplll strategy, max 8 loops)"
+            f"LLL -> BLASter DeepLLL-{DEEPLLL_DEPTH} -> BKZ-{BKZ_BETA} "
+            f"(pruned fplll strategy, max {BKZ_LOOPS} loops)"
             if PREPROCESS_MODE == "lll-deeplll-bkz"
-            else "LLL -> BKZ-60 (pruned fplll strategy, max 8 loops)"
+            else f"LLL -> BKZ-{BKZ_BETA} (pruned fplll strategy, max {BKZ_LOOPS} loops)"
         ),
         "preprocess_mode": PREPROCESS_MODE,
         "blaster_commit": blaster_commit if PREPROCESS_MODE == "lll-deeplll-bkz" else None,
