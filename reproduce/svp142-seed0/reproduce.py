@@ -70,11 +70,15 @@ def input_paths(input_dir: Path) -> tuple[Path, Path, Path, Path]:
         if PREPROCESS_MODE == "lll-deeplll-bkz"
         else f"p{BKZ_BETA}l{BKZ_LOOPS}"
     )
+    legacy_manifest = BKZ_BETA == 60 and BKZ_LOOPS == 8 and (
+        PREPROCESS_MODE != "lll-deeplll-bkz" or DEEPLLL_DEPTH == 4
+    )
+    manifest_tag = PREPROCESS_MODE if legacy_manifest else suffix
     return (
         input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.raw",
         input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.lll",
         input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.{suffix}.pre",
-        input_dir / f"preprocess-manifest-{PREPROCESS_MODE}.json",
+        input_dir / f"preprocess-manifest-{manifest_tag}.json",
     )
 
 
@@ -326,6 +330,7 @@ def run_sieve(
     timeout: float,
     tsd: int,
     mld: int,
+    continue_after_target: bool,
 ) -> int:
     if not (mld <= tsd <= DIMENSION) or mld < 100:
         raise ReproductionError(f"invalid sieve dimensions MLD={mld}, TSD={tsd}")
@@ -347,6 +352,7 @@ def run_sieve(
         "sieve_seed": int(SIEVE_SEED),
         "tsd": tsd,
         "mld": mld,
+        "continue_after_target": continue_after_target,
         "target_norm2": TARGET_NORM2,
         "raw_sha256": sha256(raw),
         "pre_sha256": manifest["pre_sha256"],
@@ -399,13 +405,24 @@ def run_sieve(
                         best_norm2 = norm2
                         result["best_verification"] = verification
                         result["t_best"] = round(elapsed, 2)
-                    if verification["ok"]:
-                        result["status"] = "solved"
+                    if verification["ok"] and "t_solution" not in result:
                         result["verification"] = verification
                         result["t_solution"] = round(elapsed, 2)
-                        break
+                        if not continue_after_target:
+                            result["status"] = "solved"
+                            break
             if result["status"] == "running":
-                result["status"] = f"exited_rc{proc.wait()}"
+                returncode = proc.wait()
+                if continue_after_target and returncode == 0 and "best_verification" in result:
+                    best = result["best_verification"]
+                    if best["norm2"] < TARGET_NORM2:
+                        result["status"] = "shorter"
+                    elif best["norm2"] == TARGET_NORM2:
+                        result["status"] = "target-only"
+                    else:
+                        result["status"] = "completed-no-target"
+                else:
+                    result["status"] = f"exited_rc{returncode}"
     finally:
         stop_process(proc)
         proc.wait()
@@ -414,7 +431,7 @@ def run_sieve(
     result_path = run_dir / "result.json"
     result_path.write_text(json.dumps(result, indent=2) + "\n")
     print(f"[svp142] {result['status']}; result: {result_path}")
-    return 0 if result["status"] == "solved" else 1
+    return 0 if result["status"] in ("solved", "shorter", "target-only") else 1
 
 
 def show_plan(input_dir: Path, run_dir: Path) -> None:
@@ -448,6 +465,7 @@ def main() -> int:
     run.add_argument("--timeout", type=float, default=10500)
     run.add_argument("--tsd", type=int, default=DEFAULT_TSD)
     run.add_argument("--mld", type=int, default=DEFAULT_MLD)
+    run.add_argument("--continue-after-target", action="store_true")
     args = parser.parse_args()
     try:
         if args.action == "plan":
@@ -464,7 +482,7 @@ def main() -> int:
         if args.action == "run":
             return run_sieve(
                 args.input_dir.resolve(), args.run_dir.resolve(), args.binary.resolve(),
-                args.timeout, args.tsd, args.mld,
+                args.timeout, args.tsd, args.mld, args.continue_after_target,
             )
     except (OSError, ReproductionError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
         print(f"[svp142] error: {exc}", file=sys.stderr)

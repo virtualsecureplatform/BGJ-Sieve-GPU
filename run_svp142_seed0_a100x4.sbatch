@@ -29,6 +29,7 @@ BGJ2_REDUCER_THREADS="${BGJ2_REDUCER_THREADS:-48}"
 POOL_THREADS="${POOL_THREADS:-8}"
 GPU_UID_SHARED_LOAD_PCT="${GPU_UID_SHARED_LOAD_PCT:-60}"
 BACKPRESSURE_PROFILE="${BACKPRESSURE_PROFILE:-tiered}"
+CONTINUE_AFTER_TARGET="${CONTINUE_AFTER_TARGET:-0}"
 
 if [[ "$ACTUAL_SOURCE_COMMIT" != "$SOURCE_COMMIT" ]]; then
     echo "Source moved after submission: expected $SOURCE_COMMIT, found $ACTUAL_SOURCE_COMMIT" >&2
@@ -40,6 +41,10 @@ if [[ ! "$TARGET_SIEVING_DIM" =~ ^[0-9]+$ ]] || (( TARGET_SIEVING_DIM < 118 || T
 fi
 if [[ ! "$MIN_LIFTING_DIM" =~ ^[0-9]+$ ]] || (( MIN_LIFTING_DIM < 100 || MIN_LIFTING_DIM > TARGET_SIEVING_DIM )); then
     echo "MIN_LIFTING_DIM must be in [100, TARGET_SIEVING_DIM]" >&2
+    exit 2
+fi
+if [[ "$CONTINUE_AFTER_TARGET" != 0 && "$CONTINUE_AFTER_TARGET" != 1 ]]; then
+    echo "CONTINUE_AFTER_TARGET must be 0 or 1" >&2
     exit 2
 fi
 if [[ ! "$BGJ2_REDUCER_THREADS" =~ ^[0-9]+$ ]] || (( BGJ2_REDUCER_THREADS < 4 || BGJ2_REDUCER_THREADS > 64 || BGJ2_REDUCER_THREADS % 4 != 0 )); then
@@ -56,7 +61,7 @@ grep -Fqx "cache_profile=svp142-500g" "$BINARY_MANIFEST"
 
 echo "node=$(hostname) job=${SLURM_JOB_ID} visible_gpus=${CUDA_VISIBLE_DEVICES:-unset}"
 echo "source_commit=${SOURCE_COMMIT} solver_key=${SOLVER_KEY} binary=${BINARY}"
-echo "input_dir=${INPUT_DIR} run_dir=${RUN_DIR} MLD=${MIN_LIFTING_DIM} TSD=${TARGET_SIEVING_DIM}"
+echo "input_dir=${INPUT_DIR} run_dir=${RUN_DIR} MLD=${MIN_LIFTING_DIM} TSD=${TARGET_SIEVING_DIM} continue_after_target=${CONTINUE_AFTER_TARGET}"
 echo "reducer_threads=${BGJ2_REDUCER_THREADS} pool_threads=${POOL_THREADS} uid_load_pct=${GPU_UID_SHARED_LOAD_PCT} backpressure=${BACKPRESSURE_PROFILE}"
 sha256sum "$BINARY"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
@@ -68,13 +73,20 @@ export APPTAINERENV_HD_BGJ2_REDUCER_THREADS="$BGJ2_REDUCER_THREADS"
 export APPTAINERENV_HD_GPU_UID_SHARED_LOAD_PCT="$GPU_UID_SHARED_LOAD_PCT"
 export APPTAINERENV_HD_BACKPRESSURE_PROFILE="$BACKPRESSURE_PROFILE"
 
+reproduce_args=(
+    run
+    --input-dir "$INPUT_DIR"
+    --run-dir "$RUN_DIR"
+    --binary "$BINARY"
+    --timeout 10500
+    --mld "$MIN_LIFTING_DIM"
+    --tsd "$TARGET_SIEVING_DIM"
+)
+if [[ "$CONTINUE_AFTER_TARGET" == 1 ]]; then
+    reproduce_args+=(--continue-after-target)
+fi
+
 apptainer exec --nv \
     --bind "$LARGE_BASE:$LARGE_BASE" \
     --pwd "$SOURCE" \
-    "$IMAGE" python3 "$REPRO" run \
-        --input-dir "$INPUT_DIR" \
-        --run-dir "$RUN_DIR" \
-        --binary "$BINARY" \
-        --timeout 10500 \
-        --mld "$MIN_LIFTING_DIM" \
-        --tsd "$TARGET_SIEVING_DIM"
+    "$IMAGE" python3 "$REPRO" "${reproduce_args[@]}"
