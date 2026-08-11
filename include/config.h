@@ -78,11 +78,13 @@ struct hw {
 // Fast persistence behavior is the DEFAULT (single-SSD tuning): lazy sync
 // on, pool persisted every 6th dim, no between-sieve pwc borrow. Restore
 // stock behavior with HD_LAZY_SYNC=0 HD_SYNC_EVERY=1 HD_PWC_NO_GROW=0.
-//   A100x4 500GB profile: 112/96/24 GB — enough slot-resident headroom for
-//   the CSD132 pool used by SVP-142 while leaving over half the node RAM for
-//   reducer staging, queues, the OS, and transient allocations.
+//   A100x4 500GB profile: 160/96/24 GB.  The CSD135 pool occupies 106956
+//   exact host chunks (128.93 GiB); the former 112GB PWC cap held CSD134 but
+//   made CSD135 thrash the backing store.  The wider cap also holds the
+//   projected CSD136 pool while leaving about 140GB for reducer staging,
+//   queues, the OS, and transient allocations on the 500GB nodes.
 // Build with -DHD_SVP140_CACHE_PROFILE=1 for the 47/32/8 GB profile, or
-// -DHD_A100X4_500G_CACHE_PROFILE=1 for the 112/96/24 GB profile.
+// -DHD_A100X4_500G_CACHE_PROFILE=1 for the 160/96/24 GB profile.
 #define ONE_TIME_IO                     1
 #ifndef HD_SVP140_CACHE_PROFILE
 #define HD_SVP140_CACHE_PROFILE         0
@@ -94,7 +96,7 @@ struct hw {
 #error "select only one host cache profile"
 #endif
 #if HD_A100X4_500G_CACHE_PROFILE
-#define PWC_DRAM_SLIMIT                 (112ULL << 30)
+#define PWC_DRAM_SLIMIT                 (160ULL << 30)
 #define BWC_DRAM_SLIMIT                 (96ULL << 30)
 #define SWC_DRAM_SLIMIT                 (24ULL << 30)
 #elif HD_SVP140_CACHE_PROFILE

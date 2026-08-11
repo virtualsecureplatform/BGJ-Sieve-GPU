@@ -29,9 +29,11 @@ LATTICE_SEED = int(os.environ.get("SVP142_LATTICE_SEED", "0"))
 SIEVE_SEED = os.environ.get("SVP_SIEVE_SEED", "0")
 DEFAULT_TSD = 132
 DEFAULT_MLD = 118
-BKZ_BETA = int(os.environ.get("SVP_BKZ_BETA", "60"))
+BKZ_BETA = int(os.environ.get("SVP_BKZ_BETA", "64" if DIMENSION >= 143 else "60"))
 BKZ_LOOPS = int(os.environ.get("SVP_BKZ_LOOPS", "8"))
-PREPROCESS_MODE = os.environ.get("SVP_PREPROCESS_MODE", "lll-bkz")
+PREPROCESS_MODE = os.environ.get(
+    "SVP_PREPROCESS_MODE", "lll-deeplll-bkz" if DIMENSION >= 143 else "lll-bkz"
+)
 DEEPLLL_DEPTH = int(os.environ.get("SVP_DEEPLLL_DEPTH", "4"))
 BLASTER_APP = os.environ.get("SVP_BLASTER_APP", "")
 TARGET_NORM2 = int(os.environ.get("SVP142_TARGET_NORM2", "9075417"))
@@ -435,12 +437,16 @@ def run_sieve(
 
 
 def show_plan(input_dir: Path, run_dir: Path) -> None:
+    pipeline = (
+        f"LLL -> DeepLLL-{DEEPLLL_DEPTH} -> pruned BKZ-{BKZ_BETA}"
+        if PREPROCESS_MODE == "lll-deeplll-bkz"
+        else f"LLL -> pruned BKZ-{BKZ_BETA}"
+    )
     print(f"""SVP-{DIMENSION} seed-{LATTICE_SEED} plan
 1. Obtain and hash-pin the official {DIMENSION}x{DIMENSION} seed-{LATTICE_SEED} basis in {input_dir}.
-2. Build the current vendored fplll revision, then run LLL -> pruned BKZ-60,
-   maximum 8 loops.
-3. Build the four-A100 binary with the 112/96/24 GiB host-cache profile.
-4. Sieve from MLD 118 through TSD 132 in {run_dir}.
+2. Build the vendored dependencies, then run {pipeline}, maximum {BKZ_LOOPS} loops.
+3. Build the four-A100 binary with the 160/96/24 GiB host-cache profile.
+4. Sieve from MLD {DEFAULT_MLD} through TSD {DEFAULT_TSD} in {run_dir}.
 5. Stop after independently verifying a lattice vector with norm^2 <= {TARGET_NORM2}.
 
 No expensive command was executed by this plan.""")

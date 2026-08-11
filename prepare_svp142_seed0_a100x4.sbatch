@@ -12,6 +12,7 @@ SOURCE="${SLURM_SUBMIT_DIR}"
 ACTUAL_SOURCE_COMMIT="$(git -C "$SOURCE" rev-parse HEAD)"
 SOURCE_COMMIT="${SOURCE_COMMIT:-${ACTUAL_SOURCE_COMMIT}}"
 FILTER_TASK_VECS="${FILTER_TASK_VECS:-524288}"
+DIMENSION="${SVP_DIMENSION:-142}"
 LATTICE_SEED="${SVP142_LATTICE_SEED:-0}"
 INSTANCE="${SVP_INSTANCE:-svp142-seed${LATTICE_SEED}}"
 IMAGE="${BGJ_IMAGE:-${LARGE_BASE}/bgj-sieve-gpu-cuda13.3.sif}"
@@ -27,7 +28,17 @@ FPLLL_COMMIT="$(git -C "${SOURCE}/dep/fplll" rev-parse HEAD)"
 FPLLL_PREFIX="${BGJ_FPLLL_PREFIX:-${LARGE_BASE}/deps/fplll-${FPLLL_COMMIT:0:12}}"
 FPLLL_BUILDER="${SOURCE}/tools/build_fplll.sh"
 LEGACY_NTL_PREFIX="${LARGE_BASE}/deps/ntl-9.3.0-svp-generator"
-PREPROCESS_MODE="${SVP_PREPROCESS_MODE:-lll-bkz}"
+if [[ ! "$DIMENSION" =~ ^[0-9]+$ ]]; then
+    echo "SVP_DIMENSION must be a nonnegative integer" >&2
+    exit 2
+fi
+if [[ -n "${SVP_PREPROCESS_MODE:-}" ]]; then
+    PREPROCESS_MODE="$SVP_PREPROCESS_MODE"
+elif (( DIMENSION >= 143 )); then
+    PREPROCESS_MODE="lll-deeplll-bkz"
+else
+    PREPROCESS_MODE="lll-bkz"
+fi
 BLASTER_COMMIT="$(git -C "${SOURCE}/dep/BLASter" rev-parse HEAD)"
 BLASTER_PREFIX="${LARGE_BASE}/deps/BLASter-${BLASTER_COMMIT:0:12}"
 
