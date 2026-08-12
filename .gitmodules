@@ -1,6 +1,6 @@
 [submodule "dep/fplll"]
 	path = dep/fplll
-	url = https://github.com/fplll/fplll.git
+	url = https://github.com/virtualsecureplatform/fplll.git
 [submodule "dep/BLASter"]
 	path = dep/BLASter
 	url = https://github.com/ludopulles/BLASter.git

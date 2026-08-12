@@ -90,7 +90,7 @@ fi
 
 # Build the current vendored fplll revision under LARGE0 if it is not cached. This
 # keeps the immutable container unchanged while pinning the actual CLI used by
-# preprocessing. Download, build, and both fplll stages stay in this allocation.
+# preprocessing. Generation, build, and all fplll stages stay in this allocation.
 apptainer exec --nv \
     --bind "$LARGE_BASE:$LARGE_BASE" \
     --pwd "$SOURCE" \

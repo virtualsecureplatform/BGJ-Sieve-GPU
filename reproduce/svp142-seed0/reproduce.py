@@ -67,11 +67,12 @@ def sha256(path: Path) -> str:
 
 
 def input_paths(input_dir: Path) -> tuple[Path, Path, Path, Path]:
-    suffix = (
-        f"d{DEEPLLL_DEPTH}.p{BKZ_BETA}l{BKZ_LOOPS}"
-        if PREPROCESS_MODE == "lll-deeplll-bkz"
-        else f"p{BKZ_BETA}l{BKZ_LOOPS}"
-    )
+    if PREPROCESS_MODE == "lll-deeplll-bkz":
+        suffix = f"d{DEEPLLL_DEPTH}.p{BKZ_BETA}l{BKZ_LOOPS}"
+    elif PREPROCESS_MODE == "potlllbkz":
+        suffix = f"potlllbkz.p{BKZ_BETA}l{BKZ_LOOPS}"
+    else:
+        suffix = f"p{BKZ_BETA}l{BKZ_LOOPS}"
     legacy_manifest = BKZ_BETA == 60 and BKZ_LOOPS == 8 and (
         PREPROCESS_MODE != "lll-deeplll-bkz" or DEEPLLL_DEPTH == 4
     )
@@ -209,7 +210,7 @@ def verify_vector_text(text: str, raw: Path) -> dict[str, object]:
 
 
 def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
-    if PREPROCESS_MODE not in {"lll-bkz", "lll-deeplll-bkz"}:
+    if PREPROCESS_MODE not in {"lll-bkz", "lll-deeplll-bkz", "potlllbkz"}:
         raise ReproductionError(f"unsupported preprocessing mode: {PREPROCESS_MODE}")
     version = fplll_version()
     if not version.startswith("fplll "):
@@ -236,31 +237,42 @@ def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
             f"LLL -> BLASter DeepLLL-{DEEPLLL_DEPTH} -> BKZ-{BKZ_BETA} "
             f"(pruned fplll strategy, max {BKZ_LOOPS} loops)"
             if PREPROCESS_MODE == "lll-deeplll-bkz"
-            else f"LLL -> BKZ-{BKZ_BETA} (pruned fplll strategy, max {BKZ_LOOPS} loops)"
+            else (
+                f"integrated PotLLLBKZ-{BKZ_BETA} "
+                f"(pruned fplll strategy, max {BKZ_LOOPS} loops)"
+                if PREPROCESS_MODE == "potlllbkz"
+                else f"LLL -> BKZ-{BKZ_BETA} (pruned fplll strategy, max {BKZ_LOOPS} loops)"
+            )
         ),
         "preprocess_mode": PREPROCESS_MODE,
         "blaster_commit": blaster_commit if PREPROCESS_MODE == "lll-deeplll-bkz" else None,
         "bkz_beta": BKZ_BETA,
         "bkz_max_loops": BKZ_LOOPS,
     }
-    if not force and manifest_path.is_file() and lll.is_file() and pre.is_file():
+    have_intermediate = PREPROCESS_MODE == "potlllbkz" or lll.is_file()
+    if not force and manifest_path.is_file() and have_intermediate and pre.is_file():
         cached = json.loads(manifest_path.read_text())
         if all(cached.get(key) == value for key, value in expected.items()):
-            if cached.get("lll_sha256") == sha256(lll) and cached.get("pre_sha256") == sha256(pre):
-                validate_matrix(lll)
+            expected_lll_sha = None if PREPROCESS_MODE == "potlllbkz" else sha256(lll)
+            if cached.get("lll_sha256") == expected_lll_sha and cached.get("pre_sha256") == sha256(pre):
+                if PREPROCESS_MODE != "potlllbkz":
+                    validate_matrix(lll)
                 validate_matrix(pre)
                 print(f"[svp142] reusing verified preprocessing: {cached['pre_sha256']}")
                 return pre
 
-    run_to_file(["fplll", "-a", "lll", str(raw)], lll)
-    pre_bkz = lll
+    pre_bkz = raw
+    if PREPROCESS_MODE != "potlllbkz":
+        run_to_file(["fplll", "-a", "lll", str(raw)], lll)
+        pre_bkz = lll
     if PREPROCESS_MODE == "lll-deeplll-bkz":
         deep = input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.deeplll{DEEPLLL_DEPTH}"
         run_deeplll(lll, deep)
         pre_bkz = deep
+    bkz_algorithm = "potlllbkz" if PREPROCESS_MODE == "potlllbkz" else "bkz"
     rc = run_to_file(
         [
-            "fplll", "-a", "bkz", "-b", str(BKZ_BETA), "-s", str(strategy),
+            "fplll", "-a", bkz_algorithm, "-b", str(BKZ_BETA), "-s", str(strategy),
             "-bkzmaxloops", str(BKZ_LOOPS), str(pre_bkz),
         ],
         pre,
@@ -271,7 +283,7 @@ def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
     manifest = dict(expected)
     manifest.update(
         {
-            "lll_sha256": sha256(lll),
+            "lll_sha256": None if PREPROCESS_MODE == "potlllbkz" else sha256(lll),
             "pre_sha256": sha256(pre),
             "known_vector": (
                 verify_vector_text(KNOWN_VECTOR.read_text(), raw)
@@ -440,7 +452,11 @@ def show_plan(input_dir: Path, run_dir: Path) -> None:
     pipeline = (
         f"LLL -> DeepLLL-{DEEPLLL_DEPTH} -> pruned BKZ-{BKZ_BETA}"
         if PREPROCESS_MODE == "lll-deeplll-bkz"
-        else f"LLL -> pruned BKZ-{BKZ_BETA}"
+        else (
+            f"integrated pruned PotLLLBKZ-{BKZ_BETA}"
+            if PREPROCESS_MODE == "potlllbkz"
+            else f"LLL -> pruned BKZ-{BKZ_BETA}"
+        )
     )
     print(f"""SVP-{DIMENSION} seed-{LATTICE_SEED} plan
 1. Obtain and hash-pin the official {DIMENSION}x{DIMENSION} seed-{LATTICE_SEED} basis in {input_dir}.
