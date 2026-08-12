@@ -67,6 +67,11 @@ def sha256(path: Path) -> str:
 
 
 def input_paths(input_dir: Path) -> tuple[Path, Path, Path, Path]:
+    lll_name = (
+        f"L_{DIMENSION}_{LATTICE_SEED}.lll-heuristic-mpfr256"
+        if PREPROCESS_MODE == "lll-potlllbkz"
+        else f"L_{DIMENSION}_{LATTICE_SEED}.lll"
+    )
     if PREPROCESS_MODE == "lll-deeplll-bkz":
         suffix = f"d{DEEPLLL_DEPTH}.p{BKZ_BETA}l{BKZ_LOOPS}"
     elif PREPROCESS_MODE == "lll-potlllbkz":
@@ -81,7 +86,7 @@ def input_paths(input_dir: Path) -> tuple[Path, Path, Path, Path]:
     manifest_tag = PREPROCESS_MODE if legacy_manifest else suffix
     return (
         input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.raw",
-        input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.lll",
+        input_dir / lll_name,
         input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.{suffix}.pre",
         input_dir / f"preprocess-manifest-{manifest_tag}.json",
     )
