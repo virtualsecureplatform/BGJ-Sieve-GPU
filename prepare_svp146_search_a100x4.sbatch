@@ -1,9 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=svp146-search-prep
 #SBATCH --partition=gr20100g
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=4G
+#SBATCH --rsc=p=1:c=1:t=1:m=4G
 #SBATCH --array=15-27
 #SBATCH --time=01:15:00
 
