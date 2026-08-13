@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=svp142-prep
 #SBATCH --partition=gr20100g
-#SBATCH --rsc=p=1:c=1:t=1:m=16G
+#SBATCH --rsc=p=1:c=1:t=1:m=4G
 #SBATCH --time=00:45:00
 #SBATCH --output=svp142-prep_%j.log
 
