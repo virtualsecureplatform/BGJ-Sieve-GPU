@@ -127,7 +127,11 @@ def download_raw(input_dir: Path) -> Path:
         with urllib.request.urlopen(request, timeout=60) as response, tmp.open("wb") as output:
             shutil.copyfileobj(response, output)
         actual = sha256(tmp)
-    if (RAW_SHA256 == "GENERATE" or actual != RAW_SHA256) and LEGACY_GENERATOR:
+    if RAW_SHA256 == "GENERATE" or actual != RAW_SHA256:
+        if not LEGACY_GENERATOR:
+            raise ReproductionError(
+                "raw basis generation requires SVP142_LEGACY_GENERATOR"
+            )
         generator = Path(LEGACY_GENERATOR)
         if not generator.is_file() or not os.access(generator, os.X_OK):
             raise ReproductionError(f"missing legacy generator: {generator}")

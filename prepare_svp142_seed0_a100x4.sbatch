@@ -72,13 +72,14 @@ echo "binary=${BINARY}"
 echo "solver_key=${SOLVER_KEY}"
 echo "fplll_commit=${FPLLL_COMMIT} fplll_prefix=${FPLLL_PREFIX}"
 
-if [[ "$LATTICE_SEED" != "0" ]]; then
-    apptainer exec --bind "$LARGE_BASE:$LARGE_BASE" --pwd "$SOURCE" "$IMAGE" \
-        "${SOURCE}/tools/build_legacy_ntl_generator.sh" \
-        "$LEGACY_NTL_PREFIX" "${SOURCE}/dep/dist/ntl-9.3.0.tar.gz" \
-        "${SOURCE}/tools/svp_challenge_generator.cpp"
-    export APPTAINERENV_SVP142_LEGACY_GENERATOR="${LEGACY_NTL_PREFIX}/bin/svp_challenge_generator"
-fi
+# The shared recipes use this pinned generator whenever their raw hash policy is
+# GENERATE.  Seed zero also needs it for dimensions without a pinned download.
+# The helper reuses the LARGE0 build after verifying its manifest.
+apptainer exec --bind "$LARGE_BASE:$LARGE_BASE" --pwd "$SOURCE" "$IMAGE" \
+    "${SOURCE}/tools/build_legacy_ntl_generator.sh" \
+    "$LEGACY_NTL_PREFIX" "${SOURCE}/dep/dist/ntl-9.3.0.tar.gz" \
+    "${SOURCE}/tools/svp_challenge_generator.cpp"
+export APPTAINERENV_SVP142_LEGACY_GENERATOR="${LEGACY_NTL_PREFIX}/bin/svp_challenge_generator"
 if [[ "$PREPROCESS_MODE" == "lll-deeplll-bkz" ]]; then
     apptainer exec --bind "$LARGE_BASE:$LARGE_BASE" --pwd "$SOURCE" "$PREPROCESS_IMAGE" \
         "${SOURCE}/tools/build_blaster.sh" "$BLASTER_PREFIX" \
