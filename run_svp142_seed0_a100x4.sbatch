@@ -30,6 +30,7 @@ POOL_THREADS="${POOL_THREADS:-8}"
 GPU_UID_SHARED_LOAD_PCT="${GPU_UID_SHARED_LOAD_PCT:-60}"
 BACKPRESSURE_PROFILE="${BACKPRESSURE_PROFILE:-tiered}"
 CONTINUE_AFTER_TARGET="${CONTINUE_AFTER_TARGET:-0}"
+SVP_TIMEOUT_SECONDS="${SVP_TIMEOUT_SECONDS:-10500}"
 
 if [[ "$ACTUAL_SOURCE_COMMIT" != "$SOURCE_COMMIT" ]]; then
     echo "Source moved after submission: expected $SOURCE_COMMIT, found $ACTUAL_SOURCE_COMMIT" >&2
@@ -47,6 +48,10 @@ if [[ "$CONTINUE_AFTER_TARGET" != 0 && "$CONTINUE_AFTER_TARGET" != 1 ]]; then
     echo "CONTINUE_AFTER_TARGET must be 0 or 1" >&2
     exit 2
 fi
+if [[ ! "$SVP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || (( SVP_TIMEOUT_SECONDS < 60 )); then
+    echo "SVP_TIMEOUT_SECONDS must be an integer >= 60" >&2
+    exit 2
+fi
 if [[ ! "$BGJ2_REDUCER_THREADS" =~ ^[0-9]+$ ]] || (( BGJ2_REDUCER_THREADS < 4 || BGJ2_REDUCER_THREADS > 64 || BGJ2_REDUCER_THREADS % 4 != 0 )); then
     echo "BGJ2_REDUCER_THREADS must be a multiple of 4 in [4, 64]" >&2
     exit 2
@@ -61,7 +66,7 @@ grep -Fqx "cache_profile=svp142-500g" "$BINARY_MANIFEST"
 
 echo "node=$(hostname) job=${SLURM_JOB_ID} visible_gpus=${CUDA_VISIBLE_DEVICES:-unset}"
 echo "source_commit=${SOURCE_COMMIT} solver_key=${SOLVER_KEY} binary=${BINARY}"
-echo "input_dir=${INPUT_DIR} run_dir=${RUN_DIR} MLD=${MIN_LIFTING_DIM} TSD=${TARGET_SIEVING_DIM} continue_after_target=${CONTINUE_AFTER_TARGET}"
+echo "input_dir=${INPUT_DIR} run_dir=${RUN_DIR} MLD=${MIN_LIFTING_DIM} TSD=${TARGET_SIEVING_DIM} timeout=${SVP_TIMEOUT_SECONDS}s continue_after_target=${CONTINUE_AFTER_TARGET}"
 echo "reducer_threads=${BGJ2_REDUCER_THREADS} pool_threads=${POOL_THREADS} uid_load_pct=${GPU_UID_SHARED_LOAD_PCT} backpressure=${BACKPRESSURE_PROFILE}"
 sha256sum "$BINARY"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
@@ -78,7 +83,7 @@ reproduce_args=(
     --input-dir "$INPUT_DIR"
     --run-dir "$RUN_DIR"
     --binary "$BINARY"
-    --timeout 10500
+    --timeout "$SVP_TIMEOUT_SECONDS"
     --mld "$MIN_LIFTING_DIM"
     --tsd "$TARGET_SIEVING_DIM"
 )

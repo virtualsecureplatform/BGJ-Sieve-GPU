@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=svp142-prep
 #SBATCH --partition=gr20100g
-#SBATCH --rsc=g=1
+#SBATCH --rsc=p=1:c=1:t=1:m=16G
 #SBATCH --time=00:45:00
 #SBATCH --output=svp142-prep_%j.log
 
@@ -91,7 +91,7 @@ fi
 # Build the current vendored fplll revision under LARGE0 if it is not cached. This
 # keeps the immutable container unchanged while pinning the actual CLI used by
 # preprocessing. Generation, build, and all fplll stages stay in this allocation.
-apptainer exec --nv \
+apptainer exec \
     --bind "$LARGE_BASE:$LARGE_BASE" \
     --pwd "$SOURCE" \
     "$IMAGE" "$FPLLL_BUILDER" "$FPLLL_PREFIX" "${SOURCE}/dep/fplll" "$FPLLL_COMMIT"
@@ -99,7 +99,7 @@ apptainer exec --nv \
 export APPTAINERENV_PATH="${FPLLL_PREFIX}/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
 export APPTAINERENV_LD_LIBRARY_PATH="${FPLLL_PREFIX}/lib:/usr/local/cuda/lib64"
 export APPTAINERENV_BGJ_FPLLL_COMMIT="$FPLLL_COMMIT"
-apptainer exec --nv \
+apptainer exec \
     --bind "$LARGE_BASE:$LARGE_BASE" \
     --pwd "$SOURCE" \
     "$PREPROCESS_IMAGE" python3 "$REPRO" prepare \
@@ -143,7 +143,7 @@ for old_manifest in "${BINARY_ROOT}"/hd_sieve-*-svp142-500g-ftv"${FILTER_TASK_VE
     exit 0
 done
 
-apptainer exec --nv \
+apptainer exec \
     --bind "$LARGE_BASE:$LARGE_BASE" \
     --pwd "$SOURCE" \
     "$IMAGE" bash -lc '
