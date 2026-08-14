@@ -493,7 +493,7 @@ def show_plan(input_dir: Path, run_dir: Path) -> None:
     print(f"""SVP-{DIMENSION} seed-{LATTICE_SEED} plan
 1. Obtain and hash-pin the official {DIMENSION}x{DIMENSION} seed-{LATTICE_SEED} basis in {input_dir}.
 2. Build the vendored dependencies, then run {pipeline}, maximum {BKZ_LOOPS} loops.
-3. Build the four-A100 binary with the 192/96/24 GiB host-cache profile.
+3. Build the four-A100 binary with the 240/96/24 GiB host-cache profile.
 4. Sieve from MLD {DEFAULT_MLD} through TSD {DEFAULT_TSD} in {run_dir}.
 5. Stop after independently verifying a lattice vector with norm^2 <= {TARGET_NORM2}.
 
