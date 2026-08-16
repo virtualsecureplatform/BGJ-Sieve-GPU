@@ -67,17 +67,20 @@ def sha256(path: Path) -> str:
 
 
 def input_paths(input_dir: Path) -> tuple[Path, Path, Path, Path]:
-    lll_name = (
-        f"L_{DIMENSION}_{LATTICE_SEED}.lll-heuristic-mpfr256"
-        if PREPROCESS_MODE == "lll-potlllbkz"
-        else f"L_{DIMENSION}_{LATTICE_SEED}.lll"
-    )
+    if PREPROCESS_MODE == "lll-potlllbkz":
+        lll_name = f"L_{DIMENSION}_{LATTICE_SEED}.lll-heuristic-mpfr256"
+    elif PREPROCESS_MODE == "potlll-bkz":
+        lll_name = f"L_{DIMENSION}_{LATTICE_SEED}.potlll-heuristic-mpfr256"
+    else:
+        lll_name = f"L_{DIMENSION}_{LATTICE_SEED}.lll"
     if PREPROCESS_MODE == "lll-deeplll-bkz":
         suffix = f"d{DEEPLLL_DEPTH}.p{BKZ_BETA}l{BKZ_LOOPS}"
     elif PREPROCESS_MODE == "lll-potlllbkz":
         suffix = f"lll-heuristic-mpfr256.potlllbkz.p{BKZ_BETA}l{BKZ_LOOPS}"
     elif PREPROCESS_MODE == "potlllbkz":
         suffix = f"potlllbkz.p{BKZ_BETA}l{BKZ_LOOPS}"
+    elif PREPROCESS_MODE == "potlll-bkz":
+        suffix = f"potlll-heuristic-mpfr256.bkz.p{BKZ_BETA}l{BKZ_LOOPS}"
     else:
         suffix = f"p{BKZ_BETA}l{BKZ_LOOPS}"
     legacy_manifest = BKZ_BETA == 60 and BKZ_LOOPS == 8 and (
@@ -222,7 +225,7 @@ def verify_vector_text(text: str, raw: Path) -> dict[str, object]:
 
 def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
     if PREPROCESS_MODE not in {
-        "lll-bkz", "lll-deeplll-bkz", "potlllbkz", "lll-potlllbkz"
+        "lll-bkz", "lll-deeplll-bkz", "potlllbkz", "lll-potlllbkz", "potlll-bkz"
     }:
         raise ReproductionError(f"unsupported preprocessing mode: {PREPROCESS_MODE}")
     version = fplll_version()
@@ -255,10 +258,16 @@ def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
                 f"(pruned fplll strategy, max {BKZ_LOOPS} loops)"
                 if PREPROCESS_MODE == "potlllbkz"
                 else (
-                    f"LLL (heuristic, MPFR 256-bit) -> PotLLLBKZ-{BKZ_BETA} "
+                    f"PotLLL (heuristic, MPFR 256-bit) -> BKZ-{BKZ_BETA} "
                     f"(pruned fplll strategy, max {BKZ_LOOPS} loops)"
-                    if PREPROCESS_MODE == "lll-potlllbkz"
-                    else f"LLL -> BKZ-{BKZ_BETA} (pruned fplll strategy, max {BKZ_LOOPS} loops)"
+                    if PREPROCESS_MODE == "potlll-bkz"
+                    else (
+                        f"LLL (heuristic, MPFR 256-bit) -> PotLLLBKZ-{BKZ_BETA} "
+                        f"(pruned fplll strategy, max {BKZ_LOOPS} loops)"
+                        if PREPROCESS_MODE == "lll-potlllbkz"
+                        else f"LLL -> BKZ-{BKZ_BETA} "
+                        f"(pruned fplll strategy, max {BKZ_LOOPS} loops)"
+                    )
                 )
             )
         ),
@@ -266,9 +275,9 @@ def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
         "blaster_commit": blaster_commit if PREPROCESS_MODE == "lll-deeplll-bkz" else None,
         "bkz_beta": BKZ_BETA,
         "bkz_max_loops": BKZ_LOOPS,
-        "lll_method": "heuristic" if PREPROCESS_MODE == "lll-potlllbkz" else None,
-        "lll_float_type": "mpfr" if PREPROCESS_MODE == "lll-potlllbkz" else None,
-        "lll_precision": 256 if PREPROCESS_MODE == "lll-potlllbkz" else None,
+        "lll_method": "heuristic" if PREPROCESS_MODE in {"lll-potlllbkz", "potlll-bkz"} else None,
+        "lll_float_type": "mpfr" if PREPROCESS_MODE in {"lll-potlllbkz", "potlll-bkz"} else None,
+        "lll_precision": 256 if PREPROCESS_MODE in {"lll-potlllbkz", "potlll-bkz"} else None,
     }
     have_intermediate = PREPROCESS_MODE == "potlllbkz" or lll.is_file()
     if not force and manifest_path.is_file() and have_intermediate and pre.is_file():
@@ -284,8 +293,9 @@ def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
 
     pre_bkz = raw
     if PREPROCESS_MODE != "potlllbkz":
-        lll_command = ["fplll", "-a", "lll"]
-        if PREPROCESS_MODE == "lll-potlllbkz":
+        lll_algorithm = "potlll" if PREPROCESS_MODE == "potlll-bkz" else "lll"
+        lll_command = ["fplll", "-a", lll_algorithm]
+        if PREPROCESS_MODE in {"lll-potlllbkz", "potlll-bkz"}:
             lll_command.extend(["-m", "heuristic", "-f", "mpfr", "-p", "256"])
         run_to_file(lll_command + [str(raw)], lll)
         pre_bkz = lll
@@ -484,9 +494,13 @@ def show_plan(input_dir: Path, run_dir: Path) -> None:
             f"integrated pruned PotLLLBKZ-{BKZ_BETA}"
             if PREPROCESS_MODE == "potlllbkz"
             else (
-                f"LLL (heuristic, MPFR 256-bit) -> pruned PotLLLBKZ-{BKZ_BETA}"
-                if PREPROCESS_MODE == "lll-potlllbkz"
-                else f"LLL -> pruned BKZ-{BKZ_BETA}"
+                f"PotLLL (heuristic, MPFR 256-bit) -> pruned BKZ-{BKZ_BETA}"
+                if PREPROCESS_MODE == "potlll-bkz"
+                else (
+                    f"LLL (heuristic, MPFR 256-bit) -> pruned PotLLLBKZ-{BKZ_BETA}"
+                    if PREPROCESS_MODE == "lll-potlllbkz"
+                    else f"LLL -> pruned BKZ-{BKZ_BETA}"
+                )
             )
         )
     )
