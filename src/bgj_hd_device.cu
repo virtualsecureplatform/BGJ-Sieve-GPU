@@ -1022,6 +1022,45 @@ buc_buffer_holder_t::buc_buffer_holder_t(Bucketer_t *bucketer) {
         if (bounce_mb < 1) bounce_mb = 1;
         if (bounce_mb > 256) bounce_mb = 256;
         this->gpu_write_bounce_nbytes = (size_t)bounce_mb << 20;
+
+        const char *p2p_env = getenv("HD_GPU_NATIVE_BWC_P2P");
+        const bool request_p2p = p2p_env && atol(p2p_env) != 0;
+        int enabled_pairs = 0;
+        if (request_p2p) {
+            for (int src = 0; src < hw::gpu_num; src++) {
+                CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[src]));
+                for (int dst = 0; dst < hw::gpu_num; dst++) {
+                    if (src == dst) continue;
+                    int can_access = 0;
+                    cudaError_t status = cudaDeviceCanAccessPeer(
+                        &can_access, hw::gpu_id_list[src], hw::gpu_id_list[dst]);
+                    if (status != cudaSuccess || !can_access) {
+                        if (status != cudaSuccess) cudaGetLastError();
+                        continue;
+                    }
+                    status = cudaDeviceEnablePeerAccess(hw::gpu_id_list[dst], 0);
+                    if (status == cudaErrorPeerAccessAlreadyEnabled) {
+                        cudaGetLastError();
+                        status = cudaSuccess;
+                    }
+                    if (status == cudaSuccess) {
+                        gpu_peer_direct[src * MAX_NUM_DEVICE + dst].store(
+                            1, std::memory_order_relaxed);
+                        enabled_pairs++;
+                    } else {
+                        fprintf(stderr,
+                                "[GPU-BWC] P2P enable failed for GPU %d -> %d: %s; using host fallback\n",
+                                hw::gpu_id_list[src], hw::gpu_id_list[dst],
+                                cudaGetErrorString(status));
+                        cudaGetLastError();
+                    }
+                }
+            }
+        }
+        printf("[GPU-BWC] direct P2P enabled for %d/%d directed GPU pairs%s\n",
+               enabled_pairs, hw::gpu_num * (hw::gpu_num - 1),
+               request_p2p ? "" : " (opt-in disabled)");
+        fflush(stdout);
     }
     
     /// thread & device info
@@ -1148,9 +1187,11 @@ buc_buffer_holder_t::~buc_buffer_holder_t() {
     if (gpu_native) {
         const double gib = 1.0 / (double)(1ULL << 30);
         printf("[GPU-BWC] materialized %.3f GiB local + %.3f GiB remote "
-               "(host staged) in %.3f s of source-path GPU time%s\n",
+               "(%.3f GiB P2P, %.3f GiB host staged) in %.3f s of source-path GPU time%s\n",
                gpu_native_local_nbytes.load(std::memory_order_relaxed) * gib,
                gpu_native_peer_nbytes.load(std::memory_order_relaxed) * gib,
+               gpu_native_p2p_nbytes.load(std::memory_order_relaxed) * gib,
+               gpu_native_host_peer_nbytes.load(std::memory_order_relaxed) * gib,
                gpu_native_kernel_us.load(std::memory_order_relaxed) / 1e6,
                gpu_native_verify_enabled ? " (verified)" : "");
         fflush(stdout);
@@ -1495,10 +1536,8 @@ int buc_buffer_holder_t::gpu_native_begin(int tid) {
         d_gpu_write_vec[tid], CSD);
     CHECK_LAST_ERR;
     // Source staging is complete before any destination stream consumes it.
-    // CUDA peer copies are not reliable under concurrent two-GPU load on this
-    // PCIe machine, so remote ranges cross a bounded pinned-host bounce buffer.
-    // The final scatter still runs on the owning GPU and all transfers remain
-    // coalesced instead of falling back to per-vector CPU materialization.
+    // Use direct peer copies when every requested CUDA peer link is available;
+    // retain the bounded pinned-host path as a per-link failure fallback.
     CHECK_CUDA_ERR(cudaStreamSynchronize(streams[tid]));
     for (int peer = 0; peer < num_devices; peer++) {
         if (peer == source_device || peer_size[peer] == 0) continue;
@@ -1506,6 +1545,42 @@ int buc_buffer_holder_t::gpu_native_begin(int tid) {
         const size_t begin = peer_begin[peer];
         const size_t count = peer_size[peer];
         cudaStream_t peer_stream = gpu_write_peer_streams[peer_index];
+        const size_t norm_nbytes = count * sizeof(int32_t);
+        const size_t vec_nbytes = count * CSD;
+        bool copied_p2p =
+            gpu_peer_direct[source_device * MAX_NUM_DEVICE + peer].load(
+                std::memory_order_relaxed) != 0;
+        if (copied_p2p) {
+            CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[peer]));
+            cudaError_t status = cudaMemcpyPeerAsync(
+                d_gpu_peer_norm[peer_index] + begin,
+                hw::gpu_id_list[peer],
+                d_gpu_write_norm[tid] + begin,
+                hw::gpu_id_list[source_device], norm_nbytes, peer_stream);
+            if (status == cudaSuccess) {
+                status = cudaMemcpyPeerAsync(
+                    d_gpu_peer_vec[peer_index] + begin * CSD,
+                    hw::gpu_id_list[peer],
+                    d_gpu_write_vec[tid] + begin * CSD,
+                    hw::gpu_id_list[source_device], vec_nbytes, peer_stream);
+            }
+            if (status != cudaSuccess) {
+                cudaStreamSynchronize(peer_stream);
+                static std::atomic<int> warned{0};
+                if (!warned.fetch_or(1))
+                    fprintf(stderr,
+                            "[GPU-BWC] direct P2P copy failed (%s); using host fallback\n",
+                            cudaGetErrorString(status));
+                cudaGetLastError();
+                gpu_peer_direct[source_device * MAX_NUM_DEVICE + peer].store(
+                    0, std::memory_order_relaxed);
+                copied_p2p = false;
+            } else {
+                gpu_native_p2p_nbytes.fetch_add(
+                    norm_nbytes + vec_nbytes, std::memory_order_relaxed);
+            }
+        }
+
         auto bounce_copy = [&](void *dst, const void *src, size_t nbytes) {
             size_t offset = 0;
             while (offset < nbytes) {
@@ -1529,11 +1604,14 @@ int buc_buffer_holder_t::gpu_native_begin(int tid) {
                 offset += step;
             }
         };
-        bounce_copy(d_gpu_peer_norm[peer_index] + begin,
-                    d_gpu_write_norm[tid] + begin,
-                    count * sizeof(int32_t));
-        bounce_copy(d_gpu_peer_vec[peer_index] + begin * CSD,
-                    d_gpu_write_vec[tid] + begin * CSD, count * CSD);
+        if (!copied_p2p) {
+            bounce_copy(d_gpu_peer_norm[peer_index] + begin,
+                        d_gpu_write_norm[tid] + begin, norm_nbytes);
+            bounce_copy(d_gpu_peer_vec[peer_index] + begin * CSD,
+                        d_gpu_write_vec[tid] + begin * CSD, vec_nbytes);
+            gpu_native_host_peer_nbytes.fetch_add(
+                norm_nbytes + vec_nbytes, std::memory_order_relaxed);
+        }
 
         CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[peer]));
         CHECK_CUDA_ERR(cudaMemcpyAsync(

@@ -12,6 +12,7 @@ SOURCE="${SLURM_SUBMIT_DIR}"
 ACTUAL_SOURCE_COMMIT="$(git -C "$SOURCE" rev-parse HEAD)"
 SOURCE_COMMIT="${SOURCE_COMMIT:-${ACTUAL_SOURCE_COMMIT}}"
 FILTER_TASK_VECS="${FILTER_TASK_VECS:-524288}"
+BGJ_ENABLE_PROFILING="${BGJ_ENABLE_PROFILING:-1}"
 DIMENSION="${SVP_DIMENSION:-142}"
 LATTICE_SEED="${SVP142_LATTICE_SEED:-0}"
 INSTANCE="${SVP_INSTANCE:-svp142-seed${LATTICE_SEED}}"
@@ -19,11 +20,11 @@ IMAGE="${BGJ_IMAGE:-${LARGE_BASE}/bgj-sieve-gpu-cuda13.3.sif}"
 PREPROCESS_IMAGE="${SVP_PREPROCESS_IMAGE:-${IMAGE}}"
 INPUT_DIR="${SVP142_INPUT_DIR:-${LARGE_BASE}/inputs/${INSTANCE}}"
 BINARY_ROOT="${BGJ_BINARY_ROOT:-${LARGE_BASE}/builds}"
-SOLVER_KEY="$("${SOURCE}/tools/solver_cache_key.sh" "$SOURCE" "$SOURCE_COMMIT" "$FILTER_TASK_VECS" | sha256sum | awk '{print $1}')"
+SOLVER_KEY="$("${SOURCE}/tools/solver_cache_key.sh" "$SOURCE" "$SOURCE_COMMIT" "$FILTER_TASK_VECS" "$BGJ_ENABLE_PROFILING" | sha256sum | awk '{print $1}')"
 BINARY="${BGJ_BINARY:-${BINARY_ROOT}/hd_sieve-${SOLVER_KEY}-a100x4-ftv${FILTER_TASK_VECS}}"
 MANIFEST="${BINARY}.manifest"
 REPRO="${SVP142_REPRO:-${SOURCE}/reproduce/svp142-seed${LATTICE_SEED}/reproduce.py}"
-DEFINES="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_FILTER_TASK_VECS=${FILTER_TASK_VECS}"
+DEFINES="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_FILTER_TASK_VECS=${FILTER_TASK_VECS} -DENABLE_PROFILING=${BGJ_ENABLE_PROFILING}"
 FPLLL_COMMIT="$(git -C "${SOURCE}/dep/fplll" rev-parse HEAD)"
 FPLLL_PREFIX="${BGJ_FPLLL_PREFIX:-${LARGE_BASE}/deps/fplll-${FPLLL_COMMIT:0:12}}"
 FPLLL_BUILDER="${SOURCE}/tools/build_fplll.sh"
@@ -50,6 +51,10 @@ if ! git -C "$SOURCE" diff --quiet || ! git -C "$SOURCE" diff --cached --quiet; 
     echo "Refusing to use tracked, uncommitted source changes" >&2
     exit 2
 fi
+if [[ "$BGJ_ENABLE_PROFILING" != 0 && "$BGJ_ENABLE_PROFILING" != 1 ]]; then
+    echo "BGJ_ENABLE_PROFILING must be 0 or 1" >&2
+    exit 2
+fi
 if [[ ! "$FILTER_TASK_VECS" =~ ^[0-9]+$ ]] || (( FILTER_TASK_VECS < 65536 || (FILTER_TASK_VECS & (FILTER_TASK_VECS - 1)) != 0 )); then
     echo "FILTER_TASK_VECS must be a power of two >= 65536" >&2
     exit 2
@@ -69,7 +74,7 @@ echo "image=${IMAGE}"
 echo "preprocess_image=${PREPROCESS_IMAGE} preprocess_mode=${PREPROCESS_MODE}"
 echo "input_dir=${INPUT_DIR}"
 echo "binary=${BINARY}"
-echo "solver_key=${SOLVER_KEY}"
+echo "solver_key=${SOLVER_KEY} enable_profiling=${BGJ_ENABLE_PROFILING}"
 echo "fplll_commit=${FPLLL_COMMIT} fplll_prefix=${FPLLL_PREFIX}"
 
 # The shared recipes use this pinned generator whenever their raw hash policy is
@@ -110,6 +115,7 @@ apptainer exec \
 if [[ -x "$BINARY" && -f "$MANIFEST" ]] &&
    grep -Fqx "solver_key=${SOLVER_KEY}" "$MANIFEST" &&
    grep -Fqx "filter_task_vecs=${FILTER_TASK_VECS}" "$MANIFEST" &&
+   grep -Fqx "enable_profiling=${BGJ_ENABLE_PROFILING}" "$MANIFEST" &&
    grep -Fqx "cache_profile=svp142-500g" "$MANIFEST"; then
     echo "Reusing existing verified compute-built binary"
     sha256sum "$BINARY"
@@ -123,7 +129,7 @@ for old_manifest in "${BINARY_ROOT}"/hd_sieve-*-svp142-500g-ftv"${FILTER_TASK_VE
     [[ -f "$old_manifest" ]] || continue
     old_commit="$(sed -n 's/^source_commit=//p' "$old_manifest" | head -1)"
     [[ "$old_commit" =~ ^[0-9a-f]{40}$ ]] || continue
-    old_key="$("${SOURCE}/tools/solver_cache_key.sh" "$SOURCE" "$old_commit" "$FILTER_TASK_VECS" 2>/dev/null | sha256sum | awk '{print $1}')" || continue
+    old_key="$("${SOURCE}/tools/solver_cache_key.sh" "$SOURCE" "$old_commit" "$FILTER_TASK_VECS" "$BGJ_ENABLE_PROFILING" 2>/dev/null | sha256sum | awk '{print $1}')" || continue
     [[ "$old_key" == "$SOLVER_KEY" ]] || continue
     old_binary="${old_manifest%.manifest}"
     [[ -x "$old_binary" ]] || continue
@@ -136,6 +142,7 @@ for old_manifest in "${BINARY_ROOT}"/hd_sieve-*-svp142-500g-ftv"${FILTER_TASK_VE
         echo "solver_key=${SOLVER_KEY}"
         echo "source_commit_built=${old_commit}"
         echo "filter_task_vecs=${FILTER_TASK_VECS}"
+        echo "enable_profiling=${BGJ_ENABLE_PROFILING}"
         echo "cache_profile=svp142-500g"
         sha256sum "$BINARY"
     } > "$MANIFEST"
@@ -164,6 +171,7 @@ mv -f "$BINARY_TMP" "$BINARY"
     echo "solver_key=${SOLVER_KEY}"
     echo "source_commit_built=${SOURCE_COMMIT}"
     echo "filter_task_vecs=${FILTER_TASK_VECS}"
+    echo "enable_profiling=${BGJ_ENABLE_PROFILING}"
     echo "cache_profile=svp142-500g"
     sha256sum "$BINARY"
 } > "$MANIFEST_TMP"

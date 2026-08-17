@@ -26,7 +26,9 @@ struct hw {
 
 ///////////////// profiling config /////////////////
 
+#ifndef ENABLE_PROFILING
 #define ENABLE_PROFILING         1
+#endif
 #define AUTO_REPORT_DURATION  1800
 #define POOL_HD_LOG_LEVEL   ll_info
 #define REDUCER_LOG_LEVEL   ll_dbg

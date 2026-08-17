@@ -171,8 +171,8 @@ template <class logger_t> void bwc_manager_tmpl<logger_t>::configure_gpu_native_
     _gpu_native_overflows.store(0, std::memory_order_relaxed);
     _gpu_native_enabled = _gpu_native_max_chunks > 0;
     if (_gpu_native_enabled) {
-        printf("[GPU-BWC] enabled: exact GPU materialization with host-staged "
-               "remote writes, capacity %d vectors (%d HBM slots) per "
+        printf("[GPU-BWC] enabled: exact GPU materialization, "
+               "capacity %d vectors (%d HBM slots) per "
                "selected bucket\n",
                _gpu_native_max_nvecs, _gpu_native_max_chunks);
         fflush(stdout);

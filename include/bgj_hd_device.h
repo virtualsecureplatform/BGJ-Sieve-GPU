@@ -378,8 +378,11 @@ struct buc_buffer_holder_t {
     cudaEvent_t *gpu_write_start = NULL, *gpu_write_stop = NULL;
     cudaStream_t *gpu_write_peer_streams = NULL;
     int32_t *gpu_write_pending = NULL;
+    std::atomic<int32_t> gpu_peer_direct[MAX_NUM_DEVICE * MAX_NUM_DEVICE]{};
     std::atomic<uint64_t> gpu_native_local_nbytes{0};
     std::atomic<uint64_t> gpu_native_peer_nbytes{0};
+    std::atomic<uint64_t> gpu_native_p2p_nbytes{0};
+    std::atomic<uint64_t> gpu_native_host_peer_nbytes{0};
     std::atomic<uint64_t> gpu_native_kernel_us{0};
 
     void (*kernel)(uint32_t *, int, int8_t *, int32_t *, const int8_t *, uint32_t, const int8_t *, int *, float, int, int, int);

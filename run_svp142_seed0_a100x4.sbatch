@@ -12,6 +12,7 @@ SOURCE="${SLURM_SUBMIT_DIR}"
 ACTUAL_SOURCE_COMMIT="$(git -C "$SOURCE" rev-parse HEAD)"
 SOURCE_COMMIT="${SOURCE_COMMIT:-${ACTUAL_SOURCE_COMMIT}}"
 FILTER_TASK_VECS="${FILTER_TASK_VECS:-524288}"
+BGJ_ENABLE_PROFILING="${BGJ_ENABLE_PROFILING:-1}"
 DIMENSION="${SVP_DIMENSION:-142}"
 LATTICE_SEED="${SVP142_LATTICE_SEED:-0}"
 INSTANCE="${SVP_INSTANCE:-svp142-seed${LATTICE_SEED}}"
@@ -19,7 +20,7 @@ IMAGE="${BGJ_IMAGE:-${LARGE_BASE}/bgj-sieve-gpu-cuda13.3.sif}"
 INPUT_DIR="${SVP142_INPUT_DIR:-${LARGE_BASE}/inputs/${INSTANCE}}"
 RUN_DIR="${SVP142_RUN_DIR:-${LARGE_BASE}/runs/${INSTANCE}/job-${SLURM_JOB_ID}}"
 BINARY_ROOT="${BGJ_BINARY_ROOT:-${LARGE_BASE}/builds}"
-SOLVER_KEY="$("${SOURCE}/tools/solver_cache_key.sh" "$SOURCE" "$SOURCE_COMMIT" "$FILTER_TASK_VECS" | sha256sum | awk '{print $1}')"
+SOLVER_KEY="$("${SOURCE}/tools/solver_cache_key.sh" "$SOURCE" "$SOURCE_COMMIT" "$FILTER_TASK_VECS" "$BGJ_ENABLE_PROFILING" | sha256sum | awk '{print $1}')"
 BINARY="${BGJ_BINARY:-${BINARY_ROOT}/hd_sieve-${SOLVER_KEY}-a100x4-ftv${FILTER_TASK_VECS}}"
 BINARY_MANIFEST="${BINARY}.manifest"
 REPRO="${SVP142_REPRO:-${SOURCE}/reproduce/svp142-seed${LATTICE_SEED}/reproduce.py}"
@@ -34,6 +35,10 @@ SVP_TIMEOUT_SECONDS="${SVP_TIMEOUT_SECONDS:-10500}"
 
 if [[ "$ACTUAL_SOURCE_COMMIT" != "$SOURCE_COMMIT" ]]; then
     echo "Source moved after submission: expected $SOURCE_COMMIT, found $ACTUAL_SOURCE_COMMIT" >&2
+    exit 2
+fi
+if [[ "$BGJ_ENABLE_PROFILING" != 0 && "$BGJ_ENABLE_PROFILING" != 1 ]]; then
+    echo "BGJ_ENABLE_PROFILING must be 0 or 1" >&2
     exit 2
 fi
 if [[ ! "$TARGET_SIEVING_DIM" =~ ^[0-9]+$ ]] || (( TARGET_SIEVING_DIM < 118 || TARGET_SIEVING_DIM > DIMENSION )); then
@@ -62,10 +67,11 @@ if [[ ! -x "$BINARY" || ! -f "$BINARY_MANIFEST" ]]; then
 fi
 grep -Fqx "solver_key=${SOLVER_KEY}" "$BINARY_MANIFEST"
 grep -Fqx "filter_task_vecs=${FILTER_TASK_VECS}" "$BINARY_MANIFEST"
+grep -Fqx "enable_profiling=${BGJ_ENABLE_PROFILING}" "$BINARY_MANIFEST"
 grep -Fqx "cache_profile=svp142-500g" "$BINARY_MANIFEST"
 
 echo "node=$(hostname) job=${SLURM_JOB_ID} visible_gpus=${CUDA_VISIBLE_DEVICES:-unset}"
-echo "source_commit=${SOURCE_COMMIT} solver_key=${SOLVER_KEY} binary=${BINARY}"
+echo "source_commit=${SOURCE_COMMIT} solver_key=${SOLVER_KEY} enable_profiling=${BGJ_ENABLE_PROFILING} binary=${BINARY}"
 echo "input_dir=${INPUT_DIR} run_dir=${RUN_DIR} MLD=${MIN_LIFTING_DIM} TSD=${TARGET_SIEVING_DIM} timeout=${SVP_TIMEOUT_SECONDS}s continue_after_target=${CONTINUE_AFTER_TARGET}"
 echo "reducer_threads=${BGJ2_REDUCER_THREADS} pool_threads=${POOL_THREADS} uid_load_pct=${GPU_UID_SHARED_LOAD_PCT} backpressure=${BACKPRESSURE_PROFILE}"
 sha256sum "$BINARY"
