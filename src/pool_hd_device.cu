@@ -1225,7 +1225,7 @@ int Pool_hd_t::stream_task_template(int num_devices, cudaDeviceProp device_props
             int real_i = 0;
             for (int i = 0; i < task_chunks; i++) {
                 if (working_chunk[i] == NULL) continue;
-                int nn = (real_i + 1) * chunk_max_nvecs > task_vecs ? 
+                int nn = (real_i + 1) * chunk_max_nvecs > task_vecs ?
                         task_vecs - real_i * chunk_max_nvecs : chunk_max_nvecs;
                 if (nn <= 0) break;
                 CHECK_CUDA_ERR(cudaMemcpyAsync(working_chunk[i]->vec, pack_buffer + real_i * chunk_max_nvecs * CSD, 
@@ -1262,7 +1262,7 @@ int Pool_hd_t::stream_task_template(int num_devices, cudaDeviceProp device_props
             int real_i = 0;
             for (int i = 0; i < task_chunks; i++) {
                 if (working_chunk[i] == NULL) continue;
-                int nn = (real_i + 1) * chunk_max_nvecs > task_chunks ? 
+                int nn = (real_i + 1) * chunk_max_nvecs > task_vecs ?
                         task_vecs - real_i * chunk_max_nvecs : chunk_max_nvecs;
                 if (nn <= 0) break;
                 CHECK_CUDA_ERR(cudaMemcpyAsync(working_chunk[i]->vec, pack_buffer + real_i * chunk_max_nvecs * CSD, 
