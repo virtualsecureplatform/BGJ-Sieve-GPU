@@ -191,13 +191,13 @@ struct buc_logger_t : public generic_logger_t {
     std::atomic<uint64_t>       ev_batch_num;
     std::atomic<uint64_t>       ev_batch_us;
 
-    int h2d_count[BUC_DEFAULT_NUM_THREADS] = {};
-    cudaEvent_t h2d_start[BUC_DEFAULT_NUM_THREADS][buc_traits_t::taskChunks];
-    cudaEvent_t h2d_stop[BUC_DEFAULT_NUM_THREADS][buc_traits_t::taskChunks];
-    cudaEvent_t d2h_start[BUC_DEFAULT_NUM_THREADS];
-    cudaEvent_t d2h_stop[BUC_DEFAULT_NUM_THREADS];
-    cudaEvent_t h2d_norm_start[BUC_DEFAULT_NUM_THREADS];
-    cudaEvent_t kernel_start[BUC_DEFAULT_NUM_THREADS];
+    int h2d_count[BUC_MAX_NUM_THREADS] = {};
+    cudaEvent_t h2d_start[BUC_MAX_NUM_THREADS][buc_traits_t::taskChunks];
+    cudaEvent_t h2d_stop[BUC_MAX_NUM_THREADS][buc_traits_t::taskChunks];
+    cudaEvent_t d2h_start[BUC_MAX_NUM_THREADS];
+    cudaEvent_t d2h_stop[BUC_MAX_NUM_THREADS];
+    cudaEvent_t h2d_norm_start[BUC_MAX_NUM_THREADS];
+    cudaEvent_t kernel_start[BUC_MAX_NUM_THREADS];
 
     int num_threads, num_devices, chunk_nbytes, CSD16;
     Bucketer_t *bucketer = NULL;
@@ -623,8 +623,8 @@ struct Bucketer_t {
     uint8_t   *_stale_slot_batch = NULL;
     long      _stale_slot_capacity = 0;
     int       _cur_batch = 0;
-    long      _stale_hits_t[BUC_DEFAULT_NUM_THREADS] = {};
-    long      _stale_ow_t[BUC_DEFAULT_NUM_THREADS] = {};
+    long      _stale_hits_t[BUC_MAX_NUM_THREADS] = {};
+    long      _stale_ow_t[BUC_MAX_NUM_THREADS] = {};
 
     /// HD_INT4_BUCKETS=1: store bucket coordinates at INT4 precision (packed
     /// design step 1 — round-trip int8->int4->int8 in place at scatter to

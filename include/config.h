@@ -178,6 +178,7 @@ struct hw {
 ///////////////// buc config /////////////////
 #define BUC_MIN_CSD16                   128     /* change with kernel choosing code tegother */
 #define BUC_DEFAULT_NUM_THREADS         16
+#define BUC_MAX_NUM_THREADS             32
 #define BUC_GRAM_SLIMIT                 (1ULL << 30)
 
 #define BGJ1_L0_MIN_ALPHA0              0.310

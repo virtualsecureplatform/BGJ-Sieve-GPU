@@ -73,7 +73,7 @@ grep -Fqx "cache_profile=svp142-500g" "$BINARY_MANIFEST"
 echo "node=$(hostname) job=${SLURM_JOB_ID} visible_gpus=${CUDA_VISIBLE_DEVICES:-unset}"
 echo "source_commit=${SOURCE_COMMIT} solver_key=${SOLVER_KEY} enable_profiling=${BGJ_ENABLE_PROFILING} binary=${BINARY}"
 echo "input_dir=${INPUT_DIR} run_dir=${RUN_DIR} MLD=${MIN_LIFTING_DIM} TSD=${TARGET_SIEVING_DIM} timeout=${SVP_TIMEOUT_SECONDS}s continue_after_target=${CONTINUE_AFTER_TARGET}"
-echo "reducer_threads=${BGJ2_REDUCER_THREADS} pool_threads=${POOL_THREADS} uid_load_pct=${GPU_UID_SHARED_LOAD_PCT} backpressure=${BACKPRESSURE_PROFILE}"
+echo "reducer_threads=${BGJ2_REDUCER_THREADS} pool_threads=${POOL_THREADS} bucket_threads=${APPTAINERENV_HD_BUCKET_THREADS:-auto} uid_load_pct=${GPU_UID_SHARED_LOAD_PCT} backpressure=${BACKPRESSURE_PROFILE}"
 sha256sum "$BINARY"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 

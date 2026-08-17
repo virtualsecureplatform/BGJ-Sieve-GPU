@@ -1983,6 +1983,13 @@ int Bucketer_t::set_batch0(long batch0) {
 }
 
 int Bucketer_t::set_num_threads(int num_threads) {
+    if (num_threads < hw::gpu_num || num_threads > BUC_MAX_NUM_THREADS ||
+        num_threads % hw::gpu_num) {
+        fprintf(stderr,
+                "[Error] bucketer threads must be a multiple of %d in [%d, %d]\n",
+                hw::gpu_num, hw::gpu_num, BUC_MAX_NUM_THREADS);
+        exit(2);
+    }
     if (_buc_pool) {
         for (int i = 0; i < this->_num_threads; i++) delete _buc_pool[i];
         free(_buc_pool);
@@ -2049,7 +2056,24 @@ int Bucketer_t::auto_bgj_params_set(int bgj) {
     if (_num_buc_slimit > bwc_manager_t::bwc_max_buckets - RED_MAX_NUM_THREADS) 
         _num_buc_slimit = bwc_manager_t::bwc_max_buckets - RED_MAX_NUM_THREADS;
 
-    if (!this->_num_threads) this->set_num_threads(traits::num_threads(_pool->CSD, _pool->ESD, _alpha0, _max_batch0));
+    if (!this->_num_threads) {
+        int num_threads = traits::num_threads(
+            _pool->CSD, _pool->ESD, _alpha0, _max_batch0);
+        const char *threads_env = getenv("HD_BUCKET_THREADS");
+        if (threads_env) {
+            char *end = NULL;
+            long requested = strtol(threads_env, &end, 10);
+            if (!*threads_env || *end || requested < hw::gpu_num ||
+                requested > BUC_MAX_NUM_THREADS || requested % hw::gpu_num) {
+                fprintf(stderr,
+                        "[Error] HD_BUCKET_THREADS must be a multiple of %d in [%d, %d]\n",
+                        hw::gpu_num, hw::gpu_num, BUC_MAX_NUM_THREADS);
+                exit(2);
+            }
+            num_threads = (int)requested;
+        }
+        this->set_num_threads(num_threads);
+    }
 
     if (bgj == 4) {
         if (_max_batch0 > 64) _max_batch0 = 64;
@@ -2113,7 +2137,7 @@ int Bucketer_t::run() {
         const char *e = getenv("HD_MEASURE_STALE");
         _measure_stale = e ? atol(e) : 0;
         _cur_batch = 0;
-        for (int t = 0; t < BUC_DEFAULT_NUM_THREADS; t++) { _stale_hits_t[t] = 0; _stale_ow_t[t] = 0; }
+        for (int t = 0; t < _num_threads; t++) { _stale_hits_t[t] = 0; _stale_ow_t[t] = 0; }
         if (_stale_slot_batch) { free(_stale_slot_batch); _stale_slot_batch = NULL; }
         if (_measure_stale) {
             _stale_slot_capacity = (long)_pwc->num_chunks() * Pool_hd_t::chunk_max_nvecs;
@@ -2296,7 +2320,7 @@ int Bucketer_t::run() {
 
     if (_measure_stale) {
         long hits = 0, ow = 0;
-        for (int t = 0; t < BUC_DEFAULT_NUM_THREADS; t++) { hits += _stale_hits_t[t]; ow += _stale_ow_t[t]; }
+        for (int t = 0; t < _num_threads; t++) { hits += _stale_hits_t[t]; ow += _stale_ow_t[t]; }
         printf("[STALE] CSD %ld: batches %d, overwrites %ld, stale-next-batch %ld (%.4f%%)\n",
                _pool->CSD, _cur_batch, ow, hits, ow ? 100.0 * hits / ow : 0.0);
         fflush(stdout);
