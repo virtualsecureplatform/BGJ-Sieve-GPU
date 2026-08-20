@@ -80,14 +80,14 @@ struct hw {
 // Fast persistence behavior is the DEFAULT (single-SSD tuning): lazy sync
 // on, pool persisted every 6th dim, no between-sieve pwc borrow. Restore
 // stock behavior with HD_LAZY_SYNC=0 HD_SYNC_EVERY=1 HD_PWC_NO_GROW=0.
-//   A100x4 500GB profile: 240/96/24 GB.  The CSD135 pool occupies 106956
-//   exact host chunks (128.93 GiB); the former 112GB PWC cap held CSD134 but
-//   made CSD135 thrash the backing store.  This cap holds about 199K exact
-//   chunks, enough for the projected ~189K-chunk CSD139 pool.  PWC/BWC/SWC
-//   reserve 360 GiB in total, leaving the remainder of the 500GB-node
-//   allocation for reducer staging, queues, the OS, and transient memory.
+//   A100x4 500GB SVP-160 profile: 352/32/16 GB.  With the fixed 158-byte
+//   host slots, the size-ratio-3.2 pool at CSD142 is about 290K chunks
+//   (roughly 350 GiB).  The larger PWC cap keeps that pool resident; native
+//   GPU BWC/P2P carries the bucket working set, so host BWC can be reduced to
+//   32 GiB.  PWC/BWC/SWC reserve 400 GiB in total, leaving room for the
+//   48-GiB reducer arena, the OS, and transient queues in a 500-GiB job.
 // Build with -DHD_SVP140_CACHE_PROFILE=1 for the 47/32/8 GB profile, or
-// -DHD_A100X4_500G_CACHE_PROFILE=1 for the 240/96/24 GB profile.
+// -DHD_A100X4_500G_CACHE_PROFILE=1 for the 352/32/16 GB SVP-160 profile.
 #define ONE_TIME_IO                     1
 #ifndef HD_SVP140_CACHE_PROFILE
 #define HD_SVP140_CACHE_PROFILE         0
@@ -99,9 +99,9 @@ struct hw {
 #error "select only one host cache profile"
 #endif
 #if HD_A100X4_500G_CACHE_PROFILE
-#define PWC_DRAM_SLIMIT                 (240ULL << 30)
-#define BWC_DRAM_SLIMIT                 (96ULL << 30)
-#define SWC_DRAM_SLIMIT                 (24ULL << 30)
+#define PWC_DRAM_SLIMIT                 (352ULL << 30)
+#define BWC_DRAM_SLIMIT                 (32ULL << 30)
+#define SWC_DRAM_SLIMIT                 (16ULL << 30)
 #elif HD_SVP140_CACHE_PROFILE
 #define PWC_DRAM_SLIMIT                 (47ULL << 30)
 #define BWC_DRAM_SLIMIT                 (32ULL << 30)
