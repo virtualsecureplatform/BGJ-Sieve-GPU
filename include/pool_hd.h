@@ -715,6 +715,7 @@ struct pwc_manager_tmpl {
 
     // cache
     long _max_cached_chunks;
+    long _cached_chunks_capacity;
     chunk_t *_cached_chunks;
     int32_t _last_cache;
     pthread_spinlock_t _cached_chunks_lock;
@@ -995,6 +996,15 @@ template <class logger_t> int pwc_manager_tmpl<logger_t>::set_max_cached_chunks(
     #if ENABLE_PROFILING
     cond_lg_init(logger->construcion_done());
     #endif
+    if (max_cached_chunks <= 0 ||
+        max_cached_chunks > (long)_ck_cache_id_mask + 1) {
+        fprintf(stderr, "[Error] invalid cache descriptor capacity %ld\n",
+                max_cached_chunks);
+        #if ENABLE_PROFILING
+        cond_lg_exit(logger->construcion_done());
+        #endif
+        return -1;
+    }
     if (max_cached_chunks == this->_max_cached_chunks) {
         cond_lg_exit(logger->construcion_done());
         return 0;
@@ -1002,6 +1012,26 @@ template <class logger_t> int pwc_manager_tmpl<logger_t>::set_max_cached_chunks(
     // shrinking evicts until enough slots are free; lazy-dirty chunks are
     // unevictable, so they must be written out first
     if (_lazy_sync && max_cached_chunks < this->_max_cached_chunks) __drain_sync_queue();
+
+    // Cache descriptors are indexed only up to _max_cached_chunks.  The old
+    // allocation reserved all 2^24 encodable cache IDs for every manager even
+    // though normal profiles use only a few thousand to a few hundred
+    // thousand.  Grow on demand so runtime cache resizing remains exact.
+    if (max_cached_chunks > _cached_chunks_capacity) {
+        chunk_t *resized = (chunk_t *)realloc(
+            _cached_chunks, (size_t)max_cached_chunks * sizeof(chunk_t));
+        if (!resized) {
+            fprintf(stderr,
+                    "[Error] cache descriptor allocation for %ld chunks failed\n",
+                    max_cached_chunks);
+            #if ENABLE_PROFILING
+            cond_lg_exit(logger->construcion_done());
+            #endif
+            return -1;
+        }
+        _cached_chunks = resized;
+        _cached_chunks_capacity = max_cached_chunks;
+    }
 
     constexpr chunk_status_t _ck_busy = _ck_loading | _ck_syncing |
                                           _ck_reading | _ck_writing | _ck_to_sync;
@@ -1528,11 +1558,12 @@ template <class logger_t> pwc_manager_tmpl<logger_t>::pwc_manager_tmpl(long load
     _compact_vec_norm = compact_vec_norm;
     _num_chunks = 0;
     _max_cached_chunks = 0;
-    _cached_chunks = (chunk_t *) malloc((_ck_cache_id_mask + 1) * sizeof(chunk_t));
+    _cached_chunks_capacity = 0;
+    _cached_chunks = NULL;
     _chunk_status = (chunk_status_t *) malloc((_ck_cache_id_mask + 1) * sizeof(chunk_status_t));
 
     set_num_threads(loading_threads, syncing_threads);
-    set_max_cached_chunks(max_cached_chunks);
+    if (set_max_cached_chunks(max_cached_chunks)) abort();
 
     _last_cache = 0;
     _num_loading_chunks.store(0);
