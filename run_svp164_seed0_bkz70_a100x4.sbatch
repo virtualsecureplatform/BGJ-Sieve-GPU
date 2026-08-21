@@ -22,7 +22,9 @@ export SVP_BKZ_BETA=70
 export SVP_BKZ_LOOPS=8
 export BGJ_ENABLE_PROFILING=0
 export SVP_SIEVE_SEED=0
-export TARGET_SIEVING_DIM=145
+# The resident high-capacity host-vector tier is CSD144.  Raising this to 145
+# would require a wider slot format and would materially reduce pool capacity.
+export TARGET_SIEVING_DIM=144
 export MIN_LIFTING_DIM=120
 export SVP_TIMEOUT_SECONDS=42930
 export APPTAINERENV_HD_BUCKET_THREADS=20
