@@ -80,14 +80,14 @@ struct hw {
 // Fast persistence behavior is the DEFAULT (single-SSD tuning): lazy sync
 // on, pool persisted every 6th dim, no between-sieve pwc borrow. Restore
 // stock behavior with HD_LAZY_SYNC=0 HD_SYNC_EVERY=1 HD_PWC_NO_GROW=0.
-//   A100x4 500GB SVP-160 profile: 352/32/16 GB.  With the fixed 158-byte
+//   A100x4 500GB SVP-163/164 profile: 364/32/16 GB.  With the fixed 158-byte
 //   host slots, the size-ratio-3.2 pool at CSD142 is about 290K chunks
-//   (roughly 350 GiB).  The larger PWC cap keeps that pool resident; native
-//   GPU BWC/P2P carries the bucket working set, so host BWC can be reduced to
-//   32 GiB.  PWC/BWC/SWC reserve 400 GiB in total, leaving room for the
-//   48-GiB reducer arena, the OS, and transient queues in a 500-GiB job.
+//   (roughly 350 GiB).  The enlarged PWC cap keeps the higher-dimension pool
+//   resident while retaining the host BWC capacity used by the native GPU
+//   BWC/P2P path.  PWC/BWC/SWC reserve 412 GiB in total; this is intended for
+//   the approved 95% RSS envelope of a full 512-GiB node.
 // Build with -DHD_SVP140_CACHE_PROFILE=1 for the 47/32/8 GB profile, or
-// -DHD_A100X4_500G_CACHE_PROFILE=1 for the 352/32/16 GB SVP-160 profile.
+// -DHD_A100X4_500G_CACHE_PROFILE=1 for the 364/32/16 GB SVP-163/164 profile.
 #define ONE_TIME_IO                     1
 #ifndef HD_SVP140_CACHE_PROFILE
 #define HD_SVP140_CACHE_PROFILE         0
@@ -99,7 +99,7 @@ struct hw {
 #error "select only one host cache profile"
 #endif
 #if HD_A100X4_500G_CACHE_PROFILE
-#define PWC_DRAM_SLIMIT                 (352ULL << 30)
+#define PWC_DRAM_SLIMIT                 (364ULL << 30)
 #define BWC_DRAM_SLIMIT                 (32ULL << 30)
 #define SWC_DRAM_SLIMIT                 (16ULL << 30)
 #elif HD_SVP140_CACHE_PROFILE
