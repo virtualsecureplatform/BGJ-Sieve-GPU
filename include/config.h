@@ -80,14 +80,16 @@ struct hw {
 // Fast persistence behavior is the DEFAULT (single-SSD tuning): lazy sync
 // on, pool persisted every 6th dim, no between-sieve pwc borrow. Restore
 // stock behavior with HD_LAZY_SYNC=0 HD_SYNC_EVERY=1 HD_PWC_NO_GROW=0.
-//   A100x4 500GB SVP-163/164 profile: 364/32/16 GB.  With the fixed 158-byte
+//   A100x4 500GB SVP-163/164 profile: 364/4/16 GB.  With the fixed 158-byte
 //   host slots, the size-ratio-3.2 pool at CSD142 is about 290K chunks
 //   (roughly 350 GiB).  The enlarged PWC cap keeps the higher-dimension pool
-//   resident while retaining the host BWC capacity used by the native GPU
-//   BWC/P2P path.  PWC/BWC/SWC reserve 412 GiB in total; this is intended for
-//   the approved 95% RSS envelope of a full 512-GiB node.
+//   resident.  Native GPU BWC/P2P materializes buckets exactly in HBM; the
+//   4-GiB host BWC cache is retained as an exact disk-backed fallback.  The
+//   completed SVP-160 CSD142 run used zero host-fallback buckets in all 19
+//   stages.  PWC/BWC/SWC reserve 384 GiB in total, leaving substantially more
+//   room for reducer staging and transient solution queues.
 // Build with -DHD_SVP140_CACHE_PROFILE=1 for the 47/32/8 GB profile, or
-// -DHD_A100X4_500G_CACHE_PROFILE=1 for the 364/32/16 GB SVP-163/164 profile.
+// -DHD_A100X4_500G_CACHE_PROFILE=1 for the 364/4/16 GB SVP-163/164 profile.
 #define ONE_TIME_IO                     1
 #ifndef HD_SVP140_CACHE_PROFILE
 #define HD_SVP140_CACHE_PROFILE         0
@@ -100,7 +102,7 @@ struct hw {
 #endif
 #if HD_A100X4_500G_CACHE_PROFILE
 #define PWC_DRAM_SLIMIT                 (364ULL << 30)
-#define BWC_DRAM_SLIMIT                 (32ULL << 30)
+#define BWC_DRAM_SLIMIT                 (4ULL << 30)
 #define SWC_DRAM_SLIMIT                 (16ULL << 30)
 #elif HD_SVP140_CACHE_PROFILE
 #define PWC_DRAM_SLIMIT                 (47ULL << 30)
