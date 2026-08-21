@@ -17,3 +17,10 @@ four-GPU solve job. The preparation job builds and caches its private fplll
 Git revision under `/LARGE0`; the SIF provides build prerequisites but does not
 install fplll itself. All generated bases, binaries, and sieve files are stored
 under `/LARGE0/gr20116/$USER/BGJ-Sieve-GPU`; no generated data is put in home.
+
+Preparation logs contain machine-readable phase timestamps. Extract the
+timestamp-derived durations (including the combined preprocessing total) with:
+
+```sh
+python3 reproduce/svp142-seed0/reproduce.py timing /path/to/prep.log
+```

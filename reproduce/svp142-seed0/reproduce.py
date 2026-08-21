@@ -52,6 +52,12 @@ SOL_RE = re.compile(
     r"\[pos (\d+)\] length = ([0-9.]+)\(([0-9.]+) gh, [0-9.eE+-]+ old\), "
     r"vec = \[([^\]]*)\]"
 )
+TIMING_RE = re.compile(
+    r"^\[svp142-timing\] phase=(?P<phase>[A-Za-z0-9_-]+) "
+    r"event=(?P<event>start|end) epoch=(?P<epoch>[0-9]+(?:\.[0-9]+)?)"
+    r"(?: elapsed_seconds=(?P<elapsed>[0-9]+(?:\.[0-9]+)?))?"
+    r"(?: returncode=(?P<returncode>-?[0-9]+))?\s*$"
+)
 
 
 class ReproductionError(RuntimeError):
@@ -166,11 +172,32 @@ def fplll_version() -> str:
     return lines[0].strip() if lines else ""
 
 
-def run_to_file(command: list[str], output: Path, accept_nonzero: bool = False) -> int:
+def run_to_file(
+    command: list[str],
+    output: Path,
+    accept_nonzero: bool = False,
+    phase: str | None = None,
+) -> int:
     tmp = output.with_name(f"{output.name}.tmp.{os.getpid()}")
+    started_wall = time.time()
+    started_mono = time.monotonic()
+    if phase:
+        print(
+            f"[svp142-timing] phase={phase} event=start "
+            f"epoch={started_wall:.3f}",
+            flush=True,
+        )
     print("[svp142] " + " ".join(command) + f" > {output}")
     with tmp.open("wb") as destination:
         proc = subprocess.run(command, stdout=destination, check=False)
+    if phase:
+        ended_wall = time.time()
+        print(
+            f"[svp142-timing] phase={phase} event=end "
+            f"epoch={ended_wall:.3f} elapsed_seconds={time.monotonic() - started_mono:.2f} "
+            f"returncode={proc.returncode}",
+            flush=True,
+        )
     if proc.returncode and not accept_nonzero:
         raise ReproductionError(
             f"command exited {proc.returncode}; partial output retained at {tmp}"
@@ -178,6 +205,54 @@ def run_to_file(command: list[str], output: Path, accept_nonzero: bool = False) 
     validate_matrix(tmp)
     tmp.replace(output)
     return proc.returncode
+
+
+def extract_timing(log_paths: list[Path]) -> dict[str, object]:
+    """Extract timestamp-based preprocessing durations from recipe logs."""
+    reports: list[dict[str, object]] = []
+    for log_path in log_paths:
+        phases: dict[str, dict[str, object]] = {}
+        for line_number, line in enumerate(log_path.read_text().splitlines(), 1):
+            match = TIMING_RE.match(line.strip())
+            if not match:
+                continue
+            phase = match.group("phase")
+            event = match.group("event")
+            entry = phases.setdefault(phase, {})
+            epoch = float(match.group("epoch"))
+            if event == "start":
+                entry["start_epoch"] = epoch
+            else:
+                entry["end_epoch"] = epoch
+                if match.group("returncode") is not None:
+                    entry["returncode"] = int(match.group("returncode"))
+                if match.group("elapsed") is not None:
+                    entry["reported_elapsed_seconds"] = float(match.group("elapsed"))
+            entry["last_line"] = line_number
+
+        complete: dict[str, dict[str, object]] = {}
+        for phase, entry in phases.items():
+            start = entry.get("start_epoch")
+            end = entry.get("end_epoch")
+            if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+                continue
+            duration = end - start
+            if duration < 0:
+                raise ReproductionError(f"timing timestamps go backwards for {phase} in {log_path}")
+            entry = dict(entry)
+            entry["elapsed_seconds"] = round(duration, 3)
+            entry.pop("last_line", None)
+            complete[phase] = entry
+        reports.append(
+            {
+                "log": str(log_path),
+                "phases": complete,
+                "preprocess_seconds": round(
+                    sum(float(entry["elapsed_seconds"]) for entry in complete.values()), 3
+                ),
+            }
+        )
+    return {"logs": reports}
 
 
 def run_deeplll(source: Path, output: Path) -> None:
@@ -297,7 +372,10 @@ def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
         lll_command = ["fplll", "-a", lll_algorithm]
         if PREPROCESS_MODE in {"lll-potlllbkz", "potlll-bkz"}:
             lll_command.extend(["-m", "heuristic", "-f", "mpfr", "-p", "256"])
-        run_to_file(lll_command + [str(raw)], lll)
+        run_to_file(
+            lll_command + [str(raw)], lll,
+            phase="potlll" if PREPROCESS_MODE == "potlll-bkz" else "lll",
+        )
         pre_bkz = lll
     if PREPROCESS_MODE == "lll-deeplll-bkz":
         deep = input_dir / f"L_{DIMENSION}_{LATTICE_SEED}.deeplll{DEEPLLL_DEPTH}"
@@ -315,6 +393,7 @@ def prepare(input_dir: Path, strategy: Path, force: bool) -> Path:
         ],
         pre,
         accept_nonzero=True,
+        phase="bkz" if bkz_algorithm == "bkz" else "potlllbkz",
     )
     if rc:
         print(f"[svp142] fplll returned {rc} at the tour limit; complete output accepted")
@@ -526,6 +605,10 @@ def main() -> int:
     prep.add_argument("--force", action="store_true")
     verify = sub.add_parser("verify-known")
     verify.add_argument("--input-dir", type=Path, required=True)
+    timing = sub.add_parser(
+        "timing", help="extract timestamp-based PotLLL/BKZ durations from prep logs"
+    )
+    timing.add_argument("log", type=Path, nargs="+")
     run = sub.add_parser("run")
     run.add_argument("--input-dir", type=Path, required=True)
     run.add_argument("--run-dir", type=Path, required=True)
@@ -547,6 +630,9 @@ def main() -> int:
             result = verify_vector_text(KNOWN_VECTOR.read_text(), raw)
             print(json.dumps(result, indent=2))
             return 0 if result["ok"] else 1
+        if args.action == "timing":
+            print(json.dumps(extract_timing([path.resolve() for path in args.log]), indent=2))
+            return 0
         if args.action == "run":
             return run_sieve(
                 args.input_dir.resolve(), args.run_dir.resolve(), args.binary.resolve(),
