@@ -2,7 +2,7 @@
 #SBATCH --job-name=svp163-s0-6-bkz70
 #SBATCH --partition=gr20100g
 #SBATCH --rsc=g=4
-#SBATCH --array=0-6%1
+#SBATCH --array=0-6%2
 #SBATCH --time=12:00:00
 #SBATCH --output=/LARGE0/gr20116/%u/BGJ-Sieve-GPU/logs/svp163-164/slurm-%x-%A_%a.out
 
