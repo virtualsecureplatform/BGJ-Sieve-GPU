@@ -13,6 +13,7 @@ ACTUAL_SOURCE_COMMIT="$(git -C "$SOURCE" rev-parse HEAD)"
 SOURCE_COMMIT="${SOURCE_COMMIT:-${ACTUAL_SOURCE_COMMIT}}"
 FILTER_TASK_VECS="${FILTER_TASK_VECS:-524288}"
 BGJ_ENABLE_PROFILING="${BGJ_ENABLE_PROFILING:-1}"
+POOL_HOST_VEC_MAX_DIM="${POOL_HOST_VEC_MAX_DIM:-144}"
 DIMENSION="${SVP_DIMENSION:-142}"
 LATTICE_SEED="${SVP142_LATTICE_SEED:-0}"
 INSTANCE="${SVP_INSTANCE:-svp142-seed${LATTICE_SEED}}"
@@ -20,7 +21,7 @@ IMAGE="${BGJ_IMAGE:-${LARGE_BASE}/bgj-sieve-gpu-cuda13.3.sif}"
 INPUT_DIR="${SVP142_INPUT_DIR:-${LARGE_BASE}/inputs/${INSTANCE}}"
 RUN_DIR="${SVP142_RUN_DIR:-${LARGE_BASE}/runs/${INSTANCE}/job-${SLURM_JOB_ID}}"
 BINARY_ROOT="${BGJ_BINARY_ROOT:-${LARGE_BASE}/builds}"
-SOLVER_KEY="$("${SOURCE}/tools/solver_cache_key.sh" "$SOURCE" "$SOURCE_COMMIT" "$FILTER_TASK_VECS" "$BGJ_ENABLE_PROFILING" | sha256sum | awk '{print $1}')"
+SOLVER_KEY="$("${SOURCE}/tools/solver_cache_key.sh" "$SOURCE" "$SOURCE_COMMIT" "$FILTER_TASK_VECS" "$BGJ_ENABLE_PROFILING" "$POOL_HOST_VEC_MAX_DIM" | sha256sum | awk '{print $1}')"
 BINARY="${BGJ_BINARY:-${BINARY_ROOT}/hd_sieve-${SOLVER_KEY}-a100x4-ftv${FILTER_TASK_VECS}}"
 BINARY_MANIFEST="${BINARY}.manifest"
 REPRO="${SVP142_REPRO:-${SOURCE}/reproduce/svp142-seed${LATTICE_SEED}/reproduce.py}"
@@ -39,6 +40,10 @@ if [[ "$ACTUAL_SOURCE_COMMIT" != "$SOURCE_COMMIT" ]]; then
 fi
 if [[ "$BGJ_ENABLE_PROFILING" != 0 && "$BGJ_ENABLE_PROFILING" != 1 ]]; then
     echo "BGJ_ENABLE_PROFILING must be 0 or 1" >&2
+    exit 2
+fi
+if [[ ! "$POOL_HOST_VEC_MAX_DIM" =~ ^[0-9]+$ ]] || (( POOL_HOST_VEC_MAX_DIM < 1 || POOL_HOST_VEC_MAX_DIM > 176 )); then
+    echo "POOL_HOST_VEC_MAX_DIM must be an integer in [1, 176]" >&2
     exit 2
 fi
 if [[ ! "$TARGET_SIEVING_DIM" =~ ^[0-9]+$ ]] || (( TARGET_SIEVING_DIM < 118 || TARGET_SIEVING_DIM > DIMENSION )); then
@@ -69,9 +74,12 @@ grep -Fqx "solver_key=${SOLVER_KEY}" "$BINARY_MANIFEST"
 grep -Fqx "filter_task_vecs=${FILTER_TASK_VECS}" "$BINARY_MANIFEST"
 grep -Fqx "enable_profiling=${BGJ_ENABLE_PROFILING}" "$BINARY_MANIFEST"
 grep -Fqx "cache_profile=svp142-500g" "$BINARY_MANIFEST"
+if (( POOL_HOST_VEC_MAX_DIM != 144 )); then
+    grep -Fqx "pool_host_vec_max_dim=${POOL_HOST_VEC_MAX_DIM}" "$BINARY_MANIFEST"
+fi
 
 echo "node=$(hostname) job=${SLURM_JOB_ID} visible_gpus=${CUDA_VISIBLE_DEVICES:-unset}"
-echo "source_commit=${SOURCE_COMMIT} solver_key=${SOLVER_KEY} enable_profiling=${BGJ_ENABLE_PROFILING} binary=${BINARY}"
+echo "source_commit=${SOURCE_COMMIT} solver_key=${SOLVER_KEY} enable_profiling=${BGJ_ENABLE_PROFILING} pool_host_vec_max_dim=${POOL_HOST_VEC_MAX_DIM} binary=${BINARY}"
 echo "input_dir=${INPUT_DIR} run_dir=${RUN_DIR} MLD=${MIN_LIFTING_DIM} TSD=${TARGET_SIEVING_DIM} timeout=${SVP_TIMEOUT_SECONDS}s continue_after_target=${CONTINUE_AFTER_TARGET}"
 echo "reducer_threads=${BGJ2_REDUCER_THREADS} pool_threads=${POOL_THREADS} bucket_threads=${APPTAINERENV_HD_BUCKET_THREADS:-auto} uid_load_pct=${GPU_UID_SHARED_LOAD_PCT} backpressure=${BACKPRESSURE_PROFILE}"
 sha256sum "$BINARY"

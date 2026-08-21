@@ -16,6 +16,7 @@ prepare_one() {
     local seed="$2"
     local repro="$3"
     local target_norm2="$4"
+    local host_vec_max_dim="${5:-144}"
     local instance="svp${dimension}-seed${seed}"
     export SVP_DIMENSION="$dimension"
     export SVP142_LATTICE_SEED="$seed"
@@ -29,18 +30,24 @@ prepare_one() {
     export SVP_BKZ_BETA=70
     export SVP_BKZ_LOOPS=8
     export BGJ_ENABLE_PROFILING=0
+    export POOL_HOST_VEC_MAX_DIM="$host_vec_max_dim"
     bash "${SOURCE}/prepare_svp142_seed0_a100x4.sbatch"
 }
 
-# Build the new cache-profile binary once, while preparing SVP-164.
-prepare_one 164 0 reproduce/svp164-seed0/reproduce.py 11009124 \
+# Build the CSD145 host-slot binary while preparing SVP-164.
+prepare_one 164 0 reproduce/svp164-seed0/reproduce.py 11009124 145 \
     >"${LOG_ROOT}/prep_${SLURM_JOB_ID}_svp164_0.log" 2>&1
+
+# Then build the default CSD144 binary before parallelizing the remaining
+# SVP-163 preprocessing tasks.
+prepare_one 163 0 reproduce/svp163-search/reproduce.py 11108888 144 \
+    >"${LOG_ROOT}/prep_${SLURM_JOB_ID}_svp163_0.log" 2>&1
 
 pids=()
 seeds=()
-for seed in {0..6}; do
+for seed in {1..6}; do
     (
-        prepare_one 163 "$seed" reproduce/svp163-search/reproduce.py 11108888
+        prepare_one 163 "$seed" reproduce/svp163-search/reproduce.py 11108888 144
     ) >"${LOG_ROOT}/prep_${SLURM_JOB_ID}_svp163_${seed}.log" 2>&1 &
     pids+=("$!")
     seeds+=("$seed")

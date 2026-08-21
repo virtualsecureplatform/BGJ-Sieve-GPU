@@ -13,6 +13,7 @@ ACTUAL_SOURCE_COMMIT="$(git -C "$SOURCE" rev-parse HEAD)"
 SOURCE_COMMIT="${SOURCE_COMMIT:-${ACTUAL_SOURCE_COMMIT}}"
 FILTER_TASK_VECS="${FILTER_TASK_VECS:-524288}"
 BGJ_ENABLE_PROFILING="${BGJ_ENABLE_PROFILING:-1}"
+POOL_HOST_VEC_MAX_DIM="${POOL_HOST_VEC_MAX_DIM:-144}"
 DIMENSION="${SVP_DIMENSION:-142}"
 LATTICE_SEED="${SVP142_LATTICE_SEED:-0}"
 INSTANCE="${SVP_INSTANCE:-svp142-seed${LATTICE_SEED}}"
@@ -20,11 +21,11 @@ IMAGE="${BGJ_IMAGE:-${LARGE_BASE}/bgj-sieve-gpu-cuda13.3.sif}"
 PREPROCESS_IMAGE="${SVP_PREPROCESS_IMAGE:-${IMAGE}}"
 INPUT_DIR="${SVP142_INPUT_DIR:-${LARGE_BASE}/inputs/${INSTANCE}}"
 BINARY_ROOT="${BGJ_BINARY_ROOT:-${LARGE_BASE}/builds}"
-SOLVER_KEY="$("${SOURCE}/tools/solver_cache_key.sh" "$SOURCE" "$SOURCE_COMMIT" "$FILTER_TASK_VECS" "$BGJ_ENABLE_PROFILING" | sha256sum | awk '{print $1}')"
+SOLVER_KEY="$("${SOURCE}/tools/solver_cache_key.sh" "$SOURCE" "$SOURCE_COMMIT" "$FILTER_TASK_VECS" "$BGJ_ENABLE_PROFILING" "$POOL_HOST_VEC_MAX_DIM" | sha256sum | awk '{print $1}')"
 BINARY="${BGJ_BINARY:-${BINARY_ROOT}/hd_sieve-${SOLVER_KEY}-a100x4-ftv${FILTER_TASK_VECS}}"
 MANIFEST="${BINARY}.manifest"
 REPRO="${SVP142_REPRO:-${SOURCE}/reproduce/svp142-seed${LATTICE_SEED}/reproduce.py}"
-DEFINES="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_FILTER_TASK_VECS=${FILTER_TASK_VECS} -DENABLE_PROFILING=${BGJ_ENABLE_PROFILING}"
+DEFINES="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_FILTER_TASK_VECS=${FILTER_TASK_VECS} -DENABLE_PROFILING=${BGJ_ENABLE_PROFILING} -DPOOL_HOST_VEC_MAX_DIM=${POOL_HOST_VEC_MAX_DIM}"
 FPLLL_COMMIT="$(git -C "${SOURCE}/dep/fplll" rev-parse HEAD)"
 FPLLL_PREFIX="${BGJ_FPLLL_PREFIX:-${LARGE_BASE}/deps/fplll-${FPLLL_COMMIT:0:12}}"
 FPLLL_BUILDER="${SOURCE}/tools/build_fplll.sh"
@@ -55,6 +56,10 @@ if [[ "$BGJ_ENABLE_PROFILING" != 0 && "$BGJ_ENABLE_PROFILING" != 1 ]]; then
     echo "BGJ_ENABLE_PROFILING must be 0 or 1" >&2
     exit 2
 fi
+if [[ ! "$POOL_HOST_VEC_MAX_DIM" =~ ^[0-9]+$ ]] || (( POOL_HOST_VEC_MAX_DIM < 1 || POOL_HOST_VEC_MAX_DIM > 176 )); then
+    echo "POOL_HOST_VEC_MAX_DIM must be an integer in [1, 176]" >&2
+    exit 2
+fi
 if [[ ! "$FILTER_TASK_VECS" =~ ^[0-9]+$ ]] || (( FILTER_TASK_VECS < 65536 || (FILTER_TASK_VECS & (FILTER_TASK_VECS - 1)) != 0 )); then
     echo "FILTER_TASK_VECS must be a power of two >= 65536" >&2
     exit 2
@@ -74,7 +79,7 @@ echo "image=${IMAGE}"
 echo "preprocess_image=${PREPROCESS_IMAGE} preprocess_mode=${PREPROCESS_MODE}"
 echo "input_dir=${INPUT_DIR}"
 echo "binary=${BINARY}"
-echo "solver_key=${SOLVER_KEY} enable_profiling=${BGJ_ENABLE_PROFILING}"
+echo "solver_key=${SOLVER_KEY} enable_profiling=${BGJ_ENABLE_PROFILING} pool_host_vec_max_dim=${POOL_HOST_VEC_MAX_DIM}"
 echo "fplll_commit=${FPLLL_COMMIT} fplll_prefix=${FPLLL_PREFIX}"
 
 # The shared recipes use this pinned generator whenever their raw hash policy is
@@ -112,7 +117,11 @@ apptainer exec \
         --input-dir "$INPUT_DIR" \
         --strategy "${FPLLL_PREFIX}/share/fplll/strategies/default.json"
 
-if [[ -x "$BINARY" && -f "$MANIFEST" ]] &&
+host_vec_manifest_ok=1
+if (( POOL_HOST_VEC_MAX_DIM != 144 )); then
+    grep -Fqx "pool_host_vec_max_dim=${POOL_HOST_VEC_MAX_DIM}" "$MANIFEST" 2>/dev/null || host_vec_manifest_ok=0
+fi
+if [[ -x "$BINARY" && -f "$MANIFEST" ]] && (( host_vec_manifest_ok )) &&
    grep -Fqx "solver_key=${SOLVER_KEY}" "$MANIFEST" &&
    grep -Fqx "filter_task_vecs=${FILTER_TASK_VECS}" "$MANIFEST" &&
    grep -Fqx "enable_profiling=${BGJ_ENABLE_PROFILING}" "$MANIFEST" &&
@@ -127,6 +136,7 @@ fi
 # immediately without recompiling unchanged CUDA/C++ sources.
 for old_manifest in "${BINARY_ROOT}"/hd_sieve-*-svp142-500g-ftv"${FILTER_TASK_VECS}".manifest; do
     [[ -f "$old_manifest" ]] || continue
+    (( POOL_HOST_VEC_MAX_DIM == 144 )) || continue
     old_commit="$(sed -n 's/^source_commit=//p' "$old_manifest" | head -1)"
     [[ "$old_commit" =~ ^[0-9a-f]{40}$ ]] || continue
     old_key="$("${SOURCE}/tools/solver_cache_key.sh" "$SOURCE" "$old_commit" "$FILTER_TASK_VECS" "$BGJ_ENABLE_PROFILING" 2>/dev/null | sha256sum | awk '{print $1}')" || continue
@@ -173,6 +183,9 @@ mv -f "$BINARY_TMP" "$BINARY"
     echo "filter_task_vecs=${FILTER_TASK_VECS}"
     echo "enable_profiling=${BGJ_ENABLE_PROFILING}"
     echo "cache_profile=svp142-500g"
+    if (( POOL_HOST_VEC_MAX_DIM != 144 )); then
+        echo "pool_host_vec_max_dim=${POOL_HOST_VEC_MAX_DIM}"
+    fi
     sha256sum "$BINARY"
 } > "$MANIFEST_TMP"
 mv -f "$MANIFEST_TMP" "$MANIFEST"
