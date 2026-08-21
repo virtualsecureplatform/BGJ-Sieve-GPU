@@ -15,6 +15,7 @@
 
 void _start_ck_allocator();
 void _destory_ck_allocator();
+void report_host_memory(const char *phase, long csd = -1);
 int _gpu_numa_host_alloc(void **ptr, size_t alignment, size_t nbytes);
 
 struct cudaDeviceProp;

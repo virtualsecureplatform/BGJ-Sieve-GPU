@@ -59,6 +59,7 @@ int Pool_hd_t::_bgj_Sieve_hd(int bgj) {
     ut_checker_t   *ut_checker = new ut_checker_t(0, this, uid_table, (pwc_manager_t *) swc_manager);
     Bucketer_t       *bucketer = new Bucketer_t(this, bwc_manager, swc_manager, ut_checker);
     Reducer_t         *reducer = new Reducer_t(this, bwc_manager, swc_manager, ut_checker);
+    report_host_memory("sieve_managers_ready", CSD);
 
     reducer->set_bucketer(bucketer);
     bucketer->set_reducer(reducer);
@@ -84,12 +85,14 @@ int Pool_hd_t::_bgj_Sieve_hd(int bgj) {
 
     reducer_thread.join();
     bucketer_thread.join();
+    report_host_memory("sieve_workers_done", CSD);
 
     delete reducer;
     delete bucketer;
     delete ut_checker;
     delete bwc_manager;
     delete swc_manager;
+    report_host_memory("sieve_cleanup_done", CSD);
     
     return ret;
 }
@@ -2152,6 +2155,7 @@ int Bucketer_t::run() {
     for (int tid = 0; tid < _num_threads; tid++) {
         _buc_pool[tid]->wait_sleep();
     }
+    report_host_memory("bucketer_buffers_ready", _pool->CSD);
 
     #if ENABLE_PROFILING
     if (logger->_ll >= logger_t::ll_info) {
@@ -4944,6 +4948,7 @@ int Reducer_t::run() {
             _sub_threads[tid * _threads_per_buc + sid]->wait_sleep();
         }
     }
+    report_host_memory("reducer_buffers_ready", _pool->CSD);
 
     #if ENABLE_PROFILING
     {

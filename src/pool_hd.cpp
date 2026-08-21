@@ -7,6 +7,54 @@
 #include "../include/vec.h"
 
 #include <omp.h>
+#include <time.h>
+
+
+void report_host_memory(const char *phase, long csd) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("HD_RSS_TELEMETRY");
+        enabled = !env || atoi(env) != 0;
+    }
+    if (!enabled) return;
+
+    unsigned long long rss_kib = 0;
+    unsigned long long hwm_kib = 0;
+    FILE *fp = fopen("/proc/self/status", "r");
+    if (fp) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) {
+            unsigned long long value = 0;
+            if (sscanf(line, "VmRSS: %llu kB", &value) == 1)
+                rss_kib = value;
+            else if (sscanf(line, "VmHWM: %llu kB", &value) == 1)
+                hwm_kib = value;
+        }
+        fclose(fp);
+    }
+
+    unsigned long long available_kib = 0;
+    fp = fopen("/proc/meminfo", "r");
+    if (fp) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) {
+            if (sscanf(line, "MemAvailable: %llu kB", &available_kib) == 1)
+                break;
+        }
+        fclose(fp);
+    }
+
+    struct timespec now = {};
+    clock_gettime(CLOCK_REALTIME, &now);
+    const long long epoch_ms = (long long)now.tv_sec * 1000LL +
+                               now.tv_nsec / 1000000LL;
+    printf("[rss] epoch_ms=%lld phase=%s csd=%ld rss_gib=%.3f "
+           "hwm_gib=%.3f available_gib=%.3f\n",
+           epoch_ms, phase ? phase : "unknown", csd,
+           rss_kib / 1048576.0, hwm_kib / 1048576.0,
+           available_kib / 1048576.0);
+    fflush(stdout);
+}
 
 
 // this is used only for basis consistency check

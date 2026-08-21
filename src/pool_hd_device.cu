@@ -412,6 +412,7 @@ int _gpu_numa_host_alloc(void **ptr, size_t alignment, size_t nbytes) {
 void _start_ck_allocator() {
     if (!ck_allocator_started.fetch_or(1, std::memory_order_acq_rel)) {
         chunk_allocator._ck_allocator_start();
+        report_host_memory("allocator_ready");
     }
 }
 

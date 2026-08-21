@@ -528,21 +528,6 @@ int _get_real_context(int *ind_l, int *ind_r, uint64_t &hash) {
     return 0;
 }
 
-void _print_memory_usage() {
-    char statm_path[64];
-    sprintf(statm_path, "/proc/%d/statm", getpid());
-    FILE* fp = fopen(statm_path, "r");
-    if (fp) {
-        long virt, res, shr;
-        if (fscanf(fp, "%ld %ld %ld", &virt, &res, &shr) == 3) {
-            // Convert pages to MB (4KB pages)
-            printf("Memory Usage - VIRT: %.2f GB, RES: %.2f GB, SHR: %.2f GB\n",
-                   virt * 4. / 1024. / 1024., res * 4. / 1024. / 1024., shr * 4. / 1024. / 1024.);
-        }
-        fclose(fp);
-    }
-}
-
 int task_config_t::run() {
     const char *dir_list[] = {".bucket", ".sol", ".uid", ".pool"};
 
@@ -638,9 +623,12 @@ int task_config_t::_run_final_sieve() {
     }
 
     pool.check(3);
+    report_host_memory("pool_ready", pool.CSD);
 
     for (;;) {
+        report_host_memory("sieve_start", pool.CSD);
         int ret = _sieve(&pool);
+        report_host_memory("sieve_end", pool.CSD);
         if (ret == 1) {
             break;
         }
@@ -677,9 +665,12 @@ int task_config_t::_run_final_sieve() {
         }
         if (pool.CSD < target_sieving_dim) {
             if (pool.extend_left()) return -1;
+            report_host_memory("extend_done", pool.CSD);
         }
         else break;
     }
+
+    report_host_memory("solve_done", pool.CSD);
 
     return 0;
 }
