@@ -2,7 +2,7 @@
 #SBATCH --job-name=svp164-s0-bkz70
 #SBATCH --partition=gr20100g
 #SBATCH --rsc=g=4
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/LARGE0/gr20116/%u/BGJ-Sieve-GPU/logs/svp163-164/slurm-%x-%j.out
 
 set -euo pipefail
@@ -27,7 +27,7 @@ export SVP_SIEVE_SEED=0
 export POOL_HOST_VEC_MAX_DIM=145
 export TARGET_SIEVING_DIM=145
 export MIN_LIFTING_DIM=120
-export SVP_TIMEOUT_SECONDS=42930
+export SVP_TIMEOUT_SECONDS=86130
 export APPTAINERENV_HD_BUCKET_THREADS=20
 export APPTAINERENV_HD_GPU_NATIVE_BWC=1
 export APPTAINERENV_HD_GPU_NATIVE_BWC_P2P=1
