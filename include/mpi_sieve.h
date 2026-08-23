@@ -36,6 +36,7 @@ int mpi_sieve_flush_candidates(int csd, swc_manager_t *swc,
 int mpi_sieve_global_stuck(uint64_t checked, uint64_t not_inserted, int csd);
 int mpi_sieve_partition_pool(Pool_hd_t *pool, long target_global_size);
 int mpi_sieve_redistribute_pool(Pool_hd_t *pool);
+int mpi_sieve_prepare_working_pool(Pool_hd_t *pool);
 int mpi_sieve_checkpoint(Pool_hd_t *pool);
 void mpi_sieve_report_dimension(Pool_hd_t *pool, const char *phase);
 

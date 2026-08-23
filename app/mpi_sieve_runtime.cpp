@@ -436,22 +436,40 @@ int mpi_sieve_redistribute_pool(Pool_hd_t *pool) {
     return 0;
 }
 
-int mpi_sieve_checkpoint(Pool_hd_t *pool) {
+int mpi_sieve_prepare_working_pool(Pool_hd_t *pool) {
     namespace fs = std::filesystem;
-    const std::string generation = ".checkpoint-" + std::to_string(pool->CSD);
-    fs::create_directories(fs::path(generation) / "pool" / "0");
-    fs::create_directories(fs::path(generation) / "pool" / "1");
-    const std::string pool_dir = generation.substr(1) + "/pool";
-    if (pool->pwc_manager->set_dirname(pool_dir.c_str())) return -1;
-    // Changing the backing directory does not make clean cache entries dirty.
-    // Explicitly enqueue every chunk so the new generation is self-contained
-    // rather than depending on files from the preceding generation.
+    const fs::path work = ".mpi-active-pool";
+    std::error_code ec;
+    fs::remove_all(work, ec);
+    if (ec) return -1;
+    fs::create_directories(work / "0", ec);
+    if (ec) return -1;
+    fs::create_directories(work / "1", ec);
+    if (ec || pool->pwc_manager->set_dirname("mpi-active-pool")) return -1;
+    // set_dirname changes the backing path but clean cache entries are not
+    // automatically rewritten.  Materialize a complete mutable working copy.
     for (long cid = 0; cid < pool->pwc_manager->num_chunks(); ++cid) {
         chunk_t *chunk = pool->pwc_manager->fetch(cid);
         if (!chunk) return -1;
         pool->pwc_manager->release_sync(cid);
     }
+    return pool->store(true);
+}
+
+int mpi_sieve_checkpoint(Pool_hd_t *pool) {
+    namespace fs = std::filesystem;
+    const std::string generation = ".checkpoint-" + std::to_string(pool->CSD);
     if (pool->store(true)) return -1;
+    std::error_code ec;
+    fs::remove_all(generation, ec);
+    if (ec) return -1;
+    fs::create_directories(generation, ec);
+    if (ec) return -1;
+    // Publish by renaming the fully flushed working tree.  The generation is
+    // never used as the live cache, so later extend/sieve writes cannot mutate
+    // an allegedly completed checkpoint.
+    fs::rename(".mpi-active-pool", fs::path(generation) / "pool", ec);
+    if (ec) return -1;
     const uint64_t local_count = pool->pwc_manager->num_vec();
     const uint64_t global_count = mpi_sieve_global_u64(local_count);
     std::string tmp = g_checkpoint_root + "/rank" + std::to_string(g_rank) + ".json.tmp";
@@ -470,7 +488,7 @@ int mpi_sieve_checkpoint(Pool_hd_t *pool) {
     // Publish the rank-local pool only after its data and manifest are durable.
     // LATEST remains unchanged until both ranks have reached this point.
     {
-        std::error_code ec;
+        ec.clear();
         fs::remove(".pool.next", ec);
         fs::create_directory_symlink(fs::path(generation) / "pool", ".pool.next", ec);
         if (ec) return -1;
@@ -496,13 +514,22 @@ int mpi_sieve_checkpoint(Pool_hd_t *pool) {
         const std::string name = entry.path().filename().string();
         if (entry.is_directory() && name.rfind(".checkpoint-", 0) == 0 &&
             name != generation) {
-            std::error_code ec;
+            ec.clear();
             fs::remove_all(entry.path(), ec);
             if (ec) fprintf(stderr, "[MPI rank %d] warning: cannot prune %s: %s\n",
                             g_rank, name.c_str(), ec.message().c_str());
         }
     }
-    return 0;
+    // Recreate the live tree from the immutable generation at the filesystem
+    // level.  This also covers chunks evicted from RAM: after the rename their
+    // old manager path no longer exists, so fetching them to rewrite would be
+    // unsafe.
+    fs::remove_all(".mpi-active-pool", ec);
+    if (ec) return -1;
+    fs::copy(fs::path(generation) / "pool", ".mpi-active-pool",
+             fs::copy_options::recursive, ec);
+    if (ec) return -1;
+    return pool->pwc_manager->set_dirname("mpi-active-pool");
 }
 
 void mpi_sieve_report_dimension(Pool_hd_t *pool, const char *phase) {

@@ -30,5 +30,6 @@ BGJ_WEAK int mpi_sieve_global_stuck(uint64_t checked, uint64_t not_inserted, int
 }
 BGJ_WEAK int mpi_sieve_partition_pool(Pool_hd_t *, long) { return 0; }
 BGJ_WEAK int mpi_sieve_redistribute_pool(Pool_hd_t *) { return 0; }
+BGJ_WEAK int mpi_sieve_prepare_working_pool(Pool_hd_t *) { return 0; }
 BGJ_WEAK int mpi_sieve_checkpoint(Pool_hd_t *) { return 0; }
 BGJ_WEAK void mpi_sieve_report_dimension(Pool_hd_t *, const char *) {}

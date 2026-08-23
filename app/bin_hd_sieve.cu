@@ -627,6 +627,7 @@ int task_config_t::_run_final_sieve() {
     }
 
     pool.check(3);
+    if (mpi_sieve_prepare_working_pool(&pool)) return -1;
     mpi_sieve_report_dimension(&pool, "pool_ready");
     report_host_memory("pool_ready", pool.CSD);
 
