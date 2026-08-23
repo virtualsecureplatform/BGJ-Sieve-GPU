@@ -17,13 +17,12 @@ libllib.a: $(OBJ) $(CUOBJ)
 	ar rcs libllib.a $(OBJ) $(CUOBJ)
 
 %.o: %.cpp $(HEADER)
-	$(CXX) $(CFLAGS) $< $(INC_DIR) -c
+	$(CXX) $(CFLAGS) $(CPPFLAGS) $< $(INC_DIR) -c
 
 %.o: %.cu $(HEADER)
-	$(NVCC) -ccbin $(CXX) $(NVCCFLAGS) $< $(INC_DIR) -c
+	$(NVCC) -ccbin $(CXX) $(NVCCFLAGS) $(CPPFLAGS) $< $(INC_DIR) -c
 
 .PHONY: clean
 
 clean:
 	-rm -f $(OBJ) $(CUOBJ) libllib.a
-

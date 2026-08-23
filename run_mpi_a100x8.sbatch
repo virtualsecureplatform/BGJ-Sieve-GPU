@@ -11,6 +11,7 @@ set -euo pipefail
 : "${BASIS:?export BASIS=/absolute/path/to/preprocessed-basis}"
 TSD="${TSD:-149}"
 MLD="${MLD:-120}"
+POOL_HOST_VEC_MAX_DIM="${POOL_HOST_VEC_MAX_DIM:-${TSD}}"
 MPI_FRAME_MIB="${MPI_FRAME_MIB:-256}"
 RESUME="${RESUME:-auto}"
 SOURCE="${SLURM_SUBMIT_DIR}"
@@ -21,6 +22,13 @@ LOG_ROOT="/LARGE0/gr20116/${USER}/BGJ-Sieve-GPU/logs/mpi"
 
 mkdir -p "${BUILD_ROOT}" "${RUN_ROOT}" "${LOG_ROOT}"
 
+if [[ ! "${POOL_HOST_VEC_MAX_DIM}" =~ ^[0-9]+$ ]] ||
+   (( POOL_HOST_VEC_MAX_DIM < TSD || POOL_HOST_VEC_MAX_DIM > 176 )); then
+    echo "POOL_HOST_VEC_MAX_DIM must be an integer in [TSD, 176]" >&2
+    exit 2
+fi
+BUILD_CPPFLAGS="-DPOOL_HOST_VEC_MAX_DIM=${POOL_HOST_VEC_MAX_DIM}"
+
 # Use the container's CUDA/NTL toolchain but the cluster MPI headers and
 # libraries. No second MPI implementation is installed in the image.
 MPI_CPPFLAGS="$(mpicxx --showme:compile)"
@@ -28,7 +36,7 @@ MPI_LIBDIR="$(mpicxx --showme:link | tr ' ' '\n' | sed -n 's/^-L//p' | head -1)"
 apptainer exec --nv \
     --bind /opt/system,"${SOURCE}","${BUILD_ROOT}" \
     "${SIF}" bash -lc \
-    "make -C '${SOURCE}/src' -j 16 && make -C '${SOURCE}/app' -j 4 hd_sieve_mpi MPI_CPPFLAGS='${MPI_CPPFLAGS}' MPI_LIBDIR='${MPI_LIBDIR}' && cp '${SOURCE}/app/hd_sieve_mpi' '${BUILD_ROOT}/'"
+    "make -B -C '${SOURCE}/src' -j 16 CPPFLAGS='${BUILD_CPPFLAGS}' && make -B -C '${SOURCE}/app' -j 4 hd_sieve_mpi CPPFLAGS='${BUILD_CPPFLAGS}' MPI_CPPFLAGS='${MPI_CPPFLAGS}' MPI_LIBDIR='${MPI_LIBDIR}' && cp '${SOURCE}/app/hd_sieve_mpi' '${BUILD_ROOT}/'"
 
 : "${UCX_LOG_LEVEL:=warn}"
 export UCX_LOG_LEVEL
@@ -46,7 +54,7 @@ export APPTAINERENV_LD_LIBRARY_PATH="${MPI_LIBDIR}:/opt/system/app/nvhpc/23.9/Li
 export HD_PWC_NO_GROW=1
 export HD_LAZY_SYNC=1
 
-echo "job=${SLURM_JOB_ID} nodes=${SLURM_JOB_NODELIST} basis=${BASIS} TSD=${TSD} MLD=${MLD}"
+echo "job=${SLURM_JOB_ID} nodes=${SLURM_JOB_NODELIST} basis=${BASIS} TSD=${TSD} MLD=${MLD} host_vec_max=${POOL_HOST_VEC_MAX_DIM}"
 set +e
 srun --mpi=pmix_v2 --nodes=2 --ntasks=2 --ntasks-per-node=1 \
     apptainer exec --nv \

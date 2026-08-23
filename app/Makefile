@@ -16,7 +16,7 @@ MPI_LDFLAGS ?= -L$(MPI_LIBDIR) -lmpi -Xlinker -rpath -Xlinker $(MPI_LIBDIR)
 
 hd_sieve_mpi: bin_hd_sieve_mpi.cu mpi_sieve_runtime.cpp ../src/libllib.a
 	$(NVCC) -ccbin $(CXX) -Xcompiler "$(CFLAGS)" -O3 \
-		bin_hd_sieve_mpi.cu mpi_sieve_runtime.cpp $(INC_DIR) $(MPI_CPPFLAGS) \
+		bin_hd_sieve_mpi.cu mpi_sieve_runtime.cpp $(INC_DIR) $(CPPFLAGS) $(MPI_CPPFLAGS) \
 		$(LIBS) $(MPI_LDFLAGS) $(SURP) -lcudart -lnuma -o $@
 
 .PHONY: clean
@@ -25,4 +25,4 @@ clean:
 	-rm -f $(CUBIN)
 
 %: bin_%.cu ../src/libllib.a
-	$(NVCC) -ccbin $(CXX) -Xcompiler "$(CFLAGS)" -O3 $< $(INC_DIR) $(LIBS) $(SURP) -lcudart -lnuma -o $*
+	$(NVCC) -ccbin $(CXX) -Xcompiler "$(CFLAGS)" -O3 $< $(INC_DIR) $(CPPFLAGS) $(LIBS) $(SURP) -lcudart -lnuma -o $*
