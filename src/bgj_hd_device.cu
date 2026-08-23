@@ -4,6 +4,7 @@
 #include "../include/bgj_hd.h"
 #include "../include/pool_hd_device.h"
 #include "../include/bgj_hd_device.h"
+#include "../include/mpi_sieve.h"
 #include <strings.h>
 
 #if ENABLE_PROFILING
@@ -1375,10 +1376,12 @@ int buc_buffer_holder_t::center_prep(int batch0, int &first_batch) {
         first_batch = 0;
         int64_t total_num = 0;
         uint32_t *score_stat = bucketer->_pool->score_stat;
-        for (int i = 1; i < 65536; i++) total_num += score_stat[i];
+        uint64_t global_stat[65536];
+        mpi_sieve_global_score_stat(score_stat, global_stat, 65536);
+        for (int i = 1; i < 65536; i++) total_num += global_stat[i];
         total_num *= traits::l0_center_precentile;
         int goal_score = 1;
-        while (total_num > 0) total_num -= score_stat[goal_score++];
+        while (total_num > 0) total_num -= global_stat[goal_score++];
         center_norm = goal_score * 2;
     } else {
         center_norm = bucketer->_reducer->center_norm;
@@ -1390,8 +1393,10 @@ int buc_buffer_holder_t::center_prep(int batch0, int &first_batch) {
     CHECK_CUDA_ERR(cudaStreamSynchronize(0));
     CHECK_CUDA_ERR(cudaMemcpy(h_center16, d_center16[0], batch0 * CSD16, cudaMemcpyDeviceToHost));
 
+    if (mpi_sieve_sync_centers(h_center16, (size_t)batch0 * CSD16)) return -1;
+
     /// copy centers to devices
-    for (int i = 1; i < num_devices; i++) {
+    for (int i = mpi_sieve_active() ? 0 : 1; i < num_devices; i++) {
         CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[i]));
         CHECK_CUDA_ERR(cudaMemcpy(d_center16[i], h_center16, batch0 * CSD16, cudaMemcpyHostToDevice));
     }
@@ -1780,6 +1785,7 @@ buc_iterator_t::buc_iterator_t(Bucketer_t *bucketer) {
     this->swc = bucketer->_swc;
 
     long nvecs_limit     = pow(4./3., bucketer->_pool->CSD * .5) * bucketer->_size_ratio;
+    if (mpi_sieve_active()) nvecs_limit /= mpi_sieve_world();
     num_chunk_limit      = (nvecs_limit + Pool_hd_t::chunk_max_nvecs - 1) / Pool_hd_t::chunk_max_nvecs;
     last_chunk_limit     = nvecs_limit % Pool_hd_t::chunk_max_nvecs;
     last_insert_chunk_id = 0;
@@ -2204,6 +2210,7 @@ int Bucketer_t::run() {
 
         int batch0 = traits::l0_max_batch0_under(_num_buc_slimit - _bwc->num_ready());
         if (batch0 > _max_batch0) batch0 = _max_batch0;
+        batch0 = mpi_sieve_min_int(batch0);
 
         #if ENABLE_PROFILING
         struct timeval batch_start;
@@ -2257,12 +2264,23 @@ int Bucketer_t::run() {
         // Run independent buckets concurrently and wake reducers as soon as
         // each one is consumable instead of presenting the entire batch at
         // once after a long GPU-idle gap.
+        if (mpi_sieve_active()) {
+            if (mpi_sieve_exchange_buckets(_bwc, _swc, _ut_checker, buc_id,
+                                           batch0, _pool->CSD))
+                flag |= flag_stuck;
+            if (mpi_sieve_global_stuck(_reducer->total_check,
+                                       _reducer->total_notin, _pool->CSD))
+                flag |= flag_stuck;
+            if (mpi_sieve_should_stop()) flag |= flag_stuck;
+            for (int i = 0; i < batch0; ++i) _signal_new_buc_ready();
+        }
+
         const char *finalize_env = getenv("HD_BWC_FINALIZE_THREADS");
         int finalize_threads = finalize_env ? atoi(finalize_env) : 2 * hw::gpu_num;
         if (finalize_threads < 1) finalize_threads = 1;
         if (finalize_threads > _num_threads) finalize_threads = _num_threads;
         if (finalize_threads > batch0) finalize_threads = batch0;
-        for (int tid = 0; tid < finalize_threads; tid++) {
+        for (int tid = 0; tid < finalize_threads && !mpi_sieve_active(); tid++) {
             _buc_pool[tid]->push([this, tid, batch0, finalize_threads] {
                 for (int i = tid; i < batch0; i += finalize_threads) {
                     _bwc->bucket_finalize(buc_id[i]);
@@ -2270,7 +2288,7 @@ int Bucketer_t::run() {
                 }
             });
         }
-        for (int tid = 0; tid < finalize_threads; tid++)
+        for (int tid = 0; tid < finalize_threads && !mpi_sieve_active(); tid++)
             _buc_pool[tid]->wait_sleep();
 
         if (_sieve_is_over() || (flag & flag_stuck)) {
@@ -2626,19 +2644,21 @@ int Bucketer_t::_batch(int tid, int replace_th, int batch0) {
 }
 
 int Bucketer_t::_update_goal() {
-    int64_t goal_num = _pwc->num_vec() * _improve_ratio;
+    uint64_t global_stat[65536];
+    mpi_sieve_global_score_stat(_pool->score_stat, global_stat, 65536);
+    int64_t goal_num = mpi_sieve_global_u64(_pwc->num_vec()) * _improve_ratio;
     int64_t center_num = goal_num / _improve_ratio * traits::l0_center_precentile;
 
     int32_t goal_score = 1;
     for (int64_t curr_num = 0;;) {
-        curr_num += _pool->score_stat[goal_score++];
+        curr_num += global_stat[goal_score++];
         if (curr_num >= goal_num || goal_score == 65535 - 1) break;
     }
     int32_t goal_norm = goal_score * 2 * (_pool->ESD ? 1.12 : 1.003);
 
     int32_t center_score = 1;
     for (int64_t curr_num = 0;;) {
-        curr_num += _pool->score_stat[center_score++];
+        curr_num += global_stat[center_score++];
         if (curr_num >= center_num || center_score == 65535 -1) break;
     }
     int32_t center_norm = center_score * 2 * (_pool->ESD ? 1.12 : 1.003);
@@ -2654,8 +2674,10 @@ int Bucketer_t::_sieve_is_over() {
     int64_t goal_num = pow(_saturation_radius, _pool->CSD * .5) * .5 * _saturation_ratio;
     int32_t goal_score = round(_pool->gh2_scaled() * .25 * _saturation_radius);
 
+    uint64_t global_stat[65536];
+    mpi_sieve_global_score_stat(_pool->score_stat, global_stat, 65536);
     for (int i = goal_score; i > 0; i--) {
-        goal_num -= _pool->score_stat[i];
+        goal_num -= global_stat[i];
         if (goal_num <= 0) return 1;
     }
 
@@ -4735,7 +4757,9 @@ int Reducer_t::auto_bgj_params_set(int bgj) {
     double exp_chunk_nbytes = (14. + _pool->CSD) * Pool_hd_t::chunk_max_nvecs;
 
     this->_num_sol_chunks_slimit = floor(_ssd_slimit / exp_chunk_nbytes);
-    long _max_sol_chunks = ceil(_bucketer->_size_ratio * pow(4./3., _pool->CSD * .5) / Pool_hd_t::chunk_max_nvecs);
+    long _max_sol_chunks = ceil(_bucketer->_size_ratio * pow(4./3., _pool->CSD * .5) /
+                                Pool_hd_t::chunk_max_nvecs /
+                                (mpi_sieve_active() ? mpi_sieve_world() : 1));
     if (_pool->pwc_manager->num_chunks() > _max_sol_chunks) _max_sol_chunks = _pool->pwc_manager->num_chunks();
     if (_num_sol_chunks_slimit > _max_sol_chunks + 1000) _num_sol_chunks_slimit = _max_sol_chunks + 1000;
 
@@ -4971,6 +4995,11 @@ int Reducer_t::run() {
     }
 
     lg_dbg("reduce done, waiting for ut checker");
+
+    // All local buckets have completed, so no producer can add to the remote
+    // candidate queue while the two ranks perform the final ownership route.
+    if (mpi_sieve_flush_candidates(_pool->CSD, _swc, _ut_checker))
+        ret = -1;
 
     _ut_checker->input_done();
 
@@ -5251,7 +5280,8 @@ int Reducer_t::_reduce(int tid) {
         _signal_bucket_done();
 
         pthread_spin_lock(&stuck_stat_lock);
-        int need_signal_stuck = traits::sieving_stuck(total_check, total_notin, _pool->CSD);            
+        int need_signal_stuck = !mpi_sieve_active() &&
+            traits::sieving_stuck(total_check, total_notin, _pool->CSD);
         pthread_spin_unlock(&stuck_stat_lock);
         if (need_signal_stuck) _signal_red_stuck();
     }
@@ -5285,6 +5315,9 @@ int Reducer_t::_red_out_2_swc(int tid, int sid) {
     if (_strategy == strategy_bgj3l || _strategy == strategy_bgj4) {
         _red_buf->bgjl_out(tid, sid, &size, &h_vec, &h_norm, &h_score, &h_u);
     }
+
+    size = mpi_sieve_filter_candidates(_pool->CSD, h_vec, h_norm, h_score,
+                                       h_u, size);
     
 
     chunk_t *dst = NULL;

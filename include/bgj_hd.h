@@ -2,6 +2,7 @@
 #define __BGJ_HD_H
 
 #include "./pool_hd.h"
+#include <vector>
 
 // CUDA-runtime shims implemented in a .cu translation unit, allowing the
 // host-only bucket manager to manage an optional device arena without making
@@ -86,6 +87,12 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
     // when the bucket is empty, delete automatically
     void read_done(chunk_t *chunk, long bucket_id);
     long bucket_num_chunks(long bucket_id);
+    // Seal a writing bucket without publishing it to reducer threads, copy its
+    // exact compact vec+norm records, and recycle it.
+    int mpi_export_bucket(long bucket_id, std::vector<uint8_t> &records,
+                          int record_size);
+    int mpi_append_bucket(long bucket_id, const uint8_t *records, long count,
+                          int record_size);
 
     // Exact ready-bucket cache in device memory.  Configuration happens after
     // the reducer strategy is known; a zero/failed allocation leaves the

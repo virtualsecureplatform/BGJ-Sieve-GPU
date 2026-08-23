@@ -2227,6 +2227,7 @@ struct load_ckpfcher_t {
         this->pwc_manager = pool->pwc_manager;
         this->exp_left = exp_left;
         pthread_spin_init(&lock, PTHREAD_PROCESS_SHARED);
+        std::fill(std::begin(pfch_id), std::end(pfch_id), -1);
 
         if (exp_left[0] >= tail_stop) {
             for (int i = 0; i < pfch_ahead; i++) {
@@ -2492,6 +2493,9 @@ int Pool_hd_t::load(long log_level) {
                     #else
                     char meta_data[12];
                     #endif
+                    // Pool discovery/recovery is a one-shot path.  Buffered I/O
+                    // is more portable here (notably through checkpoint
+                    // symlinks); the hot cache loader retains O_DIRECT.
                     int fd = open(chunk_filename, O_RDONLY);
                     if (fd == -1) {
                         if (errno != ENOENT) lg_err("open %s failed, %s, ignored", chunk_filename, strerror(errno));
@@ -2506,8 +2510,12 @@ int Pool_hd_t::load(long log_level) {
                     } while (0)
                     
                     #if ONE_TIME_IO
-                    read_bytes = read(fd, meta_data, 12 + chunk_max_nvecs * (2 + 4 + 8 + CSD));
-                    if (read_bytes < 12 + (2 + 4 + 8) * chunk_max_nvecs) FAIL_DUETO(wrong_format);
+                    // The direct-I/O layout has a full aligned metadata page,
+                    // not merely the 12 meaningful header bytes.  Asking for
+                    // the shorter, unaligned length makes O_DIRECT fail with
+                    // EINVAL and previously made every checkpoint look empty.
+                    read_bytes = read(fd, meta_data, 4096 + chunk_max_nvecs * (2 + 4 + 8 + CSD));
+                    if (read_bytes < 4096 + (2 + 4 + 8) * chunk_max_nvecs) FAIL_DUETO(wrong_format);
                     #else
                     read_bytes = read(fd, meta_data, 12);
                     if (read_bytes != 12) FAIL_DUETO(wrong_format);
@@ -2527,7 +2535,7 @@ int Pool_hd_t::load(long log_level) {
                     #undef FAIL_DUETO
 
                     #if ONE_TIME_IO
-                    read_bytes -= 12 + (2 + 4 + 8) * chunk_max_nvecs;
+                    read_bytes -= 4096 + (2 + 4 + 8) * chunk_max_nvecs;
                     #else
                     read_bytes = read(fd, dst_chunk->vec, CSD * chunk_max_nvecs);
                     #endif

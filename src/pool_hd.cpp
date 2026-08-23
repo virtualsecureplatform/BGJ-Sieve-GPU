@@ -797,7 +797,7 @@ int Pool_hd_t::shrink(long N) {
     return 0;
 }
 
-int Pool_hd_t::store() {
+int Pool_hd_t::store(bool force) {
     // HD_SYNC_EVERY=K persists the pool only on every K-th store (default 6;
     // =1 restores per-dim persistence); skipped dims leave the SSD copy
     // stale, so crash-resume rolls back up to K-1 dims of sieving
@@ -808,8 +808,99 @@ int Pool_hd_t::store() {
         sync_every = e ? atoi(e) : 6;
         if (sync_every < 1) sync_every = 1;
     }
-    if ((++num_stores % sync_every) == 0) pwc_manager->flush();
+    if (force || (++num_stores % sync_every) == 0) pwc_manager->flush();
     pwc_manager->wait_work();
+    return 0;
+}
+
+int Pool_hd_t::mpi_retain_owner(int rank, int world) {
+    if (world < 1 || rank < 0 || rank >= world) return -1;
+    uint32_t rebuilt[65536] = {};
+    const long chunks = pwc_manager->num_chunks();
+    for (long cid = 0; cid < chunks; ++cid) {
+        chunk_t *chunk = pwc_manager->fetch(cid);
+        if (!chunk) continue;
+        int out = 0;
+        const int old_size = chunk->size;
+        for (int i = 0; i < old_size; ++i) {
+            const uint64_t owner = uid_table->normalize(chunk->u[i]) % world;
+            if ((int)owner != rank) {
+                uid_table->erase(chunk->u[i]);
+                continue;
+            }
+            if (out != i) {
+                chunk->u[out] = chunk->u[i];
+                chunk->norm[out] = chunk->norm[i];
+                chunk->score[out] = chunk->score[i];
+                memcpy(chunk->vec + (long)CSD * out,
+                       chunk->vec + (long)CSD * i, CSD);
+            }
+            rebuilt[chunk->score[out]]++;
+            ++out;
+        }
+        if (out < old_size) {
+            memset(chunk->u + out, 0, sizeof(uint64_t) * (old_size - out));
+            memset(chunk->norm + out, 0, sizeof(int32_t) * (old_size - out));
+            memset(chunk->score + out, 0, sizeof(uint16_t) * (old_size - out));
+            chunk->size = out;
+            pwc_manager->release_sync(cid);
+        } else {
+            pwc_manager->release(cid);
+        }
+    }
+    memcpy(score_stat, rebuilt, sizeof(score_stat));
+    return 0;
+}
+
+int Pool_hd_t::mpi_append_records(const uint8_t *records, long count,
+                                  int record_size) {
+    const int expected = CSD + 14;
+    if (!records || count < 0 || record_size != expected) return -1;
+    long pos = 0;
+    while (pos < count) {
+        bool created = false;
+        long cid;
+        if (_mpi_append_hint < pwc_manager->num_chunks()) {
+            cid = _mpi_append_hint;
+        } else {
+            cid = pwc_manager->create_chunk();
+            created = true;
+        }
+        chunk_t *chunk = pwc_manager->fetch(cid);
+        if (!chunk) return -1;
+        if (created) {
+            chunk->size = 0;
+            memset(chunk->u, 0, sizeof(uint64_t) * chunk_max_nvecs);
+            memset(chunk->norm, 0, sizeof(int32_t) * chunk_max_nvecs);
+            memset(chunk->score, 0, sizeof(uint16_t) * chunk_max_nvecs);
+        }
+        if (chunk->size == chunk_max_nvecs) {
+            pwc_manager->release(cid);
+            ++_mpi_append_hint;
+            continue;
+        }
+        while (pos < count && chunk->size < chunk_max_nvecs) {
+            const uint8_t *src = records + pos * (long)record_size;
+            uint64_t uid;
+            int32_t norm;
+            uint16_t score;
+            memcpy(&uid, src, sizeof(uid));
+            memcpy(&norm, src + 8, sizeof(norm));
+            memcpy(&score, src + 12, sizeof(score));
+            if (uid_table->insert(uid)) {
+                const int dst = chunk->size++;
+                chunk->u[dst] = uid;
+                chunk->norm[dst] = norm;
+                chunk->score[dst] = score;
+                memcpy(chunk->vec + (long)CSD * dst, src + 14, CSD);
+                score_stat[score]++;
+            }
+            ++pos;
+        }
+        const bool full = chunk->size == chunk_max_nvecs;
+        pwc_manager->release_sync(cid);
+        if (full) ++_mpi_append_hint;
+    }
     return 0;
 }
 

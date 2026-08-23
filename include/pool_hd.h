@@ -440,7 +440,11 @@ struct Pool_hd_t {
     /// @brief show the minimal lift to index
     int show_min_lift(long index);
     /// @brief sync current pool to disk
-    int store();
+    int store(bool force = false);
+    // MPI helpers operate only at quiescent sieve/dimension boundaries.
+    int mpi_retain_owner(int rank, int world);
+    void mpi_reset_append_hint() { _mpi_append_hint = 0; }
+    int mpi_append_records(const uint8_t *records, long count, int record_size);
     /// @brief try to recover the pool from disk
     int load(long log_level = 0);
     /// @brief check for dimension lose
@@ -469,6 +473,7 @@ struct Pool_hd_t {
     int down_sieve_flag = 0;
     
     private:
+    long _mpi_append_hint = 0;
     long _num_threads;
 
     // local basis information

@@ -1,4 +1,5 @@
 #include "../include/bgj_hd.h"
+#include "../include/mpi_sieve.h"
 
 #include <sys/time.h>
 #include <unistd.h>
@@ -148,7 +149,7 @@ template <class logger_t> void bwc_manager_tmpl<logger_t>::configure_gpu_native_
     _gpu_native_max_chunks = 0;
 
     const char *env = getenv("HD_GPU_NATIVE_BWC");
-    const bool requested = enable && env && atol(env) != 0;
+    const bool requested = enable && env && atol(env) != 0 && !mpi_sieve_active();
     const char *int4_env = getenv("HD_INT4_BUCKETS");
     if (!requested || !_hbm_enabled || max_bucket_nvecs <= 0) return;
     if (int4_env && atol(int4_env) != 0) {
@@ -1064,6 +1065,88 @@ template <class logger_t> long bwc_manager_tmpl<logger_t>::bucket_num_chunks(lon
         _bucket[bucket_id].num_chunks;
     pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
     return ret;
+}
+
+template <class logger_t> int bwc_manager_tmpl<logger_t>::mpi_export_bucket(
+        long bucket_id, std::vector<uint8_t> &records, int record_size) {
+    if (bucket_id < 0 || bucket_id >= _num_buckets ||
+        record_size != (int)(sizeof(int32_t) + this->_pool->CSD)) return -1;
+    l0_bucket_t &bucket = _bucket[bucket_id];
+    if (bucket.status & l0_bucket_t::_bk_gpu_write) {
+        fprintf(stderr, "[MPI] GPU-native BWC must be disabled for remote buckets\n");
+        return -1;
+    }
+    if (!(bucket.status & l0_bucket_t::_bk_writing)) return -1;
+
+    // Close the last partial chunk exactly as bucket_finalize(), but mark the
+    // bucket reading without putting it on the reducer-visible ready list.
+    for (;;) {
+        if (bucket.writing_chunk == (chunk_t *)-1) continue;
+        pthread_spin_lock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+        chunk_t *last = bucket.writing_chunk;
+        if (last == (chunk_t *)-1) {
+            pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+            continue;
+        }
+        bucket.writing_chunk = (chunk_t *)-1;
+        pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+        if (last) {
+            if (last->size) release_sync(last->id);
+            else {
+                pthread_spin_lock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+                if (bucket.num_chunks &&
+                    bucket.chunk_ids[bucket.num_chunks - 1] == last->id)
+                    --bucket.num_chunks;
+                pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+                release_del(last->id);
+            }
+        }
+        break;
+    }
+    pthread_spin_lock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+    bucket.status = l0_bucket_t::_bk_reading;
+    pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+    __prefetch_for_reading(bucket_id);
+
+    for (;;) {
+        chunk_t *chunk = fetch_for_read(bucket_id);
+        if (!chunk) break;
+        const std::size_t old = records.size();
+        records.resize(old + (std::size_t)chunk->size * record_size);
+        uint8_t *dst = records.data() + old;
+        for (int i = 0; i < chunk->size; ++i) {
+            memcpy(dst, chunk->norm + i, sizeof(int32_t));
+            memcpy(dst + sizeof(int32_t),
+                   chunk->vec + (long)this->_pool->CSD * i, this->_pool->CSD);
+            dst += record_size;
+        }
+        read_done(chunk, bucket_id);
+    }
+    bucket_finalize(bucket_id);
+    return 0;
+}
+
+template <class logger_t> int bwc_manager_tmpl<logger_t>::mpi_append_bucket(
+        long bucket_id, const uint8_t *records, long count, int record_size) {
+    if (!records || count < 0 ||
+        record_size != (int)(sizeof(int32_t) + this->_pool->CSD))
+        return -1;
+    long pos = 0;
+    while (pos < count) {
+        chunk_t *dst = fetch_for_write(bucket_id);
+        if (!dst) return -1;
+        const int n = std::min<long>(count - pos, Pool_hd_t::chunk_max_nvecs - dst->size);
+        for (int i = 0; i < n; ++i) {
+            const uint8_t *src = records + (pos + i) * (long)record_size;
+            memcpy(dst->norm + dst->size + i, src, sizeof(int32_t));
+            memcpy(dst->vec + (long)this->_pool->CSD * (dst->size + i),
+                   src + sizeof(int32_t), this->_pool->CSD);
+        }
+        dst->size += n;
+        pos += n;
+        write_done(dst, bucket_id);
+    }
+    return 0;
 }
 
 template <class logger_t> swc_manager_tmpl<logger_t>::swc_manager_tmpl(Pool_hd_t *p) : 

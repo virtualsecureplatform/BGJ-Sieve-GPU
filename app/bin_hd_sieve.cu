@@ -6,6 +6,7 @@
 
 #include "../include/pool_hd.h"
 #include "../include/pool_hd_device.h"
+#include "../include/mpi_sieve.h"
 
 static long configured_pool_threads() {
     static long threads = 0;
@@ -126,14 +127,15 @@ int main(int argc, char** argv) {
     printf("\n");
 
     task_config_t task;
+    int rc = -1;
     if (task.parse_args(argc, argv) == 0) {
-        task.run();
+        rc = task.run();
     }
     
     _destroy_pool_hd_device_buffers();
     _destory_ck_allocator();
 
-    return 0;
+    return rc ? 1 : 0;
 }
 
 
@@ -615,7 +617,9 @@ int task_config_t::_run_final_sieve() {
     pool.set_num_threads(configured_pool_threads());
 
     if (need_sample) {
-        pool.sampling(3.2 * pow(4./3., pool.CSD * .5) - 5);
+        const long target_pool_size = 3.2 * pow(4./3., pool.CSD * .5) - 5;
+        pool.sampling(target_pool_size);
+        if (mpi_sieve_partition_pool(&pool, target_pool_size)) return -1;
     } else {
         if (real_hash) pool.basis_hash = real_hash;
         pool.pwc_manager->set_pool(&pool);
@@ -623,12 +627,30 @@ int task_config_t::_run_final_sieve() {
     }
 
     pool.check(3);
+    mpi_sieve_report_dimension(&pool, "pool_ready");
     report_host_memory("pool_ready", pool.CSD);
+
+    // LATEST denotes a fully completed CSD.  Continue at the next dimension
+    // instead of repeating the expensive sieve that produced the checkpoint.
+    if (mpi_sieve_resumed_csd() >= 0) {
+        if (mpi_sieve_resumed_csd() != pool.CSD) {
+            printf("[Error] MPI checkpoint says completed CSD %d, loaded pool has CSD %ld\n",
+                   mpi_sieve_resumed_csd(), pool.CSD);
+            return -1;
+        }
+        if (pool.CSD >= target_sieving_dim) return 0;
+        if (pool.extend_left()) return -1;
+        if (mpi_sieve_redistribute_pool(&pool)) return -1;
+        report_host_memory("resume_extend_done", pool.CSD);
+    }
 
     for (;;) {
         report_host_memory("sieve_start", pool.CSD);
         int ret = _sieve(&pool);
         report_host_memory("sieve_end", pool.CSD);
+        if (mpi_sieve_should_stop()) {
+            return -1;
+        }
         if (ret == 1) {
             break;
         }
@@ -640,6 +662,7 @@ int task_config_t::_run_final_sieve() {
             }
         }
         if (pool.CSD >= min_lifting_dim) pool.show_min_lift(pool.index_l <= 40 ? 0 : pool.index_l - 40);
+        if (mpi_sieve_checkpoint(&pool)) return -1;
         // HD_MEASURE_UT: report UidTable footprint vs pool size (item-3 payoff sizing)
         if (getenv("HD_MEASURE_UT")) {
             long nv = pool.pwc_manager->num_vec();
@@ -665,6 +688,7 @@ int task_config_t::_run_final_sieve() {
         }
         if (pool.CSD < target_sieving_dim) {
             if (pool.extend_left()) return -1;
+            if (mpi_sieve_redistribute_pool(&pool)) return -1;
             report_host_memory("extend_done", pool.CSD);
         }
         else break;

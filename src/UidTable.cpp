@@ -1,4 +1,5 @@
 #include "../include/UidTable.h"
+#include "../include/mpi_sieve.h"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -230,6 +231,7 @@ int UidTable::load_table(long table_id) {
 
 int UidTable::reset_hash_function(long CSD) {
     for (long i = 0; i < CSD; i++) _coeffs[i] = sampleU();
+    if (mpi_sieve_sync_uid_coeffs(_coeffs, CSD)) return -1;
     
     #pragma omp parallel for num_threads(_num_threads)
     for (long i = 0; i < ut_split; i++) {
