@@ -408,10 +408,13 @@ int mpi_sieve_redistribute_pool(Pool_hd_t *pool) {
                     }
                 }
                 chunk->size = out;
-                if (out < old_size) {
-                    memset(chunk->u + out, 0, sizeof(uint64_t) * (old_size - out));
-                    memset(chunk->norm + out, 0, sizeof(int32_t) * (old_size - out));
-                    memset(chunk->score + out, 0, sizeof(uint16_t) * (old_size - out));
+                if (out < Pool_hd_t::chunk_max_nvecs) {
+                    memset(chunk->u + out, 0,
+                           sizeof(uint64_t) * (Pool_hd_t::chunk_max_nvecs - out));
+                    memset(chunk->norm + out, 0,
+                           sizeof(int32_t) * (Pool_hd_t::chunk_max_nvecs - out));
+                    memset(chunk->score + out, 0,
+                           sizeof(uint16_t) * (Pool_hd_t::chunk_max_nvecs - out));
                 }
                 pool->pwc_manager->release_sync(cid);
             }

@@ -838,10 +838,10 @@ int Pool_hd_t::mpi_retain_owner(int rank, int world) {
             rebuilt[chunk->score[out]]++;
             ++out;
         }
-        if (out < old_size) {
-            memset(chunk->u + out, 0, sizeof(uint64_t) * (old_size - out));
-            memset(chunk->norm + out, 0, sizeof(int32_t) * (old_size - out));
-            memset(chunk->score + out, 0, sizeof(uint16_t) * (old_size - out));
+        if (out < chunk_max_nvecs) {
+            memset(chunk->u + out, 0, sizeof(uint64_t) * (chunk_max_nvecs - out));
+            memset(chunk->norm + out, 0, sizeof(int32_t) * (chunk_max_nvecs - out));
+            memset(chunk->score + out, 0, sizeof(uint16_t) * (chunk_max_nvecs - out));
             chunk->size = out;
             pwc_manager->release_sync(cid);
         } else {
@@ -898,6 +898,14 @@ int Pool_hd_t::mpi_append_records(const uint8_t *records, long count,
             ++pos;
         }
         const bool full = chunk->size == chunk_max_nvecs;
+        if (!full) {
+            memset(chunk->u + chunk->size, 0,
+                   sizeof(uint64_t) * (chunk_max_nvecs - chunk->size));
+            memset(chunk->norm + chunk->size, 0,
+                   sizeof(int32_t) * (chunk_max_nvecs - chunk->size));
+            memset(chunk->score + chunk->size, 0,
+                   sizeof(uint16_t) * (chunk_max_nvecs - chunk->size));
+        }
         pwc_manager->release_sync(cid);
         if (full) ++_mpi_append_hint;
     }
