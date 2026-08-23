@@ -2,6 +2,7 @@
 #include <mpi.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -10,6 +11,22 @@
 #include <vector>
 
 namespace {
+
+struct alignas(16) routed_record_t {
+    uint64_t uid;
+    float norm;
+    uint32_t bucket;
+    int8_t coordinates[176];
+};
+
+static_assert(sizeof(routed_record_t) == 192, "routing record must stay compact");
+
+uint64_t mix_uid(uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
 
 void fail(const char *what, int rank, const char *detail) {
     std::fprintf(stderr, "rank %d: %s: %s\n", rank, what, detail);
@@ -97,6 +114,96 @@ void run_pingpong(const char *kind, void *buffer, int rank, int world_size,
     }
 }
 
+void run_shard_router(int rank, int world_size) {
+    if (world_size != 2) return;
+
+    constexpr uint64_t generated_records = 2ULL << 20;
+    const size_t allocation_bytes = generated_records * sizeof(routed_record_t);
+    routed_record_t *send_records = nullptr;
+    routed_record_t *receive_records = nullptr;
+    check_cuda(cudaMallocHost(&send_records, allocation_bytes),
+               "cudaMallocHost shard send", rank);
+    check_cuda(cudaMallocHost(&receive_records, allocation_bytes),
+               "cudaMallocHost shard receive", rank);
+
+    check_mpi(MPI_Barrier(MPI_COMM_WORLD), "shard packing barrier", rank);
+    const double pack_started = MPI_Wtime();
+    uint64_t send_count = 0;
+    for (uint64_t i = 0; i < generated_records; ++i) {
+        const uint64_t uid = mix_uid((static_cast<uint64_t>(rank) << 63) ^ i);
+        const int owner = static_cast<int>(mix_uid(uid) % world_size);
+        if (owner == rank) continue;
+        routed_record_t &record = send_records[send_count++];
+        record.uid = uid;
+        record.norm = static_cast<float>((uid >> 11) & 0xffff) / 65536.0f;
+        record.bucket = static_cast<uint32_t>(uid);
+        std::memset(record.coordinates, static_cast<int>(uid),
+                    sizeof(record.coordinates));
+    }
+    const double local_pack_seconds = MPI_Wtime() - pack_started;
+    double pack_seconds = 0.0;
+    check_mpi(MPI_Reduce(&local_pack_seconds, &pack_seconds, 1, MPI_DOUBLE,
+                         MPI_MAX, 0, MPI_COMM_WORLD), "packing reduction", rank);
+
+    uint64_t receive_count = 0;
+    const int peer = 1 - rank;
+    check_mpi(MPI_Sendrecv(&send_count, 1, MPI_UINT64_T, peer, 30,
+                           &receive_count, 1, MPI_UINT64_T, peer, 30,
+                           MPI_COMM_WORLD, MPI_STATUS_IGNORE),
+              "shard count exchange", rank);
+    if (receive_count > generated_records) {
+        fail("shard receive count", rank, "peer count exceeds allocation");
+    }
+
+    const int send_bytes = static_cast<int>(send_count * sizeof(routed_record_t));
+    const int receive_bytes = static_cast<int>(receive_count * sizeof(routed_record_t));
+    double best_network_seconds = 1.0e100;
+    for (int iteration = 0; iteration < 5; ++iteration) {
+        check_mpi(MPI_Barrier(MPI_COMM_WORLD), "shard exchange barrier", rank);
+        const double started = MPI_Wtime();
+        check_mpi(MPI_Sendrecv(send_records, send_bytes, MPI_BYTE, peer, 31,
+                               receive_records, receive_bytes, MPI_BYTE, peer, 31,
+                               MPI_COMM_WORLD, MPI_STATUS_IGNORE),
+                  "shard record exchange", rank);
+        const double local_elapsed = MPI_Wtime() - started;
+        double elapsed = 0.0;
+        check_mpi(MPI_Allreduce(&local_elapsed, &elapsed, 1, MPI_DOUBLE, MPI_MAX,
+                                MPI_COMM_WORLD), "shard timing reduction", rank);
+        best_network_seconds = std::min(best_network_seconds, elapsed);
+    }
+
+    uint64_t invalid_records = 0;
+    for (uint64_t i = 0; i < receive_count; ++i) {
+        if (static_cast<int>(mix_uid(receive_records[i].uid) % world_size) != rank) {
+            ++invalid_records;
+        }
+    }
+    uint64_t global_invalid = 0;
+    uint64_t total_send_bytes = 0;
+    const uint64_t local_send_bytes = send_count * sizeof(routed_record_t);
+    check_mpi(MPI_Reduce(&invalid_records, &global_invalid, 1, MPI_UINT64_T,
+                         MPI_SUM, 0, MPI_COMM_WORLD), "shard verification", rank);
+    check_mpi(MPI_Reduce(&local_send_bytes, &total_send_bytes, 1, MPI_UINT64_T,
+                         MPI_SUM, 0, MPI_COMM_WORLD), "shard byte reduction", rank);
+
+    if (rank == 0) {
+        const double pack_mrecords = (world_size * generated_records) /
+                                     pack_seconds / 1.0e6;
+        const double network_gbps = static_cast<double>(total_send_bytes) /
+                                    best_network_seconds / 1.0e9;
+        std::printf("shard_router,ranks=%d,record_bytes=%zu,generated_per_rank=%llu,"
+                    "routed_bytes=%llu,pack_Mrecords_s=%.3f,network_GBps=%.3f,invalid=%llu\n",
+                    world_size, sizeof(routed_record_t),
+                    static_cast<unsigned long long>(generated_records),
+                    static_cast<unsigned long long>(total_send_bytes), pack_mrecords,
+                    network_gbps, static_cast<unsigned long long>(global_invalid));
+        std::fflush(stdout);
+    }
+
+    check_cuda(cudaFreeHost(send_records), "cudaFreeHost shard send", rank);
+    check_cuda(cudaFreeHost(receive_records), "cudaFreeHost shard receive", rank);
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -162,6 +269,8 @@ int main(int argc, char **argv) {
     check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize", rank);
     run_pingpong("cuda_direct", device_buffer, rank, world_size, sizes);
     check_cuda(cudaFree(device_buffer), "cudaFree", rank);
+
+    run_shard_router(rank, world_size);
 
     MPI_Comm_free(&local_comm);
     MPI_Finalize();
