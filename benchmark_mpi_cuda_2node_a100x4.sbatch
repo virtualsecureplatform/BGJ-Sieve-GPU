@@ -28,11 +28,11 @@ export OMPI_MCA_pml=ucx
 export OMPI_MCA_osc=ucx
 
 echo "probe=one_gpu_per_node"
-mpirun --bind-to none --map-by ppr:1:node -np 2 \
+srun --mpi=pmix_v2 --nodes=2 --ntasks=2 --ntasks-per-node=1 \
     "${RESULT_ROOT}/mpi_cuda_pingpong" | tee "${RESULT_ROOT}/one-gpu-per-node.csv"
 
 echo "probe=four_gpu_pairs"
-mpirun --bind-to none --map-by ppr:4:node -np 8 \
+srun --mpi=pmix_v2 --nodes=2 --ntasks=8 --ntasks-per-node=4 \
     "${RESULT_ROOT}/mpi_cuda_pingpong" | tee "${RESULT_ROOT}/four-gpu-pairs.csv"
 
 echo "result_root=${RESULT_ROOT}"
