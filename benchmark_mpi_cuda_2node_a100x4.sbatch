@@ -1,11 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=bgj-mpi-gpu-probe
 #SBATCH --partition=gr20100g
-#SBATCH --nodes=2
-#SBATCH --ntasks-per-node=4
-#SBATCH --cpus-per-task=1
-#SBATCH --gres=gpu:4
-#SBATCH --mem=16G
+#SBATCH --rsc=g=8
 #SBATCH --time=00:20:00
 #SBATCH --output=/LARGE0/gr20116/%u/BGJ-Sieve-GPU/logs/mpi-probe/slurm-%x-%j.out
 
