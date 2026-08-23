@@ -1128,9 +1128,10 @@ template <class logger_t> int bwc_manager_tmpl<logger_t>::mpi_export_bucket(
 
 template <class logger_t> int bwc_manager_tmpl<logger_t>::mpi_append_bucket(
         long bucket_id, const uint8_t *records, long count, int record_size) {
-    if (!records || count < 0 ||
-        record_size != (int)(sizeof(int32_t) + this->_pool->CSD))
+    if (count < 0 || record_size != (int)(sizeof(int32_t) + this->_pool->CSD))
         return -1;
+    if (count == 0) return 0;
+    if (!records) return -1;
     long pos = 0;
     while (pos < count) {
         chunk_t *dst = fetch_for_write(bucket_id);

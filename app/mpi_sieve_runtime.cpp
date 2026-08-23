@@ -423,7 +423,8 @@ int mpi_sieve_redistribute_pool(Pool_hd_t *pool) {
         if (exchange_bytes(outgoing.data(), outgoing.size(), incoming,
                            tag_pool_count, tag_pool_data, pool->CSD, cid)) return -1;
         if (incoming.size() % stride ||
-            pool->mpi_append_records(incoming.data(), incoming.size() / stride, stride))
+            (!incoming.empty() &&
+             pool->mpi_append_records(incoming.data(), incoming.size() / stride, stride)))
             return -1;
     }
     const uint64_t count = mpi_sieve_global_u64(pool->pwc_manager->num_vec());

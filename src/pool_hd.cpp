@@ -855,7 +855,9 @@ int Pool_hd_t::mpi_retain_owner(int rank, int world) {
 int Pool_hd_t::mpi_append_records(const uint8_t *records, long count,
                                   int record_size) {
     const int expected = CSD + 14;
-    if (!records || count < 0 || record_size != expected) return -1;
+    if (count < 0 || record_size != expected) return -1;
+    if (count == 0) return 0;
+    if (!records) return -1;
     long pos = 0;
     while (pos < count) {
         bool created = false;
