@@ -852,6 +852,63 @@ int Pool_hd_t::mpi_retain_owner(int rank, int world) {
     return 0;
 }
 
+int Pool_hd_t::mpi_trim_exact(long target) {
+    const long current = pwc_manager->num_vec();
+    if (target < 0 || target > current) return -1;
+    uint64_t to_remove = (uint64_t)(current - target);
+    if (!to_remove) return 0;
+
+    uint64_t hist[65536] = {};
+    const long chunks = pwc_manager->num_chunks();
+    for (long cid = 0; cid < chunks; ++cid) {
+        chunk_t *chunk = pwc_manager->fetch(cid);
+        if (!chunk) return -1;
+        for (int i = 0; i < chunk->size; ++i) ++hist[chunk->score[i]];
+        pwc_manager->release(cid);
+    }
+    int cutoff = 65535;
+    uint64_t above = 0;
+    while (cutoff >= 0 && above + hist[cutoff] < to_remove)
+        above += hist[cutoff--];
+    if (cutoff < 0) return -1;
+    uint64_t remove_at_cutoff = to_remove - above;
+
+    uint32_t rebuilt[65536] = {};
+    uint64_t removed = 0;
+    for (long cid = 0; cid < chunks; ++cid) {
+        chunk_t *chunk = pwc_manager->fetch(cid);
+        if (!chunk) return -1;
+        const int old_size = chunk->size;
+        int out = 0;
+        for (int i = 0; i < old_size; ++i) {
+            const bool drop = chunk->score[i] > cutoff ||
+                (chunk->score[i] == cutoff && remove_at_cutoff > 0);
+            if (drop) {
+                if (chunk->score[i] == cutoff) --remove_at_cutoff;
+                uid_table->erase(chunk->u[i]);
+                ++removed;
+                continue;
+            }
+            if (out != i) {
+                chunk->u[out] = chunk->u[i];
+                chunk->norm[out] = chunk->norm[i];
+                chunk->score[out] = chunk->score[i];
+                memcpy(chunk->vec + (long)CSD * out,
+                       chunk->vec + (long)CSD * i, CSD);
+            }
+            ++rebuilt[chunk->score[out]];
+            ++out;
+        }
+        chunk->size = out;
+        memset(chunk->u + out, 0, sizeof(uint64_t) * (chunk_max_nvecs - out));
+        memset(chunk->norm + out, 0, sizeof(int32_t) * (chunk_max_nvecs - out));
+        memset(chunk->score + out, 0, sizeof(uint16_t) * (chunk_max_nvecs - out));
+        pwc_manager->release_sync(cid);
+    }
+    memcpy(score_stat, rebuilt, sizeof(score_stat));
+    return removed == to_remove ? 0 : -1;
+}
+
 int Pool_hd_t::mpi_append_records(const uint8_t *records, long count,
                                   int record_size) {
     const int expected = CSD + 14;

@@ -9,12 +9,81 @@
 using namespace nvcuda;
 
 #include <algorithm>    // for sort, maybe...
+#include <vector>
+#include <unordered_map>
 
 double dot_avx2(double *src1, double *src2, long n);
 void red(float *dst, float *src, float q, long n);
 void copy(float *dst, float *src, long n);
+int _cuda_device_mem_info(int device_ptr, size_t *free_nbytes,
+                          size_t *total_nbytes);
+int _cuda_device_malloc(int device_ptr, void **ptr, size_t nbytes);
 
 static std::atomic<int> ck_allocator_started{0};
+
+namespace {
+struct pwc_hbm_shard_t {
+    int8_t *base = NULL;
+    int32_t slots = 0;
+    std::vector<int32_t> free_slots;
+    std::unordered_map<long, int32_t> chunks;
+    pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+};
+
+struct pwc_hbm_cache_t {
+    std::atomic<int> initialized{0};
+    size_t slot_nbytes = 0;
+    pwc_hbm_shard_t shard[MAX_NUM_DEVICE];
+    std::atomic<uint64_t> stores{0}, loads{0}, overflows{0};
+
+    void init(long csd) {
+        if (initialized.load(std::memory_order_acquire)) return;
+        const char *min_env = getenv("HD_HBM_PWC_MIN_CSD");
+        const long min_csd = min_env ? atol(min_env) : 143;
+        const char *gb_env = getenv("HD_HBM_PWC_GB");
+        const double gib_per_gpu = gb_env ? atof(gb_env) : 0.0;
+        if (csd < min_csd || gib_per_gpu <= 0.0) return;
+        int expected = 0;
+        if (!initialized.compare_exchange_strong(expected, -1,
+                                                  std::memory_order_acq_rel)) {
+            while (initialized.load(std::memory_order_acquire) == -1) usleep(1000);
+            return;
+        }
+        slot_nbytes = Pool_hd_t::chunk_max_nvecs *
+                      (size_t)POOL_HOST_VEC_SLOT_NBYTES +
+                      (ONE_TIME_IO ? 4096ULL : 0ULL);
+        int enabled = 0;
+        for (int d = 0; d < hw::gpu_num; ++d) {
+            size_t free_nbytes = 0, total_nbytes = 0;
+            if (_cuda_device_mem_info(d, &free_nbytes, &total_nbytes)) continue;
+            size_t requested = (size_t)(gib_per_gpu * (1ULL << 30));
+            // Preserve room for the 24-GiB native bucket cache, reducer
+            // buffers, CUDA context, and growth at later dimensions.
+            const size_t reserve = 40ULL << 30;
+            if (free_nbytes <= reserve) continue;
+            if (requested > free_nbytes - reserve) requested = free_nbytes - reserve;
+            int32_t slots = (int32_t)(requested / slot_nbytes);
+            while (slots > 0 && _cuda_device_malloc(d,
+                    (void **)&shard[d].base, (size_t)slots * slot_nbytes))
+                slots /= 2;
+            if (!shard[d].base || slots <= 0) continue;
+            shard[d].slots = slots;
+            shard[d].free_slots.reserve(slots);
+            shard[d].chunks.reserve(slots * 2);
+            for (int32_t i = slots - 1; i >= 0; --i)
+                shard[d].free_slots.push_back(i);
+            ++enabled;
+            printf("[PWC-HBM] GPU %d shard %.3f GiB, %d exact chunks\n",
+                   hw::gpu_id_list[d], slots * slot_nbytes / 1073741824.0,
+                   slots);
+        }
+        initialized.store(enabled ? 1 : 2, std::memory_order_release);
+        fflush(stdout);
+    }
+};
+
+static pwc_hbm_cache_t pwc_hbm_cache;
+}
 
 namespace {
 constexpr int pool_device_buffer_cache_slots = 64;
@@ -188,7 +257,7 @@ struct chunk_arena_t {
     // pinned allocation.  Failure is lossless and leaves the old capacity.
     long grow(long num_chunks) {
         if (num_chunks <= max_cached_chunks) return max_cached_chunks;
-        if (compact || extra_space) return max_cached_chunks;
+        if (compact) return max_cached_chunks;
 
         const long add_chunks = num_chunks - max_cached_chunks;
         const size_t add_nbytes = (size_t)add_chunks * chunk_nbytes;
@@ -220,8 +289,8 @@ struct chunk_arena_t {
             chunk.u = (uint64_t *)(chunk.norm + Pool_hd_t::chunk_max_nvecs);
             chunk.vec = (int8_t *)(chunk.u + Pool_hd_t::chunk_max_nvecs);
         }
-        extra_space = new_space;
-        extra_nbytes = add_nbytes;
+        extra_spaces.push_back(new_space);
+        extra_sizes.push_back(add_nbytes);
         cached_num += add_chunks;
         max_cached_chunks = num_chunks;
         pthread_spin_unlock(&cache_lock);
@@ -242,12 +311,12 @@ struct chunk_arena_t {
             #endif
             space = NULL;
         }
-        if (extra_space) {
-            CHECK_CUDA_ERR(cudaHostUnregister(extra_space));
-            free(extra_space);
-            extra_space = NULL;
-            extra_nbytes = 0;
+        for (size_t i = 0; i < extra_spaces.size(); ++i) {
+            CHECK_CUDA_ERR(cudaHostUnregister(extra_spaces[i]));
+            free(extra_spaces[i]);
         }
+        extra_spaces.clear();
+        extra_sizes.clear();
         cached_num = 0;
         if (using_num) {
             fprintf(stderr, "[Warning] %ld %s chunks not freed\n",
@@ -262,6 +331,7 @@ struct chunk_arena_t {
             pthread_spin_lock(&cache_lock);
             if (cached_num > 0) {
                 using_num++;
+                if (using_num > peak_using_num) peak_using_num = using_num;
                 chunk_t *src = &cached_chunks[--cached_num];
                 chunk->score = src->score;
                 chunk->norm = src->norm;
@@ -277,6 +347,16 @@ struct chunk_arena_t {
             pthread_spin_unlock(&cache_lock);
             usleep(1000);
         }
+    }
+
+    void usage(long *used, long *peak, long *capacity_out,
+               long *bytes_per_chunk) {
+        pthread_spin_lock(&cache_lock);
+        *used = using_num;
+        *peak = peak_using_num;
+        *capacity_out = max_cached_chunks;
+        *bytes_per_chunk = chunk_nbytes;
+        pthread_spin_unlock(&cache_lock);
     }
 
     void release(chunk_t *src) {
@@ -302,22 +382,38 @@ struct chunk_arena_t {
     long max_cached_chunks = 0;
     long cached_num = 0;
     long using_num = 0;
+    long peak_using_num = 0;
     long chunk_nbytes = 0;
     chunk_t *cached_chunks = NULL;
     int8_t *space = NULL;
-    int8_t *extra_space = NULL;
-    size_t extra_nbytes = 0;
+    std::vector<int8_t *> extra_spaces;
+    std::vector<size_t> extra_sizes;
 };
 
 struct chunk_allocator_t {
-    static constexpr long regular_chunks = PWC_DEFAULT_MAX_CACHED_CHUNKS +
-                                            SWC_DEFAULT_MAX_CACHED_CHUNKS + 256;
     static constexpr long bucket_chunks = BWC_DEFAULT_MAX_CACHED_CHUNKS + 64;
 
     void _ck_allocator_start() {
         struct bitmask *nodes = numa_get_mems_allowed();
         numa_set_interleave_mask(nodes);
         numa_bitmask_free(nodes);
+        long regular_chunks = PWC_DEFAULT_MAX_CACHED_CHUNKS +
+                              SWC_DEFAULT_MAX_CACHED_CHUNKS + 256;
+#if HD_A100X4_500G_CACHE_PROFILE
+        const char *eager_env = getenv("HD_EAGER_HOST_ARENA");
+        const bool eager = eager_env && atoi(eager_env) != 0;
+        if (!eager) {
+            const char *initial_env = getenv("HD_HOST_ARENA_INITIAL_GB");
+            double initial_gib = initial_env ? atof(initial_env) : 64.0;
+            if (initial_gib < 24.0) initial_gib = 24.0;
+            const uint64_t chunk_nbytes = Pool_hd_t::chunk_max_nvecs *
+                (uint64_t)POOL_HOST_VEC_SLOT_NBYTES + (ONE_TIME_IO ? 4096ULL : 0ULL);
+            const long staged_chunks = (long)(initial_gib * (1ULL << 30) /
+                                               chunk_nbytes);
+            if (staged_chunks > 0 && staged_chunks < regular_chunks)
+                regular_chunks = staged_chunks;
+        }
+#endif
         regular.start(regular_chunks, false, "bgj-regular");
         bucket.start(bucket_chunks, true, "bgj-bucket");
     }
@@ -334,6 +430,9 @@ struct chunk_allocator_t {
 };
 
 static chunk_allocator_t chunk_allocator;
+
+int _cuda_device_mem_info(int device_ptr, size_t *free_nbytes,
+                          size_t *total_nbytes);
 
 static int _common_gpu_numa_node() {
     static int cached = -2;
@@ -423,6 +522,64 @@ void _destory_ck_allocator() {
 long _ensure_regular_chunk_capacity(long num_chunks) {
     if (!ck_allocator_started.load(std::memory_order_acquire)) _start_ck_allocator();
     return chunk_allocator.regular.grow(num_chunks);
+}
+
+long _regular_chunk_capacity() {
+    if (!ck_allocator_started.load(std::memory_order_acquire)) _start_ck_allocator();
+    return chunk_allocator.regular.capacity();
+}
+
+void report_cache_memory(const char *phase, Pool_hd_t *pool,
+                         long swc_chunks, long swc_resident) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("HD_HBM_TELEMETRY");
+        enabled = !env || atoi(env) != 0;
+    }
+    if (!enabled) return;
+
+    long regular_used = 0, regular_peak = 0, regular_capacity = 0;
+    long regular_chunk_bytes = 0;
+    long bucket_used = 0, bucket_peak = 0, bucket_capacity = 0;
+    long bucket_chunk_bytes = 0;
+    if (ck_allocator_started.load(std::memory_order_acquire)) {
+        chunk_allocator.regular.usage(&regular_used, &regular_peak,
+                                      &regular_capacity,
+                                      &regular_chunk_bytes);
+        chunk_allocator.bucket.usage(&bucket_used, &bucket_peak,
+                                     &bucket_capacity,
+                                     &bucket_chunk_bytes);
+    }
+
+    const long pool_chunks = pool ? pool->pwc_manager->num_chunks() : -1;
+    const long pool_resident = pool ? pool->pwc_manager->resident_chunks() : -1;
+    const long pool_vectors = pool ? pool->pwc_manager->num_vec() : -1;
+    printf("[cache] phase=%s csd=%ld pool_vectors=%ld pool_chunks=%ld "
+           "pool_resident=%ld swc_chunks=%ld swc_resident=%ld "
+           "regular_used=%ld regular_peak=%ld regular_capacity=%ld "
+           "regular_used_gib=%.3f regular_free_gib=%.3f "
+           "bucket_used=%ld bucket_peak=%ld bucket_capacity=%ld "
+           "bucket_used_gib=%.3f\n",
+           phase ? phase : "unknown", pool ? pool->CSD : -1,
+           pool_vectors, pool_chunks, pool_resident, swc_chunks, swc_resident,
+           regular_used, regular_peak, regular_capacity,
+           regular_used * regular_chunk_bytes / 1073741824.0,
+           (regular_capacity - regular_used) * regular_chunk_bytes / 1073741824.0,
+           bucket_used, bucket_peak, bucket_capacity,
+           bucket_used * bucket_chunk_bytes / 1073741824.0);
+
+    for (int device_ptr = 0; device_ptr < hw::gpu_num; ++device_ptr) {
+        size_t free_nbytes = 0, total_nbytes = 0;
+        if (!_cuda_device_mem_info(device_ptr, &free_nbytes, &total_nbytes))
+            printf("[hbm] phase=%s csd=%ld device=%d free_gib=%.3f "
+                   "used_gib=%.3f total_gib=%.3f\n",
+                   phase ? phase : "unknown", pool ? pool->CSD : -1,
+                   device_ptr, free_nbytes / 1073741824.0,
+                   (total_nbytes - free_nbytes) / 1073741824.0,
+                   total_nbytes / 1073741824.0);
+    }
+    _pwc_hbm_report(phase, pool ? pool->CSD : -1);
+    fflush(stdout);
 }
 
 int _pin_thread_to_gpu_numa(int device_ptr, int worker_index) {
@@ -524,6 +681,105 @@ int _cuda_device_free(int device_ptr, void *ptr) {
     if (!ptr || device_ptr < 0 || device_ptr >= hw::gpu_num) return -1;
     if (cudaSetDevice(hw::gpu_id_list[device_ptr]) != cudaSuccess) return -1;
     return cudaFree(ptr) == cudaSuccess ? 0 : -1;
+}
+
+bool _pwc_hbm_store(long chunk_id, const chunk_t *chunk, long csd) {
+    pwc_hbm_cache.init(csd);
+    if (pwc_hbm_cache.initialized.load(std::memory_order_acquire) != 1 ||
+        !chunk || !chunk->score || hw::gpu_num <= 0)
+        return false;
+    const int d = (int)((uint64_t)chunk_id % (uint64_t)hw::gpu_num);
+    pwc_hbm_shard_t &s = pwc_hbm_cache.shard[d];
+    if (!s.base) return false;
+    pthread_mutex_lock(&s.lock);
+    auto it = s.chunks.find(chunk_id);
+    const bool existed = it != s.chunks.end();
+    int32_t slot = existed ? it->second : -1;
+    if (!existed && !s.free_slots.empty()) {
+        slot = s.free_slots.back();
+        s.free_slots.pop_back();
+        s.chunks.emplace(chunk_id, slot);
+    }
+    if (slot < 0) {
+        pthread_mutex_unlock(&s.lock);
+        pwc_hbm_cache.overflows.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const int8_t *src = (const int8_t *)chunk->score -
+                        (ONE_TIME_IO ? 12 : 0);
+    cudaSetDevice(hw::gpu_id_list[d]);
+    cudaError_t status = cudaMemcpy(s.base + (size_t)slot * pwc_hbm_cache.slot_nbytes,
+                                    src, pwc_hbm_cache.slot_nbytes,
+                                    cudaMemcpyHostToDevice);
+    if (status != cudaSuccess && !existed) {
+        s.chunks.erase(chunk_id);
+        s.free_slots.push_back(slot);
+    }
+    pthread_mutex_unlock(&s.lock);
+    if (status != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    pwc_hbm_cache.stores.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void _pwc_hbm_prepare(long csd) {
+    pwc_hbm_cache.init(csd);
+    _pwc_hbm_report("prepared", csd);
+}
+
+bool _pwc_hbm_load(long chunk_id, chunk_t *chunk, long csd) {
+    pwc_hbm_cache.init(csd);
+    if (pwc_hbm_cache.initialized.load(std::memory_order_acquire) != 1 ||
+        !chunk || !chunk->score || hw::gpu_num <= 0)
+        return false;
+    const int d = (int)((uint64_t)chunk_id % (uint64_t)hw::gpu_num);
+    pwc_hbm_shard_t &s = pwc_hbm_cache.shard[d];
+    if (!s.base) return false;
+    pthread_mutex_lock(&s.lock);
+    auto it = s.chunks.find(chunk_id);
+    if (it == s.chunks.end()) {
+        pthread_mutex_unlock(&s.lock);
+        return false;
+    }
+    const int32_t slot = it->second;
+    int8_t *dst = (int8_t *)chunk->score - (ONE_TIME_IO ? 12 : 0);
+    cudaSetDevice(hw::gpu_id_list[d]);
+    cudaError_t status = cudaMemcpy(dst,
+                                    s.base + (size_t)slot * pwc_hbm_cache.slot_nbytes,
+                                    pwc_hbm_cache.slot_nbytes,
+                                    cudaMemcpyDeviceToHost);
+    if (status == cudaSuccess) {
+        s.chunks.erase(it);
+        s.free_slots.push_back(slot);
+    }
+    pthread_mutex_unlock(&s.lock);
+    if (status != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    pwc_hbm_cache.loads.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void _pwc_hbm_report(const char *phase, long csd) {
+    if (pwc_hbm_cache.initialized.load(std::memory_order_acquire) != 1) return;
+    uint64_t used = 0, capacity = 0;
+    for (int d = 0; d < hw::gpu_num; ++d) {
+        pwc_hbm_shard_t &s = pwc_hbm_cache.shard[d];
+        pthread_mutex_lock(&s.lock);
+        used += s.chunks.size();
+        capacity += s.slots;
+        pthread_mutex_unlock(&s.lock);
+    }
+    printf("[PWC-HBM] phase=%s csd=%ld used_chunks=%lu capacity_chunks=%lu "
+           "used_gib=%.3f stores=%lu loads=%lu overflows=%lu\n",
+           phase ? phase : "unknown", csd, used, capacity,
+           used * pwc_hbm_cache.slot_nbytes / 1073741824.0,
+           pwc_hbm_cache.stores.load(), pwc_hbm_cache.loads.load(),
+           pwc_hbm_cache.overflows.load());
+    fflush(stdout);
 }
 
 static thread_local cudaStream_t hbm_copy_streams[MAX_NUM_DEVICE] = {};

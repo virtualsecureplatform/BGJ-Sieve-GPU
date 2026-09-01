@@ -17,6 +17,10 @@ void _pool_hd_device_buffers_acquire(int cache_slot, size_t buffer_nbytes,
 void _pool_hd_device_buffers_release(int8_t *d_buffer, int8_t *pack_buffer,
                                      int8_t *h_buffer, bool cached);
 void _destroy_pool_hd_device_buffers();
+// Report shared host-cache ownership and per-device HBM slack.  This performs
+// no allocation and is safe to call at sieve/dimension boundaries.
+void report_cache_memory(const char *phase, Pool_hd_t *pool = NULL,
+                         long swc_chunks = -1, long swc_resident = -1);
 
 struct local_data_t {
     static constexpr unsigned int vec_nbytes    = Pool_hd_t::vec_nbytes;

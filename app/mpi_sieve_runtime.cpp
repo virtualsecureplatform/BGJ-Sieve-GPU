@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <climits>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -369,6 +370,79 @@ int mpi_sieve_partition_pool(Pool_hd_t *pool, long target_global_size) {
         if (!g_rank) fprintf(stderr, "[MPI] pool partition count mismatch: %llu != %ld\n",
                              (unsigned long long)total, target_global_size);
         return -1;
+    }
+    return 0;
+}
+
+int mpi_sieve_prune_pool(Pool_hd_t *pool, long target_global_size) {
+    if (target_global_size < 0) return -1;
+    const uint64_t local_count = pool->pwc_manager->num_vec();
+    const uint64_t global_count = mpi_sieve_global_u64(local_count);
+    if (global_count <= (uint64_t)target_global_size) return 0;
+
+    // UID ownership is hash-balanced.  Give each rank a quota proportional to
+    // the vectors it currently owns, then let the existing shrink operation
+    // keep that rank's best-scoring vectors.  Do not derive quotas from
+    // score_stat: redistribution can leave that diagnostic histogram stale.
+    std::vector<uint64_t> counts(g_world), quotas(g_world), remainders(g_world);
+    if (MPI_Allgather(&local_count, 1, MPI_UINT64_T, counts.data(), 1,
+                      MPI_UINT64_T, MPI_COMM_WORLD) != MPI_SUCCESS)
+        return -1;
+    uint64_t assigned = 0;
+    for (int rank = 0; rank < g_world; ++rank) {
+        const unsigned __int128 product =
+            (unsigned __int128)(uint64_t)target_global_size * counts[rank];
+        quotas[rank] = (uint64_t)(product / global_count);
+        remainders[rank] = (uint64_t)(product % global_count);
+        assigned += quotas[rank];
+    }
+    while (assigned < (uint64_t)target_global_size) {
+        int best = -1;
+        for (int rank = 0; rank < g_world; ++rank) {
+            if (quotas[rank] >= counts[rank]) continue;
+            if (best < 0 || remainders[rank] > remainders[best]) best = rank;
+        }
+        if (best < 0) return -1;
+        ++quotas[best];
+        remainders[best] = 0;
+        ++assigned;
+    }
+    const uint64_t local_target = quotas[g_rank];
+    if (local_target > local_count || local_target > (uint64_t)LONG_MAX) return -1;
+    if (local_target < local_count && pool->mpi_trim_exact((long)local_target))
+        return -1;
+
+    uint64_t retained = mpi_sieve_global_u64(pool->pwc_manager->num_vec());
+    // shrink() chooses among equal-score vectors in parallel and can retain a
+    // handful more than requested.  Remove that residual exactly from the
+    // authoritative chunk contents before publishing the boundary.
+    if (retained > (uint64_t)target_global_size) {
+        uint64_t current = pool->pwc_manager->num_vec();
+        std::vector<uint64_t> current_counts(g_world);
+        if (MPI_Allgather(&current, 1, MPI_UINT64_T, current_counts.data(), 1,
+                          MPI_UINT64_T, MPI_COMM_WORLD) != MPI_SUCCESS)
+            return -1;
+        uint64_t excess = retained - (uint64_t)target_global_size;
+        std::vector<uint64_t> remove(g_world, 0);
+        for (int rank = 0; rank < g_world && excess; ++rank) {
+            remove[rank] = std::min(excess, current_counts[rank]);
+            excess -= remove[rank];
+        }
+        if (remove[g_rank] &&
+            pool->mpi_trim_exact((long)(current - remove[g_rank]))) return -1;
+        retained = mpi_sieve_global_u64(pool->pwc_manager->num_vec());
+    }
+    if (retained != (uint64_t)target_global_size) {
+        if (!g_rank)
+            fprintf(stderr, "[MPI] global prune count mismatch: %llu != %ld\n",
+                    (unsigned long long)retained, target_global_size);
+        return -1;
+    }
+    if (!g_rank) {
+        printf("[MPI] pruned CSD=%ld global_vectors=%llu quotas=%llu,%llu\n",
+               pool->CSD, (unsigned long long)retained,
+               (unsigned long long)quotas[0], (unsigned long long)quotas[1]);
+        fflush(stdout);
     }
     return 0;
 }

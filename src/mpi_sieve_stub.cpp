@@ -29,6 +29,7 @@ BGJ_WEAK int mpi_sieve_global_stuck(uint64_t checked, uint64_t not_inserted, int
     return not_inserted * 36 < checked && checked > 100;
 }
 BGJ_WEAK int mpi_sieve_partition_pool(Pool_hd_t *, long) { return 0; }
+BGJ_WEAK int mpi_sieve_prune_pool(Pool_hd_t *, long) { return 0; }
 BGJ_WEAK int mpi_sieve_redistribute_pool(Pool_hd_t *) { return 0; }
 BGJ_WEAK int mpi_sieve_prepare_working_pool(Pool_hd_t *) { return 0; }
 BGJ_WEAK int mpi_sieve_checkpoint(Pool_hd_t *) { return 0; }

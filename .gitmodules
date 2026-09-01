@@ -4,3 +4,6 @@
 [submodule "dep/BLASter"]
 	path = dep/BLASter
 	url = https://github.com/ludopulles/BLASter.git
+[submodule "deps/fplll-cuda-enumeration"]
+	path = deps/fplll-cuda-enumeration
+	url = https://github.com/virtualsecureplatform/fplll-cuda-enumeration.git

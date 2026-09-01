@@ -1,6 +1,6 @@
 CUBIN = $(filter-out hd_sieve_mpi,$(patsubst bin_%.cu,%, $(wildcard *.cu)))
 CXX = g++
-CFLAGS = -O3 -g -fopenmp -march=native -pthread -Wno-unused-result -Wno-format-truncation
+CFLAGS = -O3 -g -fopenmp -march=native -pthread -rdynamic -Wno-unused-result -Wno-format-truncation
 LIBS = -L../src -lllib -lntl -lgmp -lm
 INC_DIR =
 

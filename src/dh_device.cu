@@ -43,7 +43,9 @@ int Pool_hd_t::dh_insert(long target_index, double eta, double max_time, long *p
 
     this->set_boost_depth(new_ESD);
 
-    bwc_manager_t *bwc_manager = new bwc_manager_t(this);
+    // dh_insert reconstructs insertion coefficients from bucket u/score
+    // metadata, so its buckets cannot use the ordinary vec+norm-only format.
+    bwc_manager_t *bwc_manager = new bwc_manager_t(this, false);
     dh_bucketer_t    *bucketer = new dh_bucketer_t(this, bwc_manager);
     dh_reducer_t      *reducer = new dh_reducer_t(this, bwc_manager, eta, 1);
 
@@ -167,7 +169,8 @@ int Pool_hd_t::dh_final(long target_index, double eta, double max_time, double t
 
     this->set_boost_depth(new_ESD);
 
-    bwc_manager_t *bwc_manager = new bwc_manager_t(this);
+    // dh_final consumes the same dual-hash bucket metadata as dh_insert.
+    bwc_manager_t *bwc_manager = new bwc_manager_t(this, false);
     dh_bucketer_t    *bucketer = new dh_bucketer_t(this, bwc_manager);
     dh_reducer_t      *reducer = new dh_reducer_t(this, bwc_manager, eta, 0);
 
@@ -864,8 +867,10 @@ int dhb_buffer_t::run(int tid) {
         logger->ev_d2h_nbytes += curr_batch * (out_max_size + 1) * sizeof(uint32_t);
         logger->ev_h2d_nbytes += task_vecs[tid] * CSD * sizeof(int8_t) + task_vecs[tid] * sizeof(int32_t);
     }
-    task_vecs[tid] = 0;
     #endif
+    // This is runtime state, not profiling state.  Leaving it nonzero in
+    // profile-off builds makes the next H2D batch append past d_vec.
+    task_vecs[tid] = 0;
     int full_count = 0;
     for (int i = 0; i < curr_batch; i++) {
         if (h_out[tid][i] > out_max_size) { h_out[tid][i] = out_max_size; full_count++; }

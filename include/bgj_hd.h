@@ -15,6 +15,7 @@ int _cuda_device_h2d_pair_enqueue(int device_ptr,
                                   void *dst1, const void *src1, size_t nbytes1);
 int _cuda_device_h2d_wait(int device_ptr);
 long _ensure_regular_chunk_capacity(long num_chunks);
+long _regular_chunk_capacity();
 int _pin_thread_to_gpu_numa(int device_ptr, int worker_index);
 
 #if ENABLE_PROFILING
@@ -59,7 +60,9 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
     static constexpr long bwc_auto_prefetch_for_read_depth = 64;
     static constexpr long bwc_bucket_locks = 256;
 
-    bwc_manager_tmpl(Pool_hd_t *p);
+    // Dual-hash buckets retain u/score for insertion reconstruction; ordinary
+    // sieve buckets only need vec/norm and use the compact representation.
+    bwc_manager_tmpl(Pool_hd_t *p, bool compact_vec_norm = true);
     ~bwc_manager_tmpl();
 
     using pwc_manager_tmpl<logger_t>::set_dirname;
@@ -288,6 +291,8 @@ struct swc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
     ~swc_manager_tmpl();
 
     using pwc_manager_tmpl<logger_t>::num_vec;
+    using pwc_manager_tmpl<logger_t>::num_chunks;
+    using pwc_manager_tmpl<logger_t>::resident_chunks;
     using pwc_manager_tmpl<logger_t>::set_dirname;
     using pwc_manager_tmpl<logger_t>::set_num_threads;
     using pwc_manager_tmpl<logger_t>::set_max_cached_chunks;

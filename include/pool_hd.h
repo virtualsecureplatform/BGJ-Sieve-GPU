@@ -443,6 +443,7 @@ struct Pool_hd_t {
     int store(bool force = false);
     // MPI helpers operate only at quiescent sieve/dimension boundaries.
     int mpi_retain_owner(int rank, int world);
+    int mpi_trim_exact(long target);
     void mpi_reset_append_hint() { _mpi_append_hint = 0; }
     int mpi_append_records(const uint8_t *records, long count, int record_size);
     /// @brief try to recover the pool from disk
@@ -523,6 +524,10 @@ void _free_chunk(chunk_t *chunk);
 void _malloc_chunk(chunk_t *chunk);
 void _free_bucket_chunk(chunk_t *chunk);
 void _malloc_bucket_chunk(chunk_t *chunk);
+bool _pwc_hbm_store(long chunk_id, const chunk_t *chunk, long csd);
+bool _pwc_hbm_load(long chunk_id, chunk_t *chunk, long csd);
+void _pwc_hbm_prepare(long csd);
+void _pwc_hbm_report(const char *phase, long csd);
 
 struct boost_data_t {
     static constexpr int max_boost_dim = 48;
@@ -643,6 +648,9 @@ struct pwc_manager_tmpl {
     ~pwc_manager_tmpl();
 
     long num_vec() const;
+    /// Number of logical chunks that currently occupy a DRAM cache slot.
+    /// Intended for quiescent-boundary telemetry.
+    long resident_chunks() const;
     inline long num_chunks() const;     // return _num_chunks
     inline long num_empty() const;      // return __num_deleted_ids
     inline long max_cached_chunks() const;      // return _max_cached_chunks
@@ -754,6 +762,7 @@ struct pwc_manager_tmpl {
     // Bucket chunks contain only exact int8 vectors and int32 norms.  Pool and
     // solution chunks retain score/u as well.
     bool _compact_vec_norm;
+    bool _hbm_pool_tier = false;
     inline void __malloc_chunk(chunk_t *chunk) {
         if (_compact_vec_norm) _malloc_bucket_chunk(chunk);
         else _malloc_chunk(chunk);
@@ -1212,6 +1221,14 @@ template <class logger_t> int32_t pwc_manager_tmpl<logger_t>::__fetch_cache_for(
                 continue;
             }
 
+            // Preserve every clean primary-pool eviction in the sharded HBM
+            // tier as well.  Dirty chunks normally arrive here only after
+            // __sync_chunk has stored them, so this simply refreshes the same
+            // exact entry.  Failure leaves the existing disk backing valid.
+            if (_hbm_pool_tier)
+                _pwc_hbm_store(old_chunk_id, &_cached_chunks[cache_id],
+                                _pool->CSD);
+
             _cached_chunks[cache_id].id = chunk_id;
             _last_cache = cache_id;
             pthread_spin_unlock(&_cached_chunks_lock);
@@ -1252,12 +1269,14 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__load_chunk(long chu
     #endif
     const int stored_fields_nbytes = _compact_vec_norm ? 4 : (2 + 4 + 8);
 
+    const bool hbm_loaded = _hbm_pool_tier &&
+                           _pwc_hbm_load(chunk_id, dst_chunk, _pool->CSD);
     if ((_chunk_status[chunk_id] & _ck_size_mask) == 0) {
         dst_chunk->size = 0;
         memset(dst_chunk->norm, 0, Pool_hd_t::chunk_max_nvecs * sizeof(int32_t));
         if (!_compact_vec_norm)
             memset(dst_chunk->score, 0, Pool_hd_t::chunk_max_nvecs * sizeof(uint16_t));
-    } else {
+    } else if (!hbm_loaded) {
         int fd = open(chunk_filename, O_RDONLY | (ONE_TIME_IO ? O_DIRECT : 0));
 
         if (fd == -1) {
@@ -1338,7 +1357,7 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__load_chunk(long chu
     pthread_spin_unlock(&_locks[chunk_id % pwc_locks]);
 
     #if ENABLE_PROFILING
-    ev_ssd_ld.fetch_add(1);
+    if (!hbm_loaded) ev_ssd_ld.fetch_add(1);
     #endif
 
     _num_loading_chunks--;
@@ -1369,10 +1388,17 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__sync_chunk(long chu
     *((uint8_t *)(&meta_data[10])) = (uint8_t) (_pool->index_l);
     *((uint8_t *)(&meta_data[11])) = (uint8_t) (_pool->index_r);
 
-    int fd = open(chunk_filename, O_WRONLY | O_CREAT | (ONE_TIME_IO ? O_DIRECT : 0), 0644);
-    if (fd == -1) {
+    // HBM is populated at the actual cache-eviction point.  Writing here as
+    // well would leave duplicate host/HBM copies after ordinary checkpoint
+    // flushes and waste the scarce HBM tier.  Dirty synchronization retains
+    // its disk safety copy; the subsequent clean eviction is cached in HBM.
+    const bool hbm_stored = false;
+    int fd = -1;
+    if (!hbm_stored)
+        fd = open(chunk_filename, O_WRONLY | O_CREAT | (ONE_TIME_IO ? O_DIRECT : 0), 0644);
+    if (!hbm_stored && fd == -1) {
         lg_err("open %s failed, %s, nothing done", chunk_filename, strerror(errno));
-    } else {
+    } else if (!hbm_stored) {
         int write_bytes = 0;
         #if ONE_TIME_IO
         write_bytes += write(fd, meta_data, 4096 + Pool_hd_t::chunk_max_nvecs *
@@ -1408,7 +1434,7 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__sync_chunk(long chu
     __signal_sync_done();
 
     #if ENABLE_PROFILING
-    ev_ssd_st.fetch_add(1);
+    if (!hbm_stored) ev_ssd_st.fetch_add(1);
     #endif
 
     lg_exit();
@@ -1689,6 +1715,23 @@ template <class logger_t> int pwc_manager_tmpl<logger_t>::set_dirname(const char
 
 template <class logger_t> int pwc_manager_tmpl<logger_t>::set_pool(Pool_hd_t *pool) {
     this->_pool = pool;
+    this->_hbm_pool_tier = true;
+    const char *cache_gb_env = getenv("HD_PWC_CACHE_GB");
+    if (cache_gb_env) {
+        const double cache_gib = atof(cache_gb_env);
+        const uint64_t chunk_nbytes = Pool_hd_t::chunk_max_nvecs *
+            (uint64_t)POOL_HOST_VEC_SLOT_NBYTES + (ONE_TIME_IO ? 4096ULL : 0ULL);
+        const long chunks = cache_gib > 0.0
+            ? (long)(cache_gib * (1ULL << 30) / chunk_nbytes) : 0;
+        if (chunks < 256 || chunks > pwc_default_max_cached_chunks) {
+            fprintf(stderr, "[Error] HD_PWC_CACHE_GB=%.3f gives invalid "
+                    "PWC capacity %ld chunks\n", cache_gib, chunks);
+            return -1;
+        }
+        if (set_max_cached_chunks(chunks)) return -1;
+        printf("[cache] runtime PWC cap %.3f GiB (%ld chunks)\n",
+               chunks * chunk_nbytes / 1073741824.0, chunks);
+    }
     this->set_dirname("pool");
     return 0;
 }
@@ -1702,6 +1745,14 @@ template <class logger_t> long pwc_manager_tmpl<logger_t>::num_vec() const {
         ret += tmp == _ck_size_mask ? 0 : tmp;
     }
 
+    return ret;
+}
+
+template <class logger_t> long pwc_manager_tmpl<logger_t>::resident_chunks() const {
+    long ret = 0;
+    #pragma omp parallel for reduction(+:ret) num_threads(_loading_threads)
+    for (long i = 0; i < _num_chunks; i++)
+        if (_chunk_status[i] & _ck_caching) ++ret;
     return ret;
 }
 

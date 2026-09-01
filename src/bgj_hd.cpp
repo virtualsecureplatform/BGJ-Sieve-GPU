@@ -55,11 +55,12 @@ static long __swc_runtime_max_cached_chunks(Pool_hd_t *p) {
     return extra_chunks > 0 ? base + extra_chunks : base;
 }
 
-template <class logger_t> bwc_manager_tmpl<logger_t>::bwc_manager_tmpl(Pool_hd_t *p) : 
+template <class logger_t> bwc_manager_tmpl<logger_t>::bwc_manager_tmpl(
+                          Pool_hd_t *p, bool compact_vec_norm) : 
                           pwc_manager_tmpl<logger_t>(bwc_default_loading_threads,
                                                      bwc_default_syncing_threads,
                                                      bwc_default_max_cached_chunks,
-                                                     true) {
+                                                     compact_vec_norm) {
     _num_buckets = 0;
     _num_deleted_buckets = 0;
     _num_wl = 0;
@@ -1155,12 +1156,10 @@ template <class logger_t> swc_manager_tmpl<logger_t>::swc_manager_tmpl(Pool_hd_t
                                                      swc_default_syncing_threads,
                                                      __swc_runtime_max_cached_chunks(p)) {
     const long requested_chunks = _max_cached_chunks;
-    const long arena_chunks = _ensure_regular_chunk_capacity(
-        PWC_DEFAULT_MAX_CACHED_CHUNKS + requested_chunks + 256);
-    const long supported_chunks = arena_chunks - PWC_DEFAULT_MAX_CACHED_CHUNKS - 256;
-    if (supported_chunks < _max_cached_chunks)
-        this->set_max_cached_chunks(supported_chunks > 0 ? supported_chunks
-                                                         : swc_default_max_cached_chunks);
+    const char *eager_env = getenv("HD_EAGER_HOST_ARENA");
+    if (eager_env && atoi(eager_env) != 0)
+        _ensure_regular_chunk_capacity(PWC_DEFAULT_MAX_CACHED_CHUNKS +
+                                       requested_chunks + 256);
     _num_ready = 0;
     _num_writing = 0;
     _num_rp = 0; 

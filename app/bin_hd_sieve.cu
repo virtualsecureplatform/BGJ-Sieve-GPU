@@ -3,6 +3,9 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
 
 #include "../include/pool_hd.h"
 #include "../include/pool_hd_device.h"
@@ -112,7 +115,18 @@ void run_command_file(const char* filename) {
     }
 }
 
+static void crash_backtrace(int sig) {
+    void *frames[64];
+    const int count = backtrace(frames, 64);
+    dprintf(STDERR_FILENO, "[crash] signal=%d backtrace_frames=%d\n", sig, count);
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 int main(int argc, char** argv) {
+    signal(SIGSEGV, crash_backtrace);
+    signal(SIGABRT, crash_backtrace);
     if (argc == 2 && strstr(argv[1], ".cmd")) {
         run_command_file(argv[1]);
         _destroy_pool_hd_device_buffers();
@@ -630,6 +644,7 @@ int task_config_t::_run_final_sieve() {
     if (mpi_sieve_prepare_working_pool(&pool)) return -1;
     mpi_sieve_report_dimension(&pool, "pool_ready");
     report_host_memory("pool_ready", pool.CSD);
+    report_cache_memory("pool_ready", &pool);
 
     // LATEST denotes a fully completed CSD.  Continue at the next dimension
     // instead of repeating the expensive sieve that produced the checkpoint.
@@ -641,19 +656,28 @@ int task_config_t::_run_final_sieve() {
         }
         if (pool.CSD >= target_sieving_dim) return 0;
         if (pool.extend_left()) return -1;
-        if (mpi_sieve_redistribute_pool(&pool)) return -1;
+        // Extending the coordinate window does not change a lattice vector's
+        // UID.  Checkpoint pools are already owner-partitioned, so moving every
+        // vector again would only add network traffic.
         report_host_memory("resume_extend_done", pool.CSD);
     }
 
     for (;;) {
         report_host_memory("sieve_start", pool.CSD);
+        report_cache_memory("sieve_start", &pool);
         int ret = _sieve(&pool);
         report_host_memory("sieve_end", pool.CSD);
+        report_cache_memory("sieve_end", &pool);
         if (mpi_sieve_should_stop()) {
             return -1;
         }
         if (ret == 1) {
             break;
+        }
+        if (mpi_sieve_active()) {
+            const long target_pool_size =
+                3.2 * pow(4. / 3., pool.CSD * .5) - 5;
+            if (mpi_sieve_prune_pool(&pool, target_pool_size)) return -1;
         }
         if (pool.CSD == 100) {
             if (pool.check_dim_lose() == -1) {
@@ -689,8 +713,8 @@ int task_config_t::_run_final_sieve() {
         }
         if (pool.CSD < target_sieving_dim) {
             if (pool.extend_left()) return -1;
-            if (mpi_sieve_redistribute_pool(&pool)) return -1;
             report_host_memory("extend_done", pool.CSD);
+            report_cache_memory("extend_done", &pool);
         }
         else break;
     }
@@ -790,8 +814,15 @@ int task_config_t::_run_local_pump() {
         if (enable_dual_hash) {
             double dh_expect_time = enable_down_sieve ? (last_sieve_time * dual_hash_ratio * 1e-3) : 
                                                         (pow(10.0, pool.CSD * 0.1 - 11.4) * (pool.index_l - ind) / 32.0);
-            printf("dual hash expect time = %.2fs\n", dh_expect_time);
+            printf("[pump-down] begin dh_insert csd=%ld ind=%d target_index=%ld "
+                   "ESD=%d ratio=%ld expect_seconds=%.2f\n",
+                   pool.CSD, ind, pool.index_l - ind, pool.ESD,
+                   dual_hash_ratio, dh_expect_time);
+            fflush(stdout);
             pool.dh_insert(ind++, 1.2, dh_expect_time, &pos);
+            printf("[pump-down] end dh_insert csd=%ld next_ind=%d pos=%ld\n",
+                   pool.CSD, ind, pos);
+            fflush(stdout);
             last_sieve_time = 0.0;
         } else pool.insert(ind++, 1.2, &pos);
         L_locs.store(".bkz.tmp_basis");

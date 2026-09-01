@@ -51,6 +51,38 @@ static unsigned long long __sieve_rng_seed(Pool_hd_t *pool,
 }
 
 int Pool_hd_t::_bgj_Sieve_hd(int bgj) {
+    _pwc_hbm_prepare(CSD);
+#if HD_A100X4_500G_CACHE_PROFILE
+    // Keep the same logical limits while committing pinned pages only as the
+    // exponentially growing pool needs them.  Reserving all SWC slots before
+    // starting workers prevents allocation stalls and disk fallback.
+    {
+        const long target_vectors = (long)(3.2 * pow(4.0 / 3.0, CSD * .5) - 5);
+        const long target_pool_chunks =
+            (target_vectors + chunk_max_nvecs - 1) / chunk_max_nvecs;
+        const long required_chunks = target_pool_chunks +
+                                     SWC_DEFAULT_MAX_CACHED_CHUNKS + 256;
+        const long host_limit_chunks = pwc_manager->max_cached_chunks() +
+                                       SWC_DEFAULT_MAX_CACHED_CHUNKS + 256;
+        const long host_required_chunks =
+            required_chunks < host_limit_chunks ? required_chunks
+                                                 : host_limit_chunks;
+        const long before = _regular_chunk_capacity();
+        const long after = _ensure_regular_chunk_capacity(host_required_chunks);
+        if (after < host_required_chunks) {
+            fprintf(stderr,
+                    "[Error] staged host arena growth failed at CSD %ld: "
+                    "%ld available, %ld required\n",
+                    CSD, after, host_required_chunks);
+            return -1;
+        }
+        if (after != before)
+            printf("[cache-grow] csd=%ld chunks_before=%ld chunks_after=%ld "
+                   "pool_target_chunks=%ld swc_reserve_chunks=%ld\n",
+                   CSD, before, after, target_pool_chunks,
+                   (long)SWC_DEFAULT_MAX_CACHED_CHUNKS);
+    }
+#endif
     if (pwc_manager->max_cached_chunks() > pwc_manager_t::pwc_default_max_cached_chunks) {
         pwc_manager->wait_work();
         pwc_manager->set_max_cached_chunks(pwc_manager_t::pwc_default_max_cached_chunks);
@@ -61,6 +93,9 @@ int Pool_hd_t::_bgj_Sieve_hd(int bgj) {
     Bucketer_t       *bucketer = new Bucketer_t(this, bwc_manager, swc_manager, ut_checker);
     Reducer_t         *reducer = new Reducer_t(this, bwc_manager, swc_manager, ut_checker);
     report_host_memory("sieve_managers_ready", CSD);
+    report_cache_memory("sieve_managers_ready", this,
+                        swc_manager->num_chunks(),
+                        swc_manager->resident_chunks());
 
     reducer->set_bucketer(bucketer);
     bucketer->set_reducer(reducer);
@@ -87,6 +122,9 @@ int Pool_hd_t::_bgj_Sieve_hd(int bgj) {
     reducer_thread.join();
     bucketer_thread.join();
     report_host_memory("sieve_workers_done", CSD);
+    report_cache_memory("sieve_workers_done", this,
+                        swc_manager->num_chunks(),
+                        swc_manager->resident_chunks());
 
     delete reducer;
     delete bucketer;
@@ -94,6 +132,7 @@ int Pool_hd_t::_bgj_Sieve_hd(int bgj) {
     delete bwc_manager;
     delete swc_manager;
     report_host_memory("sieve_cleanup_done", CSD);
+    report_cache_memory("sieve_cleanup_done", this);
     
     return ret;
 }
@@ -2162,6 +2201,8 @@ int Bucketer_t::run() {
         _buc_pool[tid]->wait_sleep();
     }
     report_host_memory("bucketer_buffers_ready", _pool->CSD);
+    report_cache_memory("bucketer_buffers_ready", _pool,
+                        _swc->num_chunks(), _swc->resident_chunks());
 
     #if ENABLE_PROFILING
     if (logger->_ll >= logger_t::ll_info) {
@@ -4973,6 +5014,8 @@ int Reducer_t::run() {
         }
     }
     report_host_memory("reducer_buffers_ready", _pool->CSD);
+    report_cache_memory("reducer_buffers_ready", _pool,
+                        _swc->num_chunks(), _swc->resident_chunks());
 
     #if ENABLE_PROFILING
     {

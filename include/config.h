@@ -101,9 +101,18 @@ struct hw {
 #error "select only one host cache profile"
 #endif
 #if HD_A100X4_500G_CACHE_PROFILE
-#define PWC_DRAM_SLIMIT                 (364ULL << 30)
-#define BWC_DRAM_SLIMIT                 (4ULL << 30)
-#define SWC_DRAM_SLIMIT                 (16ULL << 30)
+#ifndef HD_A100X4_PWC_GB
+#define HD_A100X4_PWC_GB                364
+#endif
+#ifndef HD_A100X4_BWC_GB
+#define HD_A100X4_BWC_GB                4
+#endif
+#ifndef HD_A100X4_SWC_GB
+#define HD_A100X4_SWC_GB                16
+#endif
+#define PWC_DRAM_SLIMIT                 ((uint64_t)HD_A100X4_PWC_GB << 30)
+#define BWC_DRAM_SLIMIT                 ((uint64_t)HD_A100X4_BWC_GB << 30)
+#define SWC_DRAM_SLIMIT                 ((uint64_t)HD_A100X4_SWC_GB << 30)
 #elif HD_SVP140_CACHE_PROFILE
 #define PWC_DRAM_SLIMIT                 (47ULL << 30)
 #define BWC_DRAM_SLIMIT                 (32ULL << 30)
