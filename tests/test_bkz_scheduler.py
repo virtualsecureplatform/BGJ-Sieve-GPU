@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import tempfile
 import unittest
 
 
@@ -34,6 +35,12 @@ class BkzSchedulerTests(unittest.TestCase):
             "target_sieving_dimension": 120, "min_lifting_dimension": 118
         })
         self.assertEqual(command[-4:], ["--TSD", "120", "--MLD", "118"])
+
+    def test_first_vector_norm2(self):
+        with tempfile.TemporaryDirectory() as directory:
+            basis = Path(directory) / "basis"
+            basis.write_text("[[3 4]\n[0 1]]\n")
+            self.assertEqual(SCHEDULER.first_vector_norm2(basis), 25)
 
 
 if __name__ == "__main__":

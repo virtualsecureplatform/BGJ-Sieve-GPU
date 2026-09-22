@@ -214,7 +214,13 @@ __global__ void dh_buc_kernel(uint32_t *__restrict__ out, int out_max_size, floa
             need_s2g = signal[0];
             if (need_s2g) {
                 int pos = atomicAdd(t_gbuc_num, t_sbuc_num);
-                int num = min(t_sbuc_num, out_max_size - pos);
+                // The counter deliberately keeps the unsaturated bucket size so
+                // the host can report overflow.  Once it passes the output
+                // capacity, however, out_max_size - pos is negative.  Mixing
+                // that value with the unsigned t_sbuc_num in min() converts it
+                // to a huge unsigned value and writes beyond w_out.
+                int num = pos < out_max_size ?
+                          min((int)t_sbuc_num, out_max_size - pos) : 0;
                 t_sbuc_num = 0;
 
                 signal[2 * tid + 0] = pos;
@@ -240,7 +246,8 @@ __global__ void dh_buc_kernel(uint32_t *__restrict__ out, int out_max_size, floa
     }
 
     int pos = atomicAdd(t_gbuc_num, t_sbuc_num);
-    int num = min(t_sbuc_num, out_max_size - pos);
+    int num = pos < out_max_size ?
+              min((int)t_sbuc_num, out_max_size - pos) : 0;
 
     signal[2 * tid + 0] = pos;
     signal[2 * tid + 1] = num;

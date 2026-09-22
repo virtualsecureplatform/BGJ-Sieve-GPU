@@ -6,6 +6,7 @@ performed by hd_sieve and should be run inside a Slurm allocation.
 """
 
 import argparse
+import filecmp
 import hashlib
 import json
 import os
@@ -31,7 +32,7 @@ def shell_join(arguments):
     return " ".join(shlex.quote(str(argument)) for argument in arguments)
 
 
-def run_identity(source, stages):
+def run_identity(source, stages, final_sieve=None):
     digest = hashlib.sha256()
     with open(source, "rb") as handle:
         while True:
@@ -40,6 +41,7 @@ def run_identity(source, stages):
                 break
             digest.update(chunk)
     digest.update(json.dumps(stages, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    digest.update(json.dumps(final_sieve, sort_keys=True, separators=(",", ":")).encode("utf-8"))
     return digest.hexdigest()[:16]
 
 
@@ -139,6 +141,23 @@ def final_sieve_command(binary, input_name, settings):
     return command
 
 
+def first_vector_norm2(path):
+    """Return the squared norm of the first row in an fplll-style basis."""
+    values = []
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            stripped = stripped.lstrip("[").rstrip("]")
+            if stripped:
+                values = [int(value) for value in stripped.split()]
+                break
+    if not values:
+        raise ValueError("cannot read first basis vector from %s" % path)
+    return sum(value * value for value in values)
+
+
 def print_plan(plan, stages):
     print("schedule: %s" % plan.get("name", "unnamed"))
     print("stage tour block BSD D4F jump start BDH")
@@ -168,6 +187,11 @@ def main(argv=None):
         final_sieve = plan.get("final_sieve")
         if final_sieve is not None and not isinstance(final_sieve, dict):
             raise ValueError("final_sieve must be an object")
+        target_norm2 = plan.get("target_norm2")
+        if target_norm2 is not None:
+            target_norm2 = int(target_norm2)
+            if target_norm2 < 1:
+                raise ValueError("target_norm2 must be positive")
     except (OSError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))
     print_plan(plan, stages)
@@ -197,7 +221,7 @@ def main(argv=None):
         parser.error("input does not exist: %s" % source)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         parser.error("hd_sieve is not executable: %s" % binary)
-    identity = run_identity(source, stages)
+    identity = run_identity(source, stages, final_sieve)
     checkpoints = work_dir / "bkz-checkpoints" / identity
     first = checkpoints / "stage-000-input.basis"
     print("run identity: %s" % identity, flush=True)
@@ -207,12 +231,16 @@ def main(argv=None):
         atomic_copy(source, first)
 
     current = first
+    target_reached = False
     for stage in stages:
         for tour in range(1, stage["tours"] + 1):
             target = checkpoints / checkpoint_name(stage, tour)
             if target.exists():
                 print("resume: keeping completed %s" % target.name, flush=True)
                 current = target
+                if target_norm2 is not None and first_vector_norm2(current) <= target_norm2:
+                    target_reached = True
+                    break
                 continue
             local_input = work_dir / scratch_input
             local_output = work_dir / scratch_output
@@ -232,19 +260,34 @@ def main(argv=None):
             os.replace(local_output, target)
             local_input.unlink()
             current = target
+            if target_norm2 is not None:
+                norm2 = first_vector_norm2(current)
+                print("checkpoint first-vector norm2: %d (target %d)" %
+                      (norm2, target_norm2), flush=True)
+                if norm2 <= target_norm2:
+                    print("target reached; stopping progressive BKZ", flush=True)
+                    target_reached = True
+                    break
+        if target_reached:
+            break
 
-    if final_sieve is not None:
+    final_marker = checkpoints / "final-sieve.complete"
+    if final_sieve is not None and not target_reached and final_marker.exists():
+        print("resume: final sieve already completed", flush=True)
+    elif final_sieve is not None and not target_reached:
         local_input = work_dir / scratch_input
         atomic_copy(current, local_input)
         command = final_sieve_command(binary, scratch_input, final_sieve)
         print("running final sieve: " + shell_join(command), flush=True)
         subprocess.run(command, cwd=work_dir, check=True)
         local_input.unlink()
+        final_marker.touch()
 
     if args.output:
         output = args.output.resolve()
         if output.exists() and not output.samefile(current):
-            raise FileExistsError("refusing to overwrite output: %s" % output)
+            if not filecmp.cmp(str(output), str(current), shallow=False):
+                raise FileExistsError("refusing to overwrite output: %s" % output)
         if not output.exists():
             atomic_copy(current, output)
         print("completed: %s" % output)

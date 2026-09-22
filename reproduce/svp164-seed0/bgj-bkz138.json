@@ -1,0 +1,13 @@
+{
+  "name": "svp-164-seed-0-bgj-bkz138",
+  "target_norm2": 11009124,
+  "defaults": {
+    "jump": 9,
+    "dual_hash_ratio": 300,
+    "tours": 1,
+    "start_index": 0
+  },
+  "stages": [
+    {"sieve_dimension": 138, "d4f": 26}
+  ]
+}
