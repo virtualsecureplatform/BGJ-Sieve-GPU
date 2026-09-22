@@ -163,6 +163,13 @@ $ ./hd_sieve --input L_tmp1 --task bkz --BSD 122 --JUMP 8 --D4F 32 --STI 5 --out
 $ ./hd_sieve --input L_tmp2 --task bkz --BSD 129 --JUMP 8 --D4F 35 --STI 0 --output L_tmp3
 ```
 
+For a progressive sequence, [`tools/bkz_scheduler.py`](tools/bkz_scheduler.py)
+runs these tours with per-stage checkpoints and automatic stage-level resume.
+It also includes the jump-9 SVP schedules from Table 3 of Wang, Wang, and Wang
+(ASIA CCS 2023). See [`docs/bkz-scheduler.md`](docs/bkz-scheduler.md). Run the
+actual scheduler only inside a Slurm GPU allocation; `--dry-run` is safe for
+inspecting a plan on a login node.
+
 Note: the files `L_tmp1`, `L_tmp2`, and `L_tmp3` are also included in the `example/` directory. Since sieving is randomized, your intermediate results may look very different from mine, but the basis quality should be comparable.
 
 5. Run one large sieving job:

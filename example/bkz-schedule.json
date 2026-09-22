@@ -1,0 +1,14 @@
+{
+  "name": "example-progressive-pnj-bkz",
+  "defaults": {
+    "jump": 8,
+    "dual_hash_ratio": 300,
+    "tours": 1,
+    "start_index": 0
+  },
+  "stages": [
+    {"sieve_dimension": 115, "d4f": 30},
+    {"sieve_dimension": 122, "d4f": 32, "start_index": 5},
+    {"sieve_dimension": 129, "d4f": 35}
+  ]
+}
