@@ -546,10 +546,13 @@ int _get_real_context(int *ind_l, int *ind_r, uint64_t &hash) {
 
 int task_config_t::run() {
     const char *dir_list[] = {".bucket", ".sol", ".uid", ".pool"};
+    const bool resume_pump_pool = getenv("HD_PUMP_RESUME_CSD") != NULL &&
+        (task == task_bkz || (task == task_local_pump && ind_l == 0));
 
     for (int i = 0; i < ((task == task_local_pump || task == task_bkz) ? 4 : 
                   (task == task_final_sieve || task == task_dual_hash) ? 3 : 0); i++) {
         for (int j = 0; j < hw::ssd_num; j++) {
+            if (i == 3 && resume_pump_pool) continue;
             char dirname[256];
             snprintf(dirname, sizeof(dirname), "%s/%s", dir_list[i], hw::ssd_name(j));
             if (_dir_empty(dirname) != 1) {
@@ -776,14 +779,39 @@ int task_config_t::_run_local_pump() {
 
     Lattice_QP L_locs(loc_basis_file);
     Pool_hd_t pool(&L_locs);
-    if (pool.set_sieving_context(L_locs.NumRows() - start_sieving_dim, L_locs.NumRows())) return -1;
-    pool.set_boost_depth(0);
+    bool resume_pool = false;
+    const char *resume_csd_env = getenv("HD_PUMP_RESUME_CSD");
+    if (resume_csd_env && ind_l == 0) {
+        int saved_l = -1, saved_r = -1;
+        uint64_t saved_hash = 0;
+        const long expected_csd = atol(resume_csd_env);
+        if (_get_real_context(&saved_l, &saved_r, saved_hash) != 0 ||
+            saved_l < 0 || saved_r != L_locs.NumRows() ||
+            saved_r - saved_l != expected_csd || expected_csd > max_sieving_dim ||
+            !saved_hash) {
+            printf("[Error] saved pump pool does not match the requested resume CSD %ld\n", expected_csd);
+            return -1;
+        }
+        if (pool.set_sieving_context(saved_l, saved_r)) return -1;
+        pool.set_boost_depth(0);
+        pool.set_num_threads(configured_pool_threads());
+        if (pool.basis_hash != saved_hash) {
+            printf("[Error] saved pump pool basis hash does not match the input basis\n");
+            return -1;
+        }
+        pool.pwc_manager->set_pool(&pool);
+        if (pool.load(3) || pool.check(3)) return -1;
+        printf("[pump] resumed saved pool at CSD %ld\n", pool.CSD);
+        fflush(stdout);
+        resume_pool = true;
+    } else {
+        if (pool.set_sieving_context(L_locs.NumRows() - start_sieving_dim, L_locs.NumRows())) return -1;
+        pool.set_boost_depth(0);
+        pool.set_num_threads(configured_pool_threads());
+        pool.sampling(BGJ1_SIZE_RATIO * pow(4./3., pool.CSD * .5) - 5);
+    }
 
-    pool.set_num_threads(configured_pool_threads());
-
-    pool.sampling(BGJ1_SIZE_RATIO * pow(4./3., pool.CSD * .5) - 5);
-
-    while (pool.CSD <= max_sieving_dim) {
+    while (!resume_pool && pool.CSD <= max_sieving_dim) {
         gettimeofday(&sieve_start, NULL);
         int ret = _sieve(&pool);
         gettimeofday(&sieve_stop, NULL);
@@ -950,7 +978,7 @@ int task_config_t::_run_bkz() {
         pump_task.enable_dual_hash = bkz_enable_dual_hash;
         pump_task.dual_hash_ratio = bkz_dual_hash_ratio;
         pump_task.enable_down_sieve = 1;
-        if (pump_task.run() == -1) break;
+        if (pump_task.run() != 0) return -1;
         for (int i = 0; i < hw::ssd_num; i++) {
             char cmd[256];
             snprintf(cmd, 256, "find \".pool/%s/\" -name \".*_*\" -type f -delete 2>/dev/null", hw::ssd_name(i));
@@ -958,9 +986,10 @@ int task_config_t::_run_bkz() {
         }
 
         if (last_pump) {
-            char cmd[256];
-            snprintf(cmd, 256, "mv %s %s", next_basis_name, output_file);
-            system(cmd);
+            if (rename(next_basis_name, output_file) != 0) {
+                perror("BKZ output rename failed");
+                return -1;
+            }
             break;
         }
     }

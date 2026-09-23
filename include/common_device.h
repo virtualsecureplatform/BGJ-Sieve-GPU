@@ -2,13 +2,15 @@
 #define __COMMON_DEVICE_H
 
 #include <stdio.h>
+#include <stdlib.h>
 
 #define CHECK_CUDA_ERR(val) do {                                        \
-    if (val) {                                                          \
+    cudaError_t __err = (val);                                          \
+    if (__err != cudaSuccess) {                                         \
         fprintf(stderr, "CUDA error at %s:%d \"%s\", code = %d(%s)\n",  \
-        __FILE__, __LINE__, #val, val, cudaGetErrorString(val));        \
-        cudaGetLastError();                                             \
-        sleep(100000);                                                  \
+        __FILE__, __LINE__, #val, __err, cudaGetErrorString(__err));    \
+        fflush(stderr);                                                 \
+        abort();                                                        \
     }                                                                   \
 } while (0)
 
@@ -17,7 +19,8 @@
     if (__err != cudaSuccess) {                                         \
         fprintf(stderr, "CUDA error found at %s:%d, code = %d(%s)\n",   \
         __FILE__, __LINE__, __err, cudaGetErrorString(__err));          \
-        sleep(100000);                                                  \
+        fflush(stderr);                                                 \
+        abort();                                                        \
     }                                                                   \
 } while (0)
 

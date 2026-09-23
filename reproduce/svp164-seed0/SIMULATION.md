@@ -36,3 +36,11 @@ CSD-138 and CSD-142 jobs remain necessary; this simulation does not claim that
 BKZ-138 alone will solve the instance.
 
 No enumeration, GPU kernel, or sieve was run for this analysis.
+
+Operational recovery note (2026-09-23): the CSD-138 sieve pool from the first
+BKZ pump completed, but the first dual-hash pump-down insertion failed with a
+CUDA illegal-memory-access error. The recovery schedule sets `BDH=0` so that
+pump-down uses the ordinary insertion path. This changes the actual BKZ tour
+and has not been validated by the simulation above. `RESUME_CSD=138` reuses the
+saved first-pump pool only after checking its context and basis hash; later
+pumps start normally. The scheduler still checkpoints only completed tours.

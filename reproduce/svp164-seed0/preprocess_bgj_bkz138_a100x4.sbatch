@@ -7,6 +7,7 @@
 #SBATCH --output=/LARGE0/gr20116/%u/BGJ-Sieve-GPU/logs/svp164-bgj/slurm-%x-%j.out
 
 set -euo pipefail
+ulimit -c 0
 
 SOURCE="${SLURM_SUBMIT_DIR}"
 LARGE_BASE="/LARGE0/gr20116/${USER}/BGJ-Sieve-GPU"
@@ -19,6 +20,7 @@ BUILD_ROOT="${LARGE_BASE}/builds/svp164-bgj-bkz138-${SLURM_JOB_ID}"
 LOG_ROOT="${LARGE_BASE}/logs/svp164-bgj"
 
 mkdir -p "${RUN_ROOT}" "${BUILD_ROOT}" "${LOG_ROOT}" "$(dirname "${OUTPUT}")"
+RESUME_CSD="${RESUME_CSD:-}"
 for kind in pool bucket sol uid; do
     for device in 0 1 2 3; do
         mkdir -p "${RUN_ROOT}/.${kind}/${device}"
@@ -26,7 +28,9 @@ for kind in pool bucket sol uid; do
     # These files are per-pump scratch, not scheduler checkpoints.  A killed
     # pump can leave tens of thousands of stale files which must not be loaded
     # by the restarted tour.
-    find "${RUN_ROOT}/.${kind}" -type f -delete
+    if [[ "${kind}" != pool || -z "${RESUME_CSD}" ]]; then
+        find "${RUN_ROOT}/.${kind}" -type f -delete
+    fi
 done
 find "${RUN_ROOT}" -maxdepth 1 -type f \
     \( -name '.bkz-scheduler-input.basis_*' -o -name '.bkz.tmp_basis' \) -delete
@@ -43,6 +47,9 @@ export APPTAINERENV_HD_GPU_NATIVE_BWC_P2P=1
 export APPTAINERENV_HD_HBM_BWC_GB=24
 export APPTAINERENV_HD_HBM_BWC_MIN_CSD=100
 export APPTAINERENV_HD_BUCKET_THREADS=20
+if [[ -n "${RESUME_CSD}" ]]; then
+    export APPTAINERENV_HD_PUMP_RESUME_CSD="${RESUME_CSD}"
+fi
 
 timeout --signal=TERM --kill-after=60s 258930s \
     apptainer exec --nv \

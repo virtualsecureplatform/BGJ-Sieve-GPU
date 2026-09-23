@@ -1,9 +1,9 @@
 {
-  "name": "svp-164-seed-0-bgj-bkz138",
+  "name": "svp-164-seed-0-bgj-bkz138-no-dh",
   "target_norm2": 11009124,
   "defaults": {
     "jump": 9,
-    "dual_hash_ratio": 300,
+    "dual_hash_ratio": 0,
     "tours": 1,
     "start_index": 0
   },
