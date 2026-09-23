@@ -2529,6 +2529,12 @@ struct load_ckpfcher_t {
 
 int Pool_hd_t::load(long log_level) {
     lg_init();
+    const bool recovery_trace = getenv("HD_PUMP_RECOVERY_TRACE") != NULL;
+    if (recovery_trace) {
+        fprintf(stderr, "[pool-load] enter csd=%ld threads=%ld time=%ld\n",
+                CSD, _num_threads, (long)time(NULL));
+        fflush(stderr);
+    }
     
     if (pwc_manager->num_chunks()) {
         lg_err("pool is not empty, nothing done.");
@@ -2650,6 +2656,11 @@ int Pool_hd_t::load(long log_level) {
         std::sort(exist_ids.begin(), exist_ids.end(), std::greater<int32_t>());
         exist_ids_ptr = exist_ids.data();
         exist_ids_size = exist_ids.size();
+        if (recovery_trace) {
+            fprintf(stderr, "[pool-load] discovery complete files=%d wrong_names=%zu time=%ld\n",
+                    exist_ids_size, wrong_name.size(), (long)time(NULL));
+            fflush(stderr);
+        }
 
         time_t now = time(NULL);
         struct tm *local_time = localtime(&now);
@@ -2682,6 +2693,12 @@ int Pool_hd_t::load(long log_level) {
     constexpr int taskVecs = traits::taskVecs;
 
     load_ckpfcher_t ckpfcher(this, &exist_ids_size);
+    std::atomic<long> recovered_chunks{0};
+    if (recovery_trace) {
+        fprintf(stderr, "[pool-load] workers begin devices=%d time=%ld\n",
+                num_devices, (long)time(NULL));
+        fflush(stderr);
+    }
 
     #pragma omp parallel for num_threads(_num_threads)
     for (long thread = 0; thread < _num_threads; thread++) {
@@ -2918,6 +2935,15 @@ int Pool_hd_t::load(long log_level) {
                 WRITE_BACK_TO_CHUNK(chunk);
                 if (num_used == task_vecs) break;
             }
+            if (recovery_trace && task_chunks) {
+                long before = recovered_chunks.fetch_add(task_chunks);
+                long after = before + task_chunks;
+                if (before / 8192 != after / 8192) {
+                    fprintf(stderr, "[pool-load] recovered_chunks=%ld/%zu time=%ld\n",
+                            after, exist_ids.size(), (long)time(NULL));
+                    fflush(stderr);
+                }
+            }
             if (exist_ids_size == 0) break;
         }
         
@@ -2929,6 +2955,11 @@ int Pool_hd_t::load(long log_level) {
     }
 
     ut_checker.input_done();
+    if (recovery_trace) {
+        fprintf(stderr, "[pool-load] workers complete recovered_chunks=%ld time=%ld\n",
+                recovered_chunks.load(), (long)time(NULL));
+        fflush(stderr);
+    }
 
     for (int i = 0; i < num_devices; i++) CHECK_CUDA_ERR(cudaFree(local_data[i]));
     pthread_spin_destroy(&lock);
@@ -3104,6 +3135,10 @@ int Pool_hd_t::load(long log_level) {
     #undef WAIT_CONFIRM_FOR
 
     ut_checker.wait_work();
+    if (recovery_trace) {
+        fprintf(stderr, "[pool-load] uid check complete time=%ld\n", (long)time(NULL));
+        fflush(stderr);
+    }
     pthread_spin_destroy(&stat_lock);
     
     lg_report();

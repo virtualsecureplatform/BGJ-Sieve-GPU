@@ -782,6 +782,9 @@ int task_config_t::_run_local_pump() {
     bool resume_pool = false;
     const char *resume_csd_env = getenv("HD_PUMP_RESUME_CSD");
     if (resume_csd_env && ind_l == 0) {
+        fprintf(stderr, "[pump-resume] begin validation requested_csd=%s time=%ld\n",
+                resume_csd_env, (long)time(NULL));
+        fflush(stderr);
         int saved_l = -1, saved_r = -1;
         uint64_t saved_hash = 0;
         const long expected_csd = atol(resume_csd_env);
@@ -800,7 +803,16 @@ int task_config_t::_run_local_pump() {
             return -1;
         }
         pool.pwc_manager->set_pool(&pool);
-        if (pool.load(3) || pool.check(3)) return -1;
+        fprintf(stderr, "[pump-resume] load begin csd=%ld hash=%lx time=%ld\n",
+                pool.CSD, (unsigned long)saved_hash, (long)time(NULL));
+        fflush(stderr);
+        if (pool.load(3)) return -1;
+        fprintf(stderr, "[pump-resume] load complete chunks=%ld vectors=%ld time=%ld\n",
+                pool.pwc_manager->num_chunks(), pool.pwc_manager->num_vec(), (long)time(NULL));
+        fflush(stderr);
+        if (pool.check(3)) return -1;
+        fprintf(stderr, "[pump-resume] check complete time=%ld\n", (long)time(NULL));
+        fflush(stderr);
         printf("[pump] resumed saved pool at CSD %ld\n", pool.CSD);
         fflush(stdout);
         resume_pool = true;
