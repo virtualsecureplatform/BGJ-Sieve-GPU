@@ -18,6 +18,9 @@ CPPFLAGS="-DHD_A100X4_500G_CACHE_PROFILE=1 -DPOOL_HOST_VEC_MAX_DIM=144 -DENABLE_
 # Cancellation interrupted some individual copies.  Quarantine those files;
 # the independent partial replay may only load complete CSD138 chunks.
 mkdir -p "${REPLAY}/quarantine"
+for device in 0 1 2 3; do
+    mkdir -p "${REPLAY}/.pool/${device}"
+done
 find "${REPLAY}/.pool" -type f ! -size 1249280c -print0 |
     while IFS= read -r -d '' file; do
         mv "${file}" "${REPLAY}/quarantine/$(basename "${file}")"
