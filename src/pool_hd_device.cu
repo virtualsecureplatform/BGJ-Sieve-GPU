@@ -2967,6 +2967,7 @@ int Pool_hd_t::load(long log_level) {
             logger->ev_ld_stall_us += ld_stall_us;
 
             #else
+            utils_t::device_unpackf(stream, d_buffer, pack_buffer, CSD, task_vecs);
             if (recovery_trace) gpu_launched_chunks.fetch_add(task_chunks);
             traits::launch(stream, d_buffer, task_vecs, local_data[device_ptr]);
             utils_t::device_packf(stream, pack_buffer, d_buffer, CSD, task_vecs);
@@ -3199,6 +3200,12 @@ int Pool_hd_t::load(long log_level) {
         fflush(stderr);
     }
     pthread_spin_destroy(&stat_lock);
+    if (!exist_ids.empty() && pwc_manager->num_vec() == 0) {
+        lg_err("pool recovery produced zero vectors from %zu saved chunks",
+               exist_ids.size());
+        lg_exit();
+        return -1;
+    }
     
     lg_report();
     lg_exit();

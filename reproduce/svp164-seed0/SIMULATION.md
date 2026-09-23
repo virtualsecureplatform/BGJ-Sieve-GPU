@@ -53,3 +53,7 @@ roughly 52,920 chunks. The initial pinned host arena is 64 GiB, or about
 52,924 chunks at this build's slot size. Recovery workers were all waiting
 while reserving output chunks. `Pool_hd_t::load()` now grows the arena for the
 saved pool before starting workers and fails explicitly if that growth fails.
+The first fully loaded diagnostic run then exposed a separate non-profiling
+recovery bug: the GPU check kernel ran before packed vectors were unpacked,
+producing an empty pool. The non-profiling path now unpacks first and rejects
+an empty recovered pool rather than continuing into sieving.
