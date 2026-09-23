@@ -2676,13 +2676,36 @@ int Pool_hd_t::load(long log_level) {
     logger->num_thread = this->_num_threads;
     #endif
 
+    typedef check_traits traits;
+    constexpr int taskChunks = traits::taskChunks;
+    constexpr int taskVecs = traits::taskVecs;
+
+    // Recovery creates output chunks while the input is still being read.
+    // The A100 profile starts with a 64-GiB pinned arena; exhausting it makes
+    // every worker wait in chunk_arena_t::allocate() with no worker left to
+    // release a slot.  Grow once, before starting any recovery workers.
+    const long required_arena_chunks = (long)exist_ids.size() +
+        2 * _num_threads * taskChunks + load_ckpfcher_t::pfch_ahead + 256;
+    const long arena_chunks = _ensure_regular_chunk_capacity(required_arena_chunks);
+    if (recovery_trace) {
+        fprintf(stderr, "[pool-load] arena capacity=%ld required=%ld time=%ld\n",
+                arena_chunks, required_arena_chunks, (long)time(NULL));
+        fflush(stderr);
+    }
+    if (arena_chunks < required_arena_chunks) {
+        lg_err("host chunk arena growth failed: capacity %ld, required %ld",
+               arena_chunks, required_arena_chunks);
+        pthread_spin_destroy(&lock);
+        pthread_spin_destroy(&stat_lock);
+        lg_exit();
+        return -1;
+    }
+
     ut_checker_t ut_checker(ut_checker_t::type_others, this, uid_table, pwc_manager);
 
     ut_checker.set_exp_batch(exist_ids_size * ut_checker_t::default_batch_ratio);
     ut_checker.set_max_available_id(&max_available_id);
     ut_checker.set_score_stat(score_stat, stat_lock);
-
-    typedef check_traits traits;
 
     for (int i = 0; i < 65536; i++) score_stat[i] = 0U;
 
@@ -2691,9 +2714,6 @@ int Pool_hd_t::load(long log_level) {
         CHECK_CUDA_ERR(cudaSetDevice(hw::gpu_id_list[i]));
         traits::prep_device_local_data(local_data[i], this);
     }
-    constexpr int taskChunks = traits::taskChunks;
-    constexpr int taskVecs = traits::taskVecs;
-
     load_ckpfcher_t ckpfcher(this, &exist_ids_size);
     std::atomic<long> recovered_chunks{0};
     std::atomic<long> selected_chunks{0};

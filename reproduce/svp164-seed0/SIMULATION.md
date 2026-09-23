@@ -47,3 +47,9 @@ pumps start normally. The saved pool is actually at CSD 135: `store()` flushes
 only every sixth call, so CSD 136--138 must be rerun. The recovery patch also
 forces a flush at the terminal CSD. The scheduler still checkpoints only
 completed tours.
+
+Recovery diagnosis: loading the CSD-135 checkpoint repeatedly stopped after
+roughly 52,920 chunks. The initial pinned host arena is 64 GiB, or about
+52,924 chunks at this build's slot size. Recovery workers were all waiting
+while reserving output chunks. `Pool_hd_t::load()` now grows the arena for the
+saved pool before starting workers and fails explicitly if that growth fails.
