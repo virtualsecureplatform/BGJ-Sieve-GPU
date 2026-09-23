@@ -958,6 +958,20 @@ int task_config_t::_run_dual_hash() {
 
     pool.check(3);
 
+    const char *replay_insert = getenv("HD_DH_REPLAY_INSERT");
+    if (replay_insert && atoi(replay_insert) != 0) {
+        const char *max_time_env = getenv("HD_DH_REPLAY_MAXTIME");
+        double max_time = max_time_env ? atof(max_time_env) : 0.0;
+        long pos = -1;
+        printf("[dh-replay] begin dh_insert csd=%ld target_index=%ld max_time=%.2f\n",
+               pool.CSD, target_position, max_time);
+        fflush(stdout);
+        int result = pool.dh_insert(target_position, 1.2, max_time, &pos);
+        printf("[dh-replay] end dh_insert result=%d pos=%ld\n", result, pos);
+        fflush(stdout);
+        return result == -2 ? -1 : 0;
+    }
+
     pool.dh_final(target_position, 1.2);
 
     return 0;
