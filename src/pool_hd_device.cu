@@ -9,6 +9,8 @@
 using namespace nvcuda;
 
 #include <algorithm>    // for sort, maybe...
+#include <chrono>
+#include <thread>
 #include <vector>
 #include <unordered_map>
 
@@ -2694,6 +2696,27 @@ int Pool_hd_t::load(long log_level) {
 
     load_ckpfcher_t ckpfcher(this, &exist_ids_size);
     std::atomic<long> recovered_chunks{0};
+    std::atomic<long> selected_chunks{0};
+    std::atomic<long> disk_ready_chunks{0};
+    std::atomic<long> gpu_ready_chunks{0};
+    std::atomic<long> uid_handoff_chunks{0};
+    std::atomic<bool> recovery_monitor_stop{false};
+    std::thread recovery_monitor;
+    if (recovery_trace) {
+        recovery_monitor = std::thread([&]() {
+            while (!recovery_monitor_stop.load()) {
+                for (int i = 0; i < 30 && !recovery_monitor_stop.load(); i++)
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (recovery_monitor_stop.load()) break;
+                fprintf(stderr, "[pool-load] heartbeat selected=%ld disk_ready=%ld "
+                        "gpu_ready=%ld uid_handoff=%ld recovered=%ld/%zu time=%ld\n",
+                        selected_chunks.load(), disk_ready_chunks.load(),
+                        gpu_ready_chunks.load(), uid_handoff_chunks.load(),
+                        recovered_chunks.load(), exist_ids.size(), (long)time(NULL));
+                fflush(stderr);
+            }
+        });
+    }
     if (recovery_trace) {
         fprintf(stderr, "[pool-load] workers begin devices=%d time=%ld\n",
                 num_devices, (long)time(NULL));
@@ -2748,6 +2771,7 @@ int Pool_hd_t::load(long log_level) {
                 pthread_spin_unlock(&lock);
 
                 if (id != -1) {
+                    if (recovery_trace) selected_chunks.fetch_add(1);
                     char chunk_filename[256];
                     #if MULTI_SSD
                     snprintf(chunk_filename, sizeof(chunk_filename), "%s/%s/%s%06x", pwc_manager->dir(), 
@@ -2842,6 +2866,7 @@ int Pool_hd_t::load(long log_level) {
                     #endif
                     task_vecs += dst_chunk->size;
                     task_chunks++;
+                    if (recovery_trace) disk_ready_chunks.fetch_add(1);
                     close(fd);
                     exist_ids[ptr] = -1;
                     continue;
@@ -2926,6 +2951,7 @@ int Pool_hd_t::load(long log_level) {
                         cudaMemcpyDeviceToHost, stream));
             CHECK_CUDA_ERR(cudaStreamSynchronize(stream));
             #endif
+            if (recovery_trace) gpu_ready_chunks.fetch_add(task_chunks);
 
             // write back
             int num_used = 0;
@@ -2933,6 +2959,7 @@ int Pool_hd_t::load(long log_level) {
                 chunk_t *chunk = to_store[i];
 
                 WRITE_BACK_TO_CHUNK(chunk);
+                if (recovery_trace) uid_handoff_chunks.fetch_add(1);
                 if (num_used == task_vecs) break;
             }
             if (recovery_trace && task_chunks) {
@@ -3135,6 +3162,10 @@ int Pool_hd_t::load(long log_level) {
     #undef WAIT_CONFIRM_FOR
 
     ut_checker.wait_work();
+    if (recovery_trace) {
+        recovery_monitor_stop.store(true);
+        recovery_monitor.join();
+    }
     if (recovery_trace) {
         fprintf(stderr, "[pool-load] uid check complete time=%ld\n", (long)time(NULL));
         fflush(stderr);
