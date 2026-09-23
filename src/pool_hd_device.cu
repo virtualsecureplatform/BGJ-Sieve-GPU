@@ -2698,6 +2698,8 @@ int Pool_hd_t::load(long log_level) {
     std::atomic<long> recovered_chunks{0};
     std::atomic<long> selected_chunks{0};
     std::atomic<long> disk_ready_chunks{0};
+    std::atomic<long> output_reserved_chunks{0};
+    std::atomic<long> gpu_launched_chunks{0};
     std::atomic<long> gpu_ready_chunks{0};
     std::atomic<long> uid_handoff_chunks{0};
     std::atomic<bool> recovery_monitor_stop{false};
@@ -2709,10 +2711,13 @@ int Pool_hd_t::load(long log_level) {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
                 if (recovery_monitor_stop.load()) break;
                 fprintf(stderr, "[pool-load] heartbeat selected=%ld disk_ready=%ld "
-                        "gpu_ready=%ld uid_handoff=%ld recovered=%ld/%zu time=%ld\n",
+                        "output_reserved=%ld gpu_launched=%ld gpu_ready=%ld "
+                        "uid_handoff=%ld recovered=%ld/%zu cache_limit=%ld time=%ld\n",
                         selected_chunks.load(), disk_ready_chunks.load(),
+                        output_reserved_chunks.load(), gpu_launched_chunks.load(),
                         gpu_ready_chunks.load(), uid_handoff_chunks.load(),
-                        recovered_chunks.load(), exist_ids.size(), (long)time(NULL));
+                        recovered_chunks.load(), exist_ids.size(),
+                        pwc_manager->max_cached_chunks(), (long)time(NULL));
                 fflush(stderr);
             }
         });
@@ -2901,12 +2906,14 @@ int Pool_hd_t::load(long log_level) {
             chunk_t *to_store[taskChunks];
             for (int i = 0; i * chunk_max_nvecs < task_vecs; i++) {
                 to_store[i] = ckpfcher.pop();
+                if (recovery_trace) output_reserved_chunks.fetch_add(1);
             }
             
             #if ENABLE_PROFILING
             CHECK_CUDA_ERR(cudaEventRecord(ev[task_chunks*2+0], stream));
             utils_t::device_unpackf(stream, d_buffer, pack_buffer, CSD, task_vecs);
             CHECK_CUDA_ERR(cudaEventRecord(ev[task_chunks*2+1], stream));
+            if (recovery_trace) gpu_launched_chunks.fetch_add(task_chunks);
             traits::launch(stream, d_buffer, task_vecs, local_data[device_ptr]);
             CHECK_CUDA_ERR(cudaEventRecord(ev[task_chunks*2+2], stream));
             utils_t::device_packf(stream, pack_buffer, d_buffer, CSD, task_vecs);
@@ -2940,6 +2947,7 @@ int Pool_hd_t::load(long log_level) {
             logger->ev_ld_stall_us += ld_stall_us;
 
             #else
+            if (recovery_trace) gpu_launched_chunks.fetch_add(task_chunks);
             traits::launch(stream, d_buffer, task_vecs, local_data[device_ptr]);
             utils_t::device_packf(stream, pack_buffer, d_buffer, CSD, task_vecs);
             for (int i = 0; i * chunk_max_nvecs < task_vecs; i++) {
