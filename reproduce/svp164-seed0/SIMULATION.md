@@ -43,4 +43,7 @@ CUDA illegal-memory-access error. The recovery schedule sets `BDH=0` so that
 pump-down uses the ordinary insertion path. This changes the actual BKZ tour
 and has not been validated by the simulation above. `RESUME_CSD=138` reuses the
 saved first-pump pool only after checking its context and basis hash; later
-pumps start normally. The scheduler still checkpoints only completed tours.
+pumps start normally. The saved pool is actually at CSD 135: `store()` flushes
+only every sixth call, so CSD 136--138 must be rerun. The recovery patch also
+forces a flush at the terminal CSD. The scheduler still checkpoints only
+completed tours.

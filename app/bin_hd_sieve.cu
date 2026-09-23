@@ -811,7 +811,13 @@ int task_config_t::_run_local_pump() {
         pool.sampling(BGJ1_SIZE_RATIO * pow(4./3., pool.CSD * .5) - 5);
     }
 
-    while (!resume_pool && pool.CSD <= max_sieving_dim) {
+    // store() checkpoints after a completed sieve at its recorded CSD.  On
+    // recovery continue with the next dimension, not a duplicate sieve.
+    const bool sieve_needed = !resume_pool || pool.CSD < max_sieving_dim;
+    if (resume_pool && sieve_needed) {
+        if (pool.extend_left()) return -1;
+    }
+    while (sieve_needed && pool.CSD <= max_sieving_dim) {
         gettimeofday(&sieve_start, NULL);
         int ret = _sieve(&pool);
         gettimeofday(&sieve_stop, NULL);
@@ -825,7 +831,7 @@ int task_config_t::_run_local_pump() {
                     return -1;
                 }
             }
-            pool.store();
+            pool.store(pool.CSD == max_sieving_dim);
             if (pool.CSD < max_sieving_dim) {
                 if (pool.extend_left()) return -1;
                 last_sieve_time = 0.0;
