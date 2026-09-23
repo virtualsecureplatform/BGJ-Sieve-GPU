@@ -61,7 +61,15 @@ int Pool_hd_t::dh_insert(long target_index, double eta, double max_time, long *p
     bucketer->logger->set_log_err(this->logger->log_err());
     #endif
 
-    bucketer->auto_bgj_params_set();
+    if (bucketer->auto_bgj_params_set()) {
+        delete reducer;
+        delete bucketer;
+        delete bwc_manager;
+        this->set_boost_depth(old_ESD);
+        if (pos) pos[0] = -1;
+        lg_exit();
+        return -1;
+    }
     reducer->auto_bgj_params_set();
 
     std::thread bucketer_thread([&]() { bucketer->run(max_time); });
@@ -186,7 +194,14 @@ int Pool_hd_t::dh_final(long target_index, double eta, double max_time, double t
     bucketer->logger->set_log_err(this->logger->log_err());
     #endif
 
-    bucketer->auto_bgj_params_set();
+    if (bucketer->auto_bgj_params_set()) {
+        delete reducer;
+        delete bucketer;
+        delete bwc_manager;
+        this->set_boost_depth(old_ESD);
+        lg_exit();
+        return -1;
+    }
     reducer->auto_bgj_params_set();
 
     std::thread bucketer_thread([&]() { bucketer->run(max_time); });
@@ -1565,7 +1580,15 @@ int dh_bucketer_t::set_num_buc_slimit(long num_buc_slimit) {
 int dh_bucketer_t::auto_bgj_params_set() {
     int ESD = _pool->ESD;
     double pool_size = _pool->pwc_manager->num_vec();
-    double expect_buc_size = DH_BSIZE_RATIO * sqrt(pool_size);
+    const double nominal_buc_size = DH_BSIZE_RATIO * sqrt(pool_size);
+    // The GPU bucketing kernel needs at least one complete 256-bucket batch.
+    // At large pool sizes the nominal bucket size makes the 32 GiB disk cap
+    // admit fewer than 256 buckets.  Reduce the radius instead of rounding
+    // the batch down to zero; reserve 20% for bucket-size variation.
+    const double budgeted_buc_size = (double)BWC_SSD_SLIMIT /
+        (DH_MIN_BATCH * 190.0 * 1.20);
+    const double expect_buc_size = nominal_buc_size < budgeted_buc_size ?
+        nominal_buc_size : budgeted_buc_size;
     double expect_buc_ratio = expect_buc_size / pool_size;
     this->_beta = pow(expect_buc_ratio, 1.0 / _pool->ESD);
     if (this->_beta > 0.95) this->_beta = 0.95;
@@ -1581,6 +1604,11 @@ int dh_bucketer_t::auto_bgj_params_set() {
     const int cache_for_bucketer = _bwc->max_cached_chunks() - cache_for_prefetch;
     int expect_max_batch = traits::max_batch_under(cache_for_bucketer < DH_MAX_BATCH ? cache_for_bucketer : DH_MAX_BATCH);
     if (_pool->ESD > 40 && expect_max_batch > 1024) expect_max_batch = 1024;
+    if (_num_buc_slimit < DH_MIN_BATCH || expect_max_batch < DH_MIN_BATCH) {
+        fprintf(stderr, "[dh-config] insufficient bucket slots or cache: slots=%ld cache_batch=%d (minimum %d)\n",
+                _num_buc_slimit, expect_max_batch, DH_MIN_BATCH);
+        return -1;
+    }
     if (!this->_max_batch) this->_max_batch = expect_max_batch < _num_buc_slimit ? 
                                               expect_max_batch : traits::max_batch_under(_num_buc_slimit);
     if (!this->_min_batch) {
@@ -1588,6 +1616,17 @@ int dh_bucketer_t::auto_bgj_params_set() {
         if (this->_min_batch < DH_MIN_BATCH) this->_min_batch = DH_MIN_BATCH;
         if (this->_min_batch > this->_max_batch) this->_min_batch = this->_max_batch;
     }
+    if (_max_batch < DH_MIN_BATCH || _max_batch % DH_MIN_BATCH != 0 ||
+        _min_batch < DH_MIN_BATCH || _min_batch > _max_batch) {
+        fprintf(stderr, "[dh-config] invalid batch range [%ld, %ld] (unit %d)\n",
+                _min_batch, _max_batch, DH_MIN_BATCH);
+        return -1;
+    }
+
+    fprintf(stderr, "[dh-config] pool_vec=%.0f bucket_target=%.0f nominal=%.0f beta=%.6f slots=%ld batch=[%ld,%ld]\n",
+            pool_size, expect_buc_size, nominal_buc_size, _beta,
+            _num_buc_slimit, _min_batch, _max_batch);
+    fflush(stderr);
 
     if (!this->_num_threads) this->set_num_threads(traits::buc_num_threads(_pool->CSD));
 
