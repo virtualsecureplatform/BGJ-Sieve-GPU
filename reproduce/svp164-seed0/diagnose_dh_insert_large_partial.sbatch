@@ -17,6 +17,9 @@ BINARY="${LARGE_BASE}/builds/svp164-dh-partial-replay-297758/hd_sieve"
 SIF="${LARGE_BASE}/bgj-sieve-gpu-cuda13.3.sif"
 
 mkdir -p "${REPLAY}"
+for device in 0 1 2 3; do
+    mkdir -p "${REPLAY}/.pool/${device}"
+done
 if [[ -z "${STAGE_JOB:-}" ]]; then
     mkdir -p "${STAGE}"
     # Link first, while the live job may unlink old chunk names.  The replay
