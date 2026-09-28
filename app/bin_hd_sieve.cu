@@ -664,6 +664,22 @@ int task_config_t::_run_final_sieve() {
         // vector again would only add network traffic.
         report_host_memory("resume_extend_done", pool.CSD);
     }
+    // A non-MPI stage can explicitly mark a fully sieved, force-flushed pool.
+    // This is only used after a prior job completed successfully; a pool from
+    // an interrupted dimension must never take this shortcut.
+    const char *completed_csd = getenv("HD_RESUME_COMPLETED_CSD");
+    if (!mpi_sieve_active() && completed_csd) {
+        if (atol(completed_csd) != pool.CSD) {
+            printf("[Error] completed CSD %s does not match loaded CSD %ld\n",
+                   completed_csd, pool.CSD);
+            return -1;
+        }
+        printf("[sieve-resume] skipping completed CSD %ld\n", pool.CSD);
+        fflush(stdout);
+        if (pool.CSD >= target_sieving_dim) return 0;
+        if (pool.extend_left()) return -1;
+        report_host_memory("resume_extend_done", pool.CSD);
+    }
 
     for (;;) {
         report_host_memory("sieve_start", pool.CSD);
@@ -674,6 +690,9 @@ int task_config_t::_run_final_sieve() {
         if (mpi_sieve_should_stop()) {
             return -1;
         }
+        // Preserve completed non-MPI dimensions before the next extension.
+        // In particular, a separate CSD-144 job may safely start at CSD 143.
+        if (!mpi_sieve_active() && pool.store(true)) return -1;
         if (ret == 1) {
             break;
         }

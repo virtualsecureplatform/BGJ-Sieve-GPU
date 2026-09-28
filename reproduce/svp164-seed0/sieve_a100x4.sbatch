@@ -26,7 +26,7 @@ for kind in pool bucket sol uid; do
     done
 done
 
-BUILD_CPPFLAGS="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_A100X4_PWC_GB=405 -DHD_A100X4_BWC_GB=1 -DHD_A100X4_SWC_GB=4 -DPOOL_HOST_VEC_MAX_DIM=144 -DENABLE_PROFILING=0"
+BUILD_CPPFLAGS="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_A100X4_PWC_GB=${PWC_GB:-405} -DHD_A100X4_BWC_GB=1 -DHD_A100X4_SWC_GB=4 -DPOOL_HOST_VEC_MAX_DIM=144 -DENABLE_PROFILING=0"
 apptainer exec --nv --bind "${SOURCE}","${BUILD_ROOT}" "${SIF}" bash -lc \
     "make -B -C '${SOURCE}/src' -j 16 CPPFLAGS='${BUILD_CPPFLAGS}' && make -B -C '${SOURCE}/app' -j 4 hd_sieve CPPFLAGS='${BUILD_CPPFLAGS}' && cp '${SOURCE}/app/hd_sieve' '${BUILD_ROOT}/'"
 
@@ -39,12 +39,15 @@ export APPTAINERENV_HD_SYNC_EVERY=1
 export APPTAINERENV_HD_PROFILE_BUCKET_STATS=0
 export APPTAINERENV_HD_GPU_NATIVE_BWC=1
 export APPTAINERENV_HD_GPU_NATIVE_BWC_P2P=1
-export APPTAINERENV_HD_HBM_BWC_GB=24
+export APPTAINERENV_HD_HBM_BWC_GB="${HD_HBM_BWC_GB:-24}"
 export APPTAINERENV_HD_HBM_BWC_MIN_CSD=100
 export APPTAINERENV_HD_BUCKET_THREADS=16
+if [[ -n "${HD_RESUME_COMPLETED_CSD:-}" ]]; then
+    export APPTAINERENV_HD_RESUME_COMPLETED_CSD="${HD_RESUME_COMPLETED_CSD}"
+fi
 
 echo "job=${SLURM_JOB_ID} basis=${BASIS} target_csd=${TSD} persistent_run_root=${RUN_ROOT}"
-timeout --signal=TERM --kill-after=60s 86130s \
+timeout --signal=TERM --kill-after=60s "${SIEVE_TIMEOUT_SECONDS:-86130}s" \
     apptainer exec --nv \
         --bind "${BUILD_ROOT}","${RUN_ROOT}","$(dirname "${BASIS}")" \
         --pwd "${RUN_ROOT}" \
