@@ -88,14 +88,21 @@ def normalize_stages(plan):
         jump = int(stage.get("jump", 1))
         tours = int(stage.get("tours", 1))
         start = int(stage.get("start_index", 0))
+        stop = stage.get("stop_index")
+        stop = int(stop) if stop is not None else None
         bdh = int(stage.get("dual_hash_ratio", 300))
         if beta < 40 or bsd < 40:
             raise ValueError("stage %d has unsupported sieving dimension %d (< 40)" % (number, bsd))
         if d4f < 0 or jump < 1 or tours < 1 or start < 0 or bdh < 0:
             raise ValueError("stage %d contains a negative value or zero jump/tours" % number)
-        result.append({"number": number, "block_size": beta, "bsd": bsd,
-                       "d4f": d4f, "jump": jump, "tours": tours,
-                       "start_index": start, "bdh": bdh})
+        if stop is not None and stop <= start:
+            raise ValueError("stage %d stop_index must exceed start_index" % number)
+        normalized = {"number": number, "block_size": beta, "bsd": bsd,
+                      "d4f": d4f, "jump": jump, "tours": tours,
+                      "start_index": start, "bdh": bdh}
+        if stop is not None:
+            normalized["stop_index"] = stop
+        result.append(normalized)
     if not result:
         raise ValueError("schedule has no stages")
     return result
@@ -122,10 +129,13 @@ def atomic_copy(source, destination):
 
 
 def command_for(binary, input_name, output_name, stage):
-    return [str(binary), "--input", input_name, "--task", "bkz",
+    command = [str(binary), "--input", input_name, "--task", "bkz",
             "--BSD", str(stage["bsd"]), "--JUMP", str(stage["jump"]),
             "--D4F", str(stage["d4f"]), "--BDH", str(stage["bdh"]),
             "--STI", str(stage["start_index"]), "--output", output_name]
+    if stage.get("stop_index") is not None:
+        command.extend(("--STOP_INDEX", str(stage["stop_index"])))
+    return command
 
 
 def final_sieve_command(binary, input_name, settings):

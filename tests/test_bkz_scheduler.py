@@ -30,6 +30,21 @@ class BkzSchedulerTests(unittest.TestCase):
         self.assertEqual(stages[0]["block_size"], 145)
         self.assertEqual(stages[0]["tours"], 2)
 
+    def test_pump_checkpoint_stage_passes_stop_index(self):
+        stage = SCHEDULER.normalize_stages({
+            "stages": [{"sieve_dimension": 143, "d4f": 21,
+                        "jump": 9, "start_index": 9, "stop_index": 18}]
+        })[0]
+        command = SCHEDULER.command_for("hd_sieve", "in", "out", stage)
+        self.assertEqual(command[-2:], ["--STOP_INDEX", "18"])
+
+    def test_stop_index_must_exceed_start(self):
+        with self.assertRaises(ValueError):
+            SCHEDULER.normalize_stages({
+                "stages": [{"block_size": 164, "start_index": 9,
+                            "stop_index": 9}]
+            })
+
     def test_final_sieve_arguments(self):
         command = SCHEDULER.final_sieve_command("hd_sieve", "basis", {
             "target_sieving_dimension": 120, "min_lifting_dimension": 118

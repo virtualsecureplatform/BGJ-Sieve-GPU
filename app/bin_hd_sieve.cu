@@ -63,6 +63,7 @@ struct task_config_t {
     /* for bkz only */
     long bkz_sieving_dim = val_not_assigned;
     long bkz_start_index = 0;
+    long bkz_stop_index = val_not_assigned;
     long bkz_jump_step = 8;
     long bkz_dim_for_free = 35;
     long bkz_enable_dual_hash = 1;
@@ -179,7 +180,8 @@ int task_config_t::show_help(const char *argv0) {
     printf("    --JUMP          Set jump step\n");
     printf("    --D4F           Set dimension for free\n");
     printf("    --BDH           Set dual hash ratio\n");
-    printf("    --STI           Set start index\n\n");
+    printf("    --STI           Set start index\n");
+    printf("    --STOP_INDEX    Stop after the pump before this index\n\n");
 
     return 0;
 }
@@ -379,6 +381,12 @@ int task_config_t::parse_args(int argc, char **argv) {
                     return -1;
                 }
                 bkz_start_index = atoi(argv[i]);
+            } else if (strcasecmp(argv[i], "--STOP_INDEX") == 0) {
+                if (++i >= argc) {
+                    printf("Error: missing value for %s\n", argv[i-1]);
+                    return -1;
+                }
+                bkz_stop_index = atoi(argv[i]);
             } else if (strcasecmp(argv[i], "--output") == 0 || strcasecmp(argv[i], "-o") == 0) {
                 if (++i >= argc) {
                     printf("Error: missing value for %s\n", argv[i-1]);
@@ -1004,6 +1012,12 @@ int task_config_t::_run_bkz() {
     }
 
     if (bkz_dual_hash_ratio == 0) bkz_enable_dual_hash = 0;
+    if (bkz_stop_index != val_not_assigned &&
+        (bkz_stop_index <= bkz_start_index || bkz_stop_index > L.NumRows())) {
+        printf("[Error] BKZ stop index %ld must be in (%ld, %ld]\n",
+               bkz_stop_index, bkz_start_index, L.NumRows());
+        return -1;
+    }
 
     long block_size = bkz_dim_for_free + bkz_sieving_dim;
 
@@ -1036,7 +1050,8 @@ int task_config_t::_run_bkz() {
             system(cmd);
         }
 
-        if (last_pump) {
+        if (last_pump || (bkz_stop_index != val_not_assigned &&
+                          index + bkz_jump_step >= bkz_stop_index)) {
             if (rename(next_basis_name, output_file) != 0) {
                 perror("BKZ output rename failed");
                 return -1;

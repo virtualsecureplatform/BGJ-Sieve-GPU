@@ -1,0 +1,17 @@
+{
+  "name": "svp-164-seed-0-bgj-bkz143-no-dh-pump-checkpoints",
+  "target_norm2": 11009124,
+  "defaults": {
+    "sieve_dimension": 143,
+    "d4f": 21,
+    "jump": 9,
+    "dual_hash_ratio": 0,
+    "tours": 1
+  },
+  "stages": [
+    {"start_index": 0, "stop_index": 9},
+    {"start_index": 9, "stop_index": 18},
+    {"start_index": 18, "stop_index": 27},
+    {"start_index": 27}
+  ]
+}
