@@ -25,6 +25,19 @@ GENERATOR="${BASE}/deps/ntl-9.3.0-svp-generator/bin/svp_challenge_generator"
 FPLLL_COMMIT="b0e38e31085e1ef3f115594142675012fd5f7224"
 FPLLL="${BASE}/deps/fplll-${FPLLL_COMMIT:0:12}"
 echo "Source commit: ${SOURCE_COMMIT}; lattice dimension=164 seed=1"
+# Optional read-only inspection of an existing allocation, from a compute node.
+if [[ -n "${DIAG_JOB_ID:-}" ]]; then
+    timeout 45s srun --jobid="${DIAG_JOB_ID}" --overlap -N1 -n1 bash -lc '
+        ps -u "$USER" -L -o pid,tid,pcpu,stat,wchan:32,comm --sort=-pcpu | head -35
+        nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader
+        for pid in $(pgrep -u "$USER" -x hd_sieve); do
+            if command -v gdb >/dev/null; then
+                timeout 20s gdb -batch -ex "set pagination off" -ex "thread apply all bt 5" -p "$pid"
+            fi
+        done
+    ' > "${BUILD}/existing-job-diagnostic.log" 2>&1 || true
+    cat "${BUILD}/existing-job-diagnostic.log"
+fi
 apptainer exec --bind "${BASE}","${SLURM_SUBMIT_DIR}" "${SIF}" \
     bash "${SOURCE}/tools/build_fplll.sh" "${FPLLL}" \
     "${SLURM_SUBMIT_DIR}/dep/fplll" "${FPLLL_COMMIT}"

@@ -8,6 +8,7 @@
 
 #include <omp.h>
 #include <time.h>
+#include <chrono>
 
 
 void report_host_memory(const char *phase, long csd) {
@@ -1098,7 +1099,7 @@ int ut_checker_t::task_commit(chunk_t *chunk) {
         
         {
             std::unique_lock<std::mutex> lock(_ut_mutex);
-            _ut_cv.wait(lock);
+            _ut_cv.wait_for(lock, std::chrono::milliseconds(100));
         }
 
         pthread_spin_lock(&_ut_lock);
@@ -1121,7 +1122,7 @@ int ut_checker_t::task_commit(uint64_t uid) {
             
             {
                 std::unique_lock<std::mutex> lock(_ut_mutex);
-                _ut_cv.wait(lock);
+                _ut_cv.wait_for(lock, std::chrono::milliseconds(100));
             }
 
             pthread_spin_lock(&_ut_lock);
@@ -1158,7 +1159,7 @@ int ut_checker_t::task_commit(uint64_t *uids, long num) {
                 
                 {
                     std::unique_lock<std::mutex> lock(_ut_mutex);
-                    _ut_cv.wait(lock);
+                    _ut_cv.wait_for(lock, std::chrono::milliseconds(100));
                 }
 
                 pthread_spin_lock(&_ut_lock);
@@ -1209,10 +1210,11 @@ int ut_checker_t::task_commit(uint64_t *uids, long num) {
             
             {
                 std::unique_lock<std::mutex> lock(_ut_mutex);
-                _ut_cv.wait(lock);
+                _ut_cv.wait_for(lock, std::chrono::milliseconds(100));
             }
 
             pthread_spin_lock(&_ut_lock);
+            to_malloc = (num + _to_check[_num_to_check - 1].size) / Pool_hd_t::chunk_max_nvecs;
         }
 
         for (int i = 0; i < to_malloc; i++) {
@@ -1278,17 +1280,8 @@ int ut_checker_t::trigger_batch() {
 
         if (_num_red_to_rm) {
             std::swap(_red_to_rm, _red_in_rm);
-            int ic_holds = _num_red_in_rm;
             _num_red_in_rm = _num_red_to_rm;
             _num_red_to_rm = 0;
-            for (int i = _num_red_in_rm; i < _max_holding; i++) {
-                if (_red_in_rm[i].u) {
-                    uint64_t *tmp = _red_in_rm[i].u;
-                    _red_in_rm[i].u = NULL;
-                    _red_to_rm[ic_holds].u = tmp;
-                    _red_to_rm[ic_holds++].size = 0;
-                }
-            }
         }
     } else {
         if (_num_to_check == 0) {
@@ -1297,19 +1290,10 @@ int ut_checker_t::trigger_batch() {
             return 0;
         }
         std::swap(_to_check, _in_check);
-        int ic_holds = _num_in_check;
         _num_in_check = _num_to_check;
         _num_to_check = 0;
-        if (_type == type_check || _type == type_shrink) {
-            for (int i = _num_in_check; i < _max_holding; i++) {
-                if (_in_check[i].u) {
-                    uint64_t *tmp = _in_check[i].u;
-                    _in_check[i].u = NULL;
-                    _to_check[ic_holds].u = tmp;
-                    _to_check[ic_holds++].size = 0;
-                }
-            }
-        }
+        // UID-only buffers stay owned by their array across swaps. Moving
+        // spare pointers between arrays risks overwriting or aliasing owners.
         
         if (_type == type_others && _max_available_id) {
             for (int i = _num_in_check - 1; i >= 0; i--) {
@@ -1509,24 +1493,12 @@ int ut_checker_t::batch(long tid, long table_size, long current_hold) {
             if (_type != type_check && _type != type_shrink) _num_in_check = 0;
             if (_type == type_shrink || _type == type_check) {
                 pthread_spin_lock(&_ut_lock);
-                for (int i = _num_to_check; i < _max_holding; i++) {
-                    if (_num_in_check == 0) break;
-                    if (_to_check[i].u == NULL) {
-                        _to_check[i].u = _in_check[--_num_in_check].u;
-                        _in_check[_num_in_check].u = NULL;
-                    }
-                }
+                _num_in_check = 0;
                 pthread_spin_unlock(&_ut_lock);
             }
             if (_type == type_sieve) {
                 pthread_spin_lock(&_ut_lock);
-                for (int i = _num_red_to_rm; i < _max_holding; i++) {
-                    if (_num_red_in_rm == 0) break;
-                    if (_red_to_rm[i].u == NULL) {
-                        _red_to_rm[i].u = _red_in_rm[--_num_red_in_rm].u;
-                        _red_in_rm[_num_red_in_rm].u = NULL;
-                    }
-                }
+                _num_red_in_rm = 0;
                 pthread_spin_unlock(&_ut_lock);
             }
             if (_input_done) {
