@@ -25,7 +25,7 @@ GENERATOR="${BASE}/deps/ntl-9.3.0-svp-generator/bin/svp_challenge_generator"
 FPLLL="${BASE}/deps/fplll-1987472ec5ca"
 echo "Source commit: ${SOURCE_COMMIT}; lattice dimension=164 seed=1"
 if [[ ! -s "${RAW}" ]]; then
-    "${GENERATOR}" 164 1 > "${RAW}.tmp"
+    apptainer exec --bind "${BASE}" "${SIF}" "${GENERATOR}" 164 1 > "${RAW}.tmp"
     mv "${RAW}.tmp" "${RAW}"
 fi
 if [[ ! -s "${POT}" ]]; then
