@@ -731,6 +731,21 @@ void _pwc_hbm_prepare(long csd) {
     _pwc_hbm_report("prepared", csd);
 }
 
+// Call only with pool workers quiescent. Each HBM entry has valid disk
+// backing, so discarding entries is safe when chunk IDs change meaning.
+void _pwc_hbm_reset() {
+    if (pwc_hbm_cache.initialized.load(std::memory_order_acquire) != 1) return;
+    for (int d = 0; d < hw::gpu_num; ++d) {
+        pwc_hbm_shard_t &s = pwc_hbm_cache.shard[d];
+        pthread_mutex_lock(&s.lock);
+        s.chunks.clear();
+        s.free_slots.clear();
+        for (int32_t i = s.slots - 1; i >= 0; --i)
+            s.free_slots.push_back(i);
+        pthread_mutex_unlock(&s.lock);
+    }
+}
+
 bool _pwc_hbm_load(long chunk_id, chunk_t *chunk, long csd) {
     pwc_hbm_cache.init(csd);
     if (pwc_hbm_cache.initialized.load(std::memory_order_acquire) != 1 ||
@@ -1720,6 +1735,7 @@ int Pool_hd_t::extend_left() {
     }
 
     pwc_manager->wait_work();
+    _pwc_hbm_reset();
     if (CSD > 120) {
         long target_cached_chunks = __pwc_between_sieve_target();
         if (pwc_manager->max_cached_chunks() != target_cached_chunks) {
@@ -1750,6 +1766,7 @@ int Pool_hd_t::shrink_left() {
     lg_init();
 
     pwc_manager->wait_work();
+    _pwc_hbm_reset();
     if (CSD > 120) {
         long target_cached_chunks = __pwc_between_sieve_target();
         if (pwc_manager->max_cached_chunks() != target_cached_chunks) {
@@ -1905,6 +1922,7 @@ int Pool_hd_t::insert(long index, double eta, long *pos, long auto_lll) {
     }
 
     pwc_manager->wait_work();
+    _pwc_hbm_reset();
     if (CSD > 120) {
         long target_cached_chunks = __pwc_between_sieve_target();
         if (pwc_manager->max_cached_chunks() != target_cached_chunks) {

@@ -527,6 +527,7 @@ void _malloc_bucket_chunk(chunk_t *chunk);
 bool _pwc_hbm_store(long chunk_id, const chunk_t *chunk, long csd);
 bool _pwc_hbm_load(long chunk_id, chunk_t *chunk, long csd);
 void _pwc_hbm_prepare(long csd);
+void _pwc_hbm_reset();
 void _pwc_hbm_report(const char *phase, long csd);
 
 struct boost_data_t {

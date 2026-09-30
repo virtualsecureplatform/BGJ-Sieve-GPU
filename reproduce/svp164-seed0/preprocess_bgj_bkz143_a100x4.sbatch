@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=svp164-s0-bgj-b143
+#SBATCH --job-name=svp164-s0-bgj-b143-hbm
 #SBATCH --partition=gr20100g
 #SBATCH --rsc=g=4
 #SBATCH --time=7-00:00:00
@@ -15,7 +15,7 @@ SIF="${SIF:-${LARGE_BASE}/bgj-sieve-gpu-cuda13.3.sif}"
 INPUT="${LARGE_BASE}/inputs/svp164-seed0/L_164_0.hdbkz-b138-j9-f26.pre"
 OUTPUT="${LARGE_BASE}/inputs/svp164-seed0/L_164_0.hdbkz-b143-j9-f21.pre"
 RAW="${LARGE_BASE}/inputs/svp164-seed0/L_164_0.raw"
-RUN_ROOT="${LARGE_BASE}/runs/svp164-seed0/bgj-bkz143-pump-checkpoints"
+RUN_ROOT="${LARGE_BASE}/runs/svp164-seed0/bgj-bkz143-hbm-pump-checkpoints"
 BUILD_ROOT="${LARGE_BASE}/builds/svp164-bgj-bkz143-${SLURM_JOB_ID}"
 LOG_ROOT="${LARGE_BASE}/logs/svp164-bgj"
 
@@ -34,7 +34,14 @@ done
 find "${RUN_ROOT}" -maxdepth 1 -type f \
     \( -name '.bkz-scheduler-input.basis_*' -o -name '.bkz.tmp_basis' \) -delete
 
-BUILD_CPPFLAGS="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_A100X4_PWC_GB=405 -DHD_A100X4_BWC_GB=1 -DHD_A100X4_SWC_GB=4 -DPOOL_HOST_VEC_MAX_DIM=144 -DENABLE_PROFILING=0"
+# BKZ pump-down retains a larger host working set than the final sieve.
+# Offload the projected CSD-143 pool's ~25 GiB excess to four HBM shards.
+BUILD_CPPFLAGS="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_A100X4_PWC_GB=380 -DHD_A100X4_BWC_GB=1 -DHD_A100X4_SWC_GB=4 -DPOOL_HOST_VEC_MAX_DIM=144 -DENABLE_PROFILING=0"
+SOURCE_COMMIT="${SOURCE_COMMIT:-$(git -C "${SOURCE}" rev-parse HEAD)}"
+mkdir -p "${BUILD_ROOT}/source"
+git -C "${SOURCE}" archive "${SOURCE_COMMIT}" | tar -x -C "${BUILD_ROOT}/source"
+SOURCE="${BUILD_ROOT}/source"
+echo "Source commit: ${SOURCE_COMMIT}"
 apptainer exec --nv --bind "${SOURCE}","${BUILD_ROOT}" "${SIF}" bash -lc \
     "make -B -C '${SOURCE}/src' -j 16 CPPFLAGS='${BUILD_CPPFLAGS}' && make -B -C '${SOURCE}/app' -j 4 hd_sieve CPPFLAGS='${BUILD_CPPFLAGS}' && cp '${SOURCE}/app/hd_sieve' '${BUILD_ROOT}/'"
 
@@ -46,7 +53,11 @@ export APPTAINERENV_HD_LAZY_SYNC=1
 export APPTAINERENV_HD_PROFILE_BUCKET_STATS=0
 export APPTAINERENV_HD_GPU_NATIVE_BWC=1
 export APPTAINERENV_HD_GPU_NATIVE_BWC_P2P=1
-export APPTAINERENV_HD_HBM_BWC_GB=24
+export APPTAINERENV_HD_HBM_PWC_GB=16
+export APPTAINERENV_HD_HBM_PWC_MIN_CSD=143
+export APPTAINERENV_HD_HBM_BWC_GB=12
+export APPTAINERENV_HD_BGJ2_REDUCER_THREADS=32
+export APPTAINERENV_HD_POOL_BUFFER_CACHE=0
 export APPTAINERENV_HD_HBM_BWC_MIN_CSD=100
 export APPTAINERENV_HD_BUCKET_THREADS=20
 
