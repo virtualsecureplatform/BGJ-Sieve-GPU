@@ -22,8 +22,15 @@ RAW="${INPUTS}/L_164_1.raw"
 POT="${INPUTS}/L_164_1.potlll.pre"
 OUTPUT="${INPUTS}/L_164_1.scheduled-bkz.pre"
 GENERATOR="${BASE}/deps/ntl-9.3.0-svp-generator/bin/svp_challenge_generator"
-FPLLL="${BASE}/deps/fplll-1987472ec5ca"
+FPLLL_COMMIT="b0e38e31085e1ef3f115594142675012fd5f7224"
+FPLLL="${BASE}/deps/fplll-${FPLLL_COMMIT:0:12}"
 echo "Source commit: ${SOURCE_COMMIT}; lattice dimension=164 seed=1"
+apptainer exec --bind "${BASE}","${SLURM_SUBMIT_DIR}" "${SIF}" \
+    bash "${SOURCE}/tools/build_fplll.sh" "${FPLLL}" \
+    "${SLURM_SUBMIT_DIR}/dep/fplll" "${FPLLL_COMMIT}"
+# Fail before preprocessing if a cached executable lacks this extension.
+apptainer exec --bind "${BASE}" "${SIF}" env LD_LIBRARY_PATH="${FPLLL}/lib" \
+    "${FPLLL}/bin/fplll" --help | grep -q 'potlll'
 if [[ ! -s "${RAW}" ]]; then
     apptainer exec --bind "${BASE}" "${SIF}" "${GENERATOR}" 164 1 > "${RAW}.tmp"
     mv "${RAW}.tmp" "${RAW}"
@@ -33,6 +40,8 @@ if [[ ! -s "${POT}" ]]; then
         "${FPLLL}/bin/fplll" -a potlll -m heuristic -f mpfr -p 256 "${RAW}" > "${POT}.tmp"
     mv "${POT}.tmp" "${POT}"
 fi
+apptainer exec --bind "${BASE}" "${SIF}" python3 \
+    "${SOURCE}/tools/check_basis_det_mod.py" "${RAW}" "${POT}"
 sha256sum "${RAW}" "${POT}" "${GENERATOR}" "${FPLLL}/bin/fplll" "${BUILD}/reference-simulator.py"
 FLAGS="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_A100X4_PWC_GB=380 -DHD_A100X4_BWC_GB=1 -DHD_A100X4_SWC_GB=4 -DPOOL_HOST_VEC_MAX_DIM=144 -DENABLE_PROFILING=0"
 apptainer exec --nv --bind "${BASE}" "${SIF}" bash -lc \
