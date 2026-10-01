@@ -1239,7 +1239,7 @@ int ut_checker_t::task_commit(uint64_t *uids, long num) {
             _num_to_check++;
             try_trigger = 1;
         }
-        int nn =  num < Pool_hd_t::chunk_max_nvecs - _to_check[_num_to_check - 1].size ? 
+        int nn =  num < Pool_hd_t::chunk_max_nvecs - _to_check[_num_to_check - 1].size ?
                   num : Pool_hd_t::chunk_max_nvecs - _to_check[_num_to_check - 1].size;
         memcpy(_to_check[_num_to_check - 1].u + _to_check[_num_to_check - 1].size, uids, 8 * nn);
         _to_check[_num_to_check - 1].size += nn;
