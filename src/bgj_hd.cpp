@@ -61,6 +61,14 @@ template <class logger_t> bwc_manager_tmpl<logger_t>::bwc_manager_tmpl(
                                                      bwc_default_syncing_threads,
                                                      bwc_default_max_cached_chunks,
                                                      compact_vec_norm) {
+    // Host fallback buckets have an independent persistence policy. A small
+    // BWC must be able to recycle completed writes before a batch finishes;
+    // this does not change primary-pool or GPU-native HBM caching.
+    if (const char *env = getenv("HD_BWC_LAZY_SYNC"))
+        this->_lazy_sync = atoi(env) != 0;
+    fprintf(stdout, "[BWC] lazy_sync=%d host_cache_chunks=%ld\n",
+            this->_lazy_sync ? 1 : 0, this->_max_cached_chunks);
+    fflush(stdout);
     _num_buckets = 0;
     _num_deleted_buckets = 0;
     _num_wl = 0;
