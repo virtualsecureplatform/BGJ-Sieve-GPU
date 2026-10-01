@@ -379,22 +379,16 @@ template <class logger_t> bool bwc_manager_tmpl<logger_t>::__stage_bucket_to_hbm
         return false;
     }
 
-    int32_t fetched = 0;
-    for (; fetched < num_chunks; fetched++) {
-        chunks[fetched] = pwc_manager_tmpl<logger_t>::fetch(_bucket[bucket_id].chunk_ids[fetched]);
-        if (!chunks[fetched]) break;
-    }
-    if (fetched != num_chunks) {
-        for (int32_t i = 0; i < fetched; i++)
-            pwc_manager_tmpl<logger_t>::release(chunks[i]->id);
-        for (int32_t i = 0; i < num_chunks; i++) __hbm_release(device_ptr, slots[i]);
-        free(slots);
-        free(chunks);
-        return false;
-    }
-
     const size_t norm_capacity = Pool_hd_t::chunk_max_nvecs * sizeof(int32_t);
     for (int32_t i = 0; i < num_chunks; i++) {
+        // Do not pin an entire bucket (or several concurrent buckets) in the
+        // small host BWC: all staging workers can otherwise exhaust it while
+        // waiting to fetch their remaining chunks, before any bucket is ready.
+        chunks[i] = pwc_manager_tmpl<logger_t>::fetch(_bucket[bucket_id].chunk_ids[i]);
+        if (!chunks[i]) {
+            fprintf(stderr, "[Error] missing chunk while staging bucket %d\n", bucket_id);
+            abort();
+        }
         int8_t *slot = __hbm_slot(device_ptr, slots[i]);
         if (_cuda_device_h2d_pair_enqueue(
                 device_ptr,
@@ -406,15 +400,13 @@ template <class logger_t> bool bwc_manager_tmpl<logger_t>::__stage_bucket_to_hbm
             abort();
         }
         _bucket[bucket_id].hbm_sizes[i] = chunks[i]->size;
-    }
-    // Keep the bucket private until every chunk copy is complete, but avoid a
-    // host/device round trip after each pair of copies.
-    if (_cuda_device_h2d_wait(device_ptr)) {
-        fprintf(stderr, "[Error] failed to finish staging bucket %d in GPU %d HBM\n",
-                bucket_id, hw::gpu_id_list[device_ptr]);
-        abort();
-    }
-    for (int32_t i = 0; i < num_chunks; i++) {
+        // The source buffer must not be recycled until its asynchronous copy
+        // completes. The bucket remains private until all chunks are staged.
+        if (_cuda_device_h2d_wait(device_ptr)) {
+            fprintf(stderr, "[Error] failed to finish staging bucket %d in GPU %d HBM\n",
+                    bucket_id, hw::gpu_id_list[device_ptr]);
+            abort();
+        }
         release_del(chunks[i]->id);
         _bucket[bucket_id].chunk_ids[i] = slots[i];
     }
