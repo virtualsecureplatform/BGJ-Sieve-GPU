@@ -32,7 +32,9 @@ if [[ -n "${DIAG_JOB_ID:-}" ]]; then
         nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader
         for pid in $(pgrep -u "$USER" -x hd_sieve); do
             if command -v gdb >/dev/null; then
-                timeout 20s gdb -batch -ex "set pagination off" -ex "thread apply all bt 5" -p "$pid"
+                exe=$(readlink "/proc/$pid/exe")
+                timeout 20s gdb -batch -ex "set sysroot /proc/$pid/root" \
+                    -ex "set pagination off" -ex "thread apply all bt 8" "$exe" -p "$pid"
             fi
         done
     ' > "${BUILD}/existing-job-diagnostic.log" 2>&1 || true
@@ -57,8 +59,13 @@ apptainer exec --bind "${BASE}" "${SIF}" python3 \
     "${SOURCE}/tools/check_basis_det_mod.py" "${RAW}" "${POT}"
 sha256sum "${RAW}" "${POT}" "${GENERATOR}" "${FPLLL}/bin/fplll" "${BUILD}/reference-simulator.py"
 FLAGS="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_A100X4_PWC_GB=380 -DHD_A100X4_BWC_GB=1 -DHD_A100X4_SWC_GB=4 -DPOOL_HOST_VEC_MAX_DIM=144 -DENABLE_PROFILING=0"
+SANITIZER_FLAGS=""
+if [[ "${SANITIZE_UID:-0}" == 1 ]]; then
+    SANITIZER_FLAGS="CFLAGS='-O1 -g -fopenmp -march=native -pthread -rdynamic -fsanitize=address -fno-omit-frame-pointer'"
+    export APPTAINERENV_ASAN_OPTIONS=detect_leaks=0:abort_on_error=1
+fi
 apptainer exec --nv --bind "${BASE}" "${SIF}" bash -lc \
-    "make -B -C '${SOURCE}/src' -j 16 CPPFLAGS='${FLAGS}' && make -B -C '${SOURCE}/app' -j 4 hd_sieve CPPFLAGS='${FLAGS}' && g++ -O2 '${SOURCE}/tools/dump_gso.cpp' '${SOURCE}/src/libllib.a' -lntl -lgmp -lm -fopenmp -o '${BUILD}/dump_gso'"
+    "make -B -C '${SOURCE}/src' -j 16 CPPFLAGS='${FLAGS}' ${SANITIZER_FLAGS} && make -B -C '${SOURCE}/app' -j 4 hd_sieve CPPFLAGS='${FLAGS}' ${SANITIZER_FLAGS} && g++ -O2 -fsanitize=address '${SOURCE}/tools/dump_gso.cpp' '${SOURCE}/src/libllib.a' -lntl -lgmp -lm -fopenmp -o '${BUILD}/dump_gso'"
 apptainer exec --bind "${BASE}" "${SIF}" "${BUILD}/dump_gso" "${POT}" > "${RUN}/potlll.gso"
 if [[ ! -s "${RUN}/schedule.json" ]]; then
     apptainer exec --bind "${BASE}" "${SIF}" python3 "${SOURCE}/tools/plan_svp164_chain.py" \

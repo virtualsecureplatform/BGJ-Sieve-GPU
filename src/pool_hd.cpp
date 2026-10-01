@@ -1036,6 +1036,9 @@ ut_checker_t::ut_checker_t(long type, Pool_hd_t *p, UidTable *uid_table, pwc_man
 
 ut_checker_t::~ut_checker_t() {
     this->wait_work();
+    // _running_threads becomes zero before the final worker returns. Join
+    // queued callbacks before freeing arrays or destroying their locks.
+    _ut_pool.wait_sleep();
     if (_type == type_shrink || _type == type_check) {
         for (long i = 0; i < _max_holding; i++) {
             if (_to_check[i].u) free(_to_check[i].u);
@@ -1232,14 +1235,14 @@ int ut_checker_t::task_commit(uint64_t *uids, long num) {
 
     int try_trigger = 0;
     while (num > 0) {
-        int nn =  num < Pool_hd_t::chunk_max_nvecs - _to_check[_num_to_check - 1].size ? 
-                  num : Pool_hd_t::chunk_max_nvecs - _to_check[_num_to_check - 1].size;
-        memcpy(_to_check[_num_to_check - 1].u + _to_check[_num_to_check - 1].size, uids, 8 * nn);
-        _to_check[_num_to_check - 1].size += nn;
         if (_to_check[_num_to_check - 1].size == Pool_hd_t::chunk_max_nvecs) {
             _num_to_check++;
             try_trigger = 1;
         }
+        int nn =  num < Pool_hd_t::chunk_max_nvecs - _to_check[_num_to_check - 1].size ? 
+                  num : Pool_hd_t::chunk_max_nvecs - _to_check[_num_to_check - 1].size;
+        memcpy(_to_check[_num_to_check - 1].u + _to_check[_num_to_check - 1].size, uids, 8 * nn);
+        _to_check[_num_to_check - 1].size += nn;
         uids += nn;
         num -= nn;
     }
