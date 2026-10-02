@@ -1172,14 +1172,25 @@ template <class logger_t> int32_t pwc_manager_tmpl<logger_t>::__fetch_cache_for(
     volatile chunk_status_t *_chunk_status_vol = reinterpret_cast<volatile chunk_status_t*>(_chunk_status);
     volatile chunk_t *_cached_chunks_vol = reinterpret_cast<volatile chunk_t*>(_cached_chunks);
 
+    const char *timeout_env = getenv("HD_CACHE_WAIT_TIMEOUT_S");
+    const long timeout_s = timeout_env ? atol(timeout_env) : 0;
+    const auto wait_start = std::chrono::steady_clock::now();
     long scanned = 0;
     for (int32_t cache_id = _last_cache + 1;; cache_id++) {
         if (cache_id >= _max_cached_chunks) cache_id %= _max_cached_chunks;
         // lazy mode can leave every cached chunk dirty (= unevictable); a
         // full fruitless scan means we must write some out to make progress
-        if (_lazy_sync && ++scanned >= 2 * _max_cached_chunks) {
+        if (++scanned >= 2 * _max_cached_chunks) {
             scanned = 0;
-            __signal_sync_done();
+            if (timeout_s > 0 && std::chrono::steady_clock::now() - wait_start >
+                    std::chrono::seconds(timeout_s)) {
+                fprintf(stderr, "[cache-wait-timeout] chunk=%ld capacity=%ld loading=%d syncing=%d csd=%d\n",
+                        chunk_id, _max_cached_chunks, (int)_num_loading_chunks.load(),
+                        (int)_num_syncing_chunks.load(), _pool ? (int)_pool->CSD : -1);
+                fflush(stderr);
+                abort();
+            }
+            if (_lazy_sync) __signal_sync_done();
             usleep(500);
         }
 

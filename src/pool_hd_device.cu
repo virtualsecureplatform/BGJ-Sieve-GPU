@@ -329,6 +329,9 @@ struct chunk_arena_t {
     }
 
     void allocate(chunk_t *chunk) {
+        const char *timeout_env = getenv("HD_CACHE_WAIT_TIMEOUT_S");
+        const long timeout_s = timeout_env ? atol(timeout_env) : 0;
+        const auto wait_start = std::chrono::steady_clock::now();
         for (;;) {
             pthread_spin_lock(&cache_lock);
             if (cached_num > 0) {
@@ -345,6 +348,14 @@ struct chunk_arena_t {
                 src->vec = NULL;
                 pthread_spin_unlock(&cache_lock);
                 return;
+            }
+            if (timeout_s > 0 && std::chrono::steady_clock::now() - wait_start >
+                    std::chrono::seconds(timeout_s)) {
+                fprintf(stderr, "[arena-wait-timeout] kind=%s used=%ld capacity=%ld\n",
+                        compact ? "bucket" : "regular", using_num, max_cached_chunks);
+                fflush(stderr);
+                pthread_spin_unlock(&cache_lock);
+                abort();
             }
             pthread_spin_unlock(&cache_lock);
             usleep(1000);
