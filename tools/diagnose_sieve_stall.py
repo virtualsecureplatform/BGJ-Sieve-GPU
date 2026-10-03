@@ -84,7 +84,7 @@ def main():
                 try:
                     gpu = subprocess.check_output(
                         ["nvidia-smi", "--query-gpu=utilization.gpu",
-                         "--format=csv,noheader,nounits"], timeout=15, text=True)
+                         "--format=csv,noheader,nounits"], timeout=15, universal_newlines=True)
                     values = [int(row.strip()) for row in gpu.splitlines() if row.strip()]
                     idle = idle + 1 if values and all(value == 0 for value in values) else 0
                 except (ValueError, OSError, subprocess.SubprocessError):
