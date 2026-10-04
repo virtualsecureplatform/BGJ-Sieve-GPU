@@ -1032,7 +1032,7 @@ template <class logger_t> int pwc_manager_tmpl<logger_t>::set_max_cached_chunks(
     }
     // shrinking evicts until enough slots are free; lazy-dirty chunks are
     // unevictable, so they must be written out first
-    if (_lazy_sync && max_cached_chunks < this->_max_cached_chunks) __drain_sync_queue();
+    if (_lazy_sync && max_cached_chunks < this->_max_cached_chunks) flush();
 
     // Cache descriptors are indexed only up to _max_cached_chunks.  The old
     // allocation reserved all 2^24 encodable cache IDs for every manager even
