@@ -58,7 +58,9 @@ fi
 apptainer exec --bind "${BASE}" "${SIF}" python3 \
     "${SOURCE}/tools/check_basis_det_mod.py" "${RAW}" "${POT}"
 sha256sum "${RAW}" "${POT}" "${GENERATOR}" "${FPLLL}/bin/fplll" "${BUILD}/reference-simulator.py"
-FLAGS="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_A100X4_PWC_GB=350 -DHD_A100X4_BWC_GB=8 -DHD_A100X4_SWC_GB=4 -DPOOL_HOST_VEC_MAX_DIM=144 -DENABLE_PROFILING=0"
+# Aggressive host cache: accept OOM risk to minimize disk spills alongside
+# the 16-GiB-per-GPU write-back tier. The prior 380-GiB run had little headroom.
+FLAGS="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_A100X4_PWC_GB=380 -DHD_A100X4_BWC_GB=8 -DHD_A100X4_SWC_GB=4 -DPOOL_HOST_VEC_MAX_DIM=144 -DENABLE_PROFILING=0"
 SANITIZER_FLAGS=""
 if [[ "${SANITIZE_UID:-0}" == 1 ]]; then
     SANITIZER_FLAGS="CFLAGS='-O1 -g -fopenmp -march=native -pthread -rdynamic -fsanitize=address -fno-omit-frame-pointer'"
