@@ -58,7 +58,7 @@ fi
 apptainer exec --bind "${BASE}" "${SIF}" python3 \
     "${SOURCE}/tools/check_basis_det_mod.py" "${RAW}" "${POT}"
 sha256sum "${RAW}" "${POT}" "${GENERATOR}" "${FPLLL}/bin/fplll" "${BUILD}/reference-simulator.py"
-FLAGS="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_A100X4_PWC_GB=380 -DHD_A100X4_BWC_GB=8 -DHD_A100X4_SWC_GB=4 -DPOOL_HOST_VEC_MAX_DIM=144 -DENABLE_PROFILING=0"
+FLAGS="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_A100X4_PWC_GB=350 -DHD_A100X4_BWC_GB=8 -DHD_A100X4_SWC_GB=4 -DPOOL_HOST_VEC_MAX_DIM=144 -DENABLE_PROFILING=0"
 SANITIZER_FLAGS=""
 if [[ "${SANITIZE_UID:-0}" == 1 ]]; then
     SANITIZER_FLAGS="CFLAGS='-O1 -g -fopenmp -march=native -pthread -rdynamic -fsanitize=address -fno-omit-frame-pointer'"
@@ -73,15 +73,20 @@ if [[ ! -s "${RUN}/schedule.json" ]]; then
     mv "${RUN}/schedule.json.tmp" "${RUN}/schedule.json"
 fi
 cat "${RUN}/schedule.json"
+ARCHIVE="${RUN}/interrupted-scratch-before-${SLURM_JOB_ID}"
+mkdir -p "${ARCHIVE}"
 for kind in pool bucket sol uid; do
+    if [[ -d "${RUN}/.${kind}" ]]; then
+        mv "${RUN}/.${kind}" "${ARCHIVE}/.${kind}"
+    fi
     for device in 0 1 2 3; do mkdir -p "${RUN}/.${kind}/${device}"; done
-    find "${RUN}/.${kind}" -type f -delete
 done
-find "${RUN}" -maxdepth 1 -type f \( -name '.bkz-scheduler-input.basis_*' -o -name '.bkz.tmp_basis' \) -delete
+find "${RUN}" -maxdepth 1 -type f \( -name '.bkz-scheduler-input.basis_*' -o -name '.bkz.tmp_basis' \) -exec mv -t "${ARCHIVE}" {} +
 export APPTAINERENV_HD_RSS_TELEMETRY=1 APPTAINERENV_HD_HBM_TELEMETRY=1
 export APPTAINERENV_HD_HOST_ARENA_INITIAL_GB=64 APPTAINERENV_HD_PWC_NO_GROW=1
 export APPTAINERENV_HD_LAZY_SYNC=1 APPTAINERENV_HD_PROFILE_BUCKET_STATS=0
 export APPTAINERENV_HD_BWC_LAZY_SYNC=0
+export APPTAINERENV_HD_HBM_PWC_WRITEBACK=1 APPTAINERENV_HD_CACHE_WAIT_TIMEOUT_S=600
 export APPTAINERENV_HD_GPU_NATIVE_BWC=1 APPTAINERENV_HD_GPU_NATIVE_BWC_P2P=1
 export APPTAINERENV_HD_HBM_PWC_GB=16 APPTAINERENV_HD_HBM_PWC_MIN_CSD=143
 export APPTAINERENV_HD_HBM_BWC_GB=12 APPTAINERENV_HD_HBM_BWC_MIN_CSD=100
