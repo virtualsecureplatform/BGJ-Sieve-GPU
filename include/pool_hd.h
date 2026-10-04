@@ -524,8 +524,10 @@ void _free_chunk(chunk_t *chunk);
 void _malloc_chunk(chunk_t *chunk);
 void _free_bucket_chunk(chunk_t *chunk);
 void _malloc_bucket_chunk(chunk_t *chunk);
-bool _pwc_hbm_store(long chunk_id, const chunk_t *chunk, long csd);
+bool _pwc_hbm_store(long chunk_id, const chunk_t *chunk, long csd, bool dirty = false);
 bool _pwc_hbm_load(long chunk_id, chunk_t *chunk, long csd);
+void _pwc_hbm_forget(long chunk_id);
+bool _pwc_hbm_writeback_enabled();
 void _pwc_hbm_prepare(long csd);
 void _pwc_hbm_reset();
 void _pwc_hbm_report(const char *phase, long csd);
@@ -633,6 +635,8 @@ struct pwc_manager_tmpl {
     static constexpr chunk_status_t _ck_reading = 0x10000000;         // cache is being used (read-only)
     static constexpr chunk_status_t _ck_writing = 0x08000000;         // cache is being used (read & write)
     static constexpr chunk_status_t _ck_to_sync = 0x04000000;         // need to sync to disk, but not started
+    static constexpr chunk_status_t _ck_hbm_dirty = 0x02000000;       // authoritative dirty data is in HBM
+    static constexpr chunk_status_t _ck_disk_spill = 0x01000000;      // HBM full: permit disk write
     static constexpr chunk_status_t _ck_size_mask = 2 * Pool_hd_t::chunk_max_nvecs - 1;
     static constexpr chunk_status_t _ck_cache_id_mask = 0x00ffffff;            
 
@@ -764,6 +768,7 @@ struct pwc_manager_tmpl {
     // solution chunks retain score/u as well.
     bool _compact_vec_norm;
     bool _hbm_pool_tier = false;
+    std::atomic<bool> _force_disk_flush{false};
     inline void __malloc_chunk(chunk_t *chunk) {
         if (_compact_vec_norm) _malloc_bucket_chunk(chunk);
         else _malloc_chunk(chunk);
@@ -1167,8 +1172,10 @@ template <class logger_t> int pwc_manager_tmpl<logger_t>::set_max_cached_chunks(
 
 template <class logger_t> int32_t pwc_manager_tmpl<logger_t>::__fetch_cache_for(long chunk_id) {
     lg_init();
-    constexpr chunk_status_t _ck_busy = _ck_loading | _ck_syncing | 
-                                        _ck_reading | _ck_writing | _ck_to_sync;
+    const bool writeback = _hbm_pool_tier && _pwc_hbm_writeback_enabled() &&
+                          !_force_disk_flush.load();
+    const chunk_status_t _ck_busy = _ck_loading | _ck_syncing |
+        _ck_reading | _ck_writing | (writeback ? 0 : _ck_to_sync);
     volatile chunk_status_t *_chunk_status_vol = reinterpret_cast<volatile chunk_status_t*>(_chunk_status);
     volatile chunk_t *_cached_chunks_vol = reinterpret_cast<volatile chunk_t*>(_cached_chunks);
 
@@ -1233,13 +1240,20 @@ template <class logger_t> int32_t pwc_manager_tmpl<logger_t>::__fetch_cache_for(
                 continue;
             }
 
-            // Preserve every clean primary-pool eviction in the sharded HBM
-            // tier as well.  Dirty chunks normally arrive here only after
-            // __sync_chunk has stored them, so this simply refreshes the same
-            // exact entry.  Failure leaves the existing disk backing valid.
-            if (_hbm_pool_tier)
-                _pwc_hbm_store(old_chunk_id, &_cached_chunks[cache_id],
-                                _pool->CSD);
+            const bool dirty = (_chunk_status[old_chunk_id] & _ck_to_sync) != 0;
+            const bool stored = _hbm_pool_tier && _pwc_hbm_store(
+                old_chunk_id, &_cached_chunks[cache_id], _pool->CSD, dirty);
+            if (dirty && !stored) {
+                // Keep the only current copy in host RAM. Spill only this
+                // chunk to disk; never evict dirty data on an HBM miss.
+                pthread_spin_unlock(&_cached_chunks_lock);
+                pthread_spin_lock(&_locks[old_chunk_id % pwc_locks]);
+                _chunk_status[old_chunk_id] |= _ck_disk_spill;
+                _chunk_status[old_chunk_id] &= ~(_ck_writing | _ck_reading);
+                pthread_spin_unlock(&_locks[old_chunk_id % pwc_locks]);
+                __signal_sync_done();
+                continue;
+            }
 
             _cached_chunks[cache_id].id = chunk_id;
             _last_cache = cache_id;
@@ -1249,6 +1263,10 @@ template <class logger_t> int32_t pwc_manager_tmpl<logger_t>::__fetch_cache_for(
             new_status &= ~_ck_cache_id_mask;
             new_status |= _cached_chunks[cache_id].size;
             new_status &= (~_ck_writing) & (~_ck_caching) & (~_ck_reading);
+            if (dirty) {
+                new_status &= ~(_ck_to_sync | _ck_disk_spill);
+                new_status |= _ck_hbm_dirty;
+            }
             pthread_spin_lock(&_locks[old_chunk_id % pwc_locks]);
             _chunk_status[old_chunk_id] = new_status;
             pthread_spin_unlock(&_locks[old_chunk_id % pwc_locks]);
@@ -1283,6 +1301,11 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__load_chunk(long chu
 
     const bool hbm_loaded = _hbm_pool_tier &&
                            _pwc_hbm_load(chunk_id, dst_chunk, _pool->CSD);
+    const bool hbm_dirty = (_chunk_status[chunk_id] & _ck_hbm_dirty) != 0;
+    if (hbm_dirty && !hbm_loaded) {
+        fprintf(stderr, "[Error] missing authoritative dirty HBM chunk %ld\n", chunk_id);
+        abort();
+    }
     if ((_chunk_status[chunk_id] & _ck_size_mask) == 0) {
         dst_chunk->size = 0;
         memset(dst_chunk->norm, 0, Pool_hd_t::chunk_max_nvecs * sizeof(int32_t));
@@ -1364,9 +1387,19 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__load_chunk(long chu
     new_status &= ~_ck_loading;
     new_status &= ~_ck_cache_id_mask;
     new_status |= cache_id;
+    if (hbm_dirty) {
+        new_status &= ~_ck_hbm_dirty;
+        new_status |= _ck_to_sync;
+    }
     pthread_spin_lock(&_locks[chunk_id % pwc_locks]);
     _chunk_status[chunk_id] = new_status;
     pthread_spin_unlock(&_locks[chunk_id % pwc_locks]);
+
+    if (hbm_dirty) {
+        pthread_spin_lock(&_to_sync_chunks_lock);
+        _to_sync_chunks.push(chunk_id);
+        pthread_spin_unlock(&_to_sync_chunks_lock);
+    }
 
     #if ENABLE_PROFILING
     if (!hbm_loaded) ev_ssd_ld.fetch_add(1);
@@ -1410,6 +1443,7 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__sync_chunk(long chu
         fd = open(chunk_filename, O_WRONLY | O_CREAT | (ONE_TIME_IO ? O_DIRECT : 0), 0644);
     if (!hbm_stored && fd == -1) {
         lg_err("open %s failed, %s, nothing done", chunk_filename, strerror(errno));
+        if (_hbm_pool_tier && _pwc_hbm_writeback_enabled()) abort();
     } else if (!hbm_stored) {
         int write_bytes = 0;
         #if ONE_TIME_IO
@@ -1427,19 +1461,23 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__sync_chunk(long chu
         if (write_bytes < stored_fields_nbytes * Pool_hd_t::chunk_max_nvecs +
                           _pool->CSD * Pool_hd_t::chunk_max_nvecs + (ONE_TIME_IO ? 4096 : 12)) {
             lg_err("bytes write to chunk %lx less than expect, ignored", chunk_id);
+            if (_hbm_pool_tier && _pwc_hbm_writeback_enabled()) abort();
         }
         if (ftruncate(fd, write_bytes) == -1) {
+            if (_hbm_pool_tier && _pwc_hbm_writeback_enabled()) abort();
             #if MULTI_SSD
             lg_err("ftruncate %s/%s/%s%06lx failed, %s, ignored", _dir, hw::ssd_name(chunk_id), _pfx, chunk_id, strerror(errno));
             #else
             lg_err("ftruncate %s%06lx failed, %s, ignored", _prefix, chunk_id, strerror(errno));
             #endif
         }
-        close(fd);
+        if (_hbm_pool_tier && _pwc_hbm_writeback_enabled() &&
+            _force_disk_flush.load() && fsync(fd) != 0) abort();
+        if (close(fd) != 0 && _hbm_pool_tier && _pwc_hbm_writeback_enabled()) abort();
     }
 
     pthread_spin_lock(&_locks[chunk_id % pwc_locks]);
-    _chunk_status[chunk_id] &= ~_ck_syncing;
+    _chunk_status[chunk_id] &= ~(_ck_syncing | _ck_disk_spill);
     pthread_spin_unlock(&_locks[chunk_id % pwc_locks]);
     _num_syncing_chunks--;
     __notify_chunk_io();
@@ -1521,7 +1559,9 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__signal_sync_done() 
         _to_sync_chunks.pop();
         pthread_spin_unlock(&_to_sync_chunks_lock);
 
-        if (_chunk_status[chunk_id] & _ck_busy) {
+        if ((_chunk_status[chunk_id] & _ck_busy) ||
+            (_hbm_pool_tier && _pwc_hbm_writeback_enabled() &&
+             !_force_disk_flush.load() && !(_chunk_status[chunk_id] & _ck_disk_spill))) {
             pthread_spin_lock(&_to_sync_chunks_lock);
             _to_sync_chunks.push(chunk_id);
             pthread_spin_unlock(&_to_sync_chunks_lock);
@@ -1625,6 +1665,7 @@ template <class logger_t> pwc_manager_tmpl<logger_t>::pwc_manager_tmpl(long load
 template <class logger_t> pwc_manager_tmpl<logger_t>::~pwc_manager_tmpl() {
     _syncing_pool.wait_work();
     _loading_pool.wait_work();
+    if (_hbm_pool_tier && _pwc_hbm_writeback_enabled()) flush();
     __free_all();
     for (long i = 0; i < pwc_locks; i++) {
         pthread_spin_destroy(&this->_locks[i]);
@@ -1945,6 +1986,7 @@ template <class logger_t> int pwc_manager_tmpl<logger_t>::sync_release(long chun
 
 template <class logger_t> int pwc_manager_tmpl<logger_t>::release_del(long chunk_id) {
     lg_init();
+    if (_hbm_pool_tier) _pwc_hbm_forget(chunk_id);
     if ((_chunk_status[chunk_id] & _ck_syncing) == 0) {
         if (_chunk_status[chunk_id] & _ck_caching) {
             pthread_spin_lock(&_cached_chunks_lock);
@@ -2016,7 +2058,21 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__drain_sync_queue() 
 }
 
 template <class logger_t> int pwc_manager_tmpl<logger_t>::flush() {
+    // Caller must quiesce mutating workers. Persist resident dirty chunks,
+    // then page authoritative HBM copies through the same disk serializer.
+    const bool writeback = _hbm_pool_tier && _pwc_hbm_writeback_enabled();
+    if (writeback) _force_disk_flush.store(true);
     if (_lazy_sync) __drain_sync_queue();
+    if (writeback) {
+        for (long id = 0; id < _num_chunks; ++id) {
+            if (!(_chunk_status[id] & _ck_hbm_dirty)) continue;
+            chunk_t *chunk = fetch(id);
+            if (!chunk) abort();
+            release_sync(id);
+        }
+        __drain_sync_queue();
+        _force_disk_flush.store(false);
+    }
     return 0;
 }
 

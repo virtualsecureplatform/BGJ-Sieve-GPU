@@ -13,6 +13,7 @@ using namespace nvcuda;
 #include <thread>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 double dot_avx2(double *src1, double *src2, long n);
 void red(float *dst, float *src, float q, long n);
@@ -29,6 +30,8 @@ struct pwc_hbm_shard_t {
     int32_t slots = 0;
     std::vector<int32_t> free_slots;
     std::unordered_map<long, int32_t> chunks;
+    std::unordered_set<long> dirty_chunks;
+    cudaStream_t stream = NULL;
     pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 };
 
@@ -69,6 +72,7 @@ struct pwc_hbm_cache_t {
                     (void **)&shard[d].base, (size_t)slots * slot_nbytes))
                 slots /= 2;
             if (!shard[d].base || slots <= 0) continue;
+            CHECK_CUDA_ERR(cudaStreamCreateWithFlags(&shard[d].stream, cudaStreamNonBlocking));
             shard[d].slots = slots;
             shard[d].free_slots.reserve(slots);
             shard[d].chunks.reserve(slots * 2);
@@ -696,7 +700,12 @@ int _cuda_device_free(int device_ptr, void *ptr) {
     return cudaFree(ptr) == cudaSuccess ? 0 : -1;
 }
 
-bool _pwc_hbm_store(long chunk_id, const chunk_t *chunk, long csd) {
+bool _pwc_hbm_writeback_enabled() {
+    const char *env = getenv("HD_HBM_PWC_WRITEBACK");
+    return env && atoi(env) != 0;
+}
+
+bool _pwc_hbm_store(long chunk_id, const chunk_t *chunk, long csd, bool dirty) {
     pwc_hbm_cache.init(csd);
     if (pwc_hbm_cache.initialized.load(std::memory_order_acquire) != 1 ||
         !chunk || !chunk->score || hw::gpu_num <= 0)
@@ -721,13 +730,20 @@ bool _pwc_hbm_store(long chunk_id, const chunk_t *chunk, long csd) {
     const int8_t *src = (const int8_t *)chunk->score -
                         (ONE_TIME_IO ? 12 : 0);
     cudaSetDevice(hw::gpu_id_list[d]);
-    cudaError_t status = cudaMemcpy(s.base + (size_t)slot * pwc_hbm_cache.slot_nbytes,
+    cudaError_t status = cudaMemcpyAsync(s.base + (size_t)slot * pwc_hbm_cache.slot_nbytes,
                                     src, pwc_hbm_cache.slot_nbytes,
-                                    cudaMemcpyHostToDevice);
+                                    cudaMemcpyHostToDevice, s.stream);
+    if (status == cudaSuccess) status = cudaStreamSynchronize(s.stream);
     if (status != cudaSuccess && !existed) {
         s.chunks.erase(chunk_id);
         s.free_slots.push_back(slot);
     }
+    if (status != cudaSuccess && existed && s.dirty_chunks.count(chunk_id)) {
+        fprintf(stderr, "[Error] CUDA copy failed for authoritative HBM chunk %ld: %s\n",
+                chunk_id, cudaGetErrorString(status));
+        abort();
+    }
+    if (status == cudaSuccess && dirty) s.dirty_chunks.insert(chunk_id);
     pthread_mutex_unlock(&s.lock);
     if (status != cudaSuccess) {
         cudaGetLastError();
@@ -742,19 +758,37 @@ void _pwc_hbm_prepare(long csd) {
     _pwc_hbm_report("prepared", csd);
 }
 
-// Call only with pool workers quiescent. Each HBM entry has valid disk
-// backing, so discarding entries is safe when chunk IDs change meaning.
+// Call only with pool workers quiescent and after explicit dirty write-back.
 void _pwc_hbm_reset() {
     if (pwc_hbm_cache.initialized.load(std::memory_order_acquire) != 1) return;
     for (int d = 0; d < hw::gpu_num; ++d) {
         pwc_hbm_shard_t &s = pwc_hbm_cache.shard[d];
         pthread_mutex_lock(&s.lock);
+        if (!s.dirty_chunks.empty()) {
+            fprintf(stderr, "[Error] refusing to discard %zu dirty HBM chunks on GPU %d\n",
+                    s.dirty_chunks.size(), d);
+            abort();
+        }
         s.chunks.clear();
         s.free_slots.clear();
         for (int32_t i = s.slots - 1; i >= 0; --i)
             s.free_slots.push_back(i);
         pthread_mutex_unlock(&s.lock);
     }
+}
+
+void _pwc_hbm_forget(long chunk_id) {
+    if (pwc_hbm_cache.initialized.load(std::memory_order_acquire) != 1 || hw::gpu_num <= 0)
+        return;
+    pwc_hbm_shard_t &s = pwc_hbm_cache.shard[(uint64_t)chunk_id % hw::gpu_num];
+    pthread_mutex_lock(&s.lock);
+    auto it = s.chunks.find(chunk_id);
+    if (it != s.chunks.end()) {
+        s.free_slots.push_back(it->second);
+        s.chunks.erase(it);
+    }
+    s.dirty_chunks.erase(chunk_id);
+    pthread_mutex_unlock(&s.lock);
 }
 
 bool _pwc_hbm_load(long chunk_id, chunk_t *chunk, long csd) {
@@ -774,13 +808,15 @@ bool _pwc_hbm_load(long chunk_id, chunk_t *chunk, long csd) {
     const int32_t slot = it->second;
     int8_t *dst = (int8_t *)chunk->score - (ONE_TIME_IO ? 12 : 0);
     cudaSetDevice(hw::gpu_id_list[d]);
-    cudaError_t status = cudaMemcpy(dst,
+    cudaError_t status = cudaMemcpyAsync(dst,
                                     s.base + (size_t)slot * pwc_hbm_cache.slot_nbytes,
                                     pwc_hbm_cache.slot_nbytes,
-                                    cudaMemcpyDeviceToHost);
+                                    cudaMemcpyDeviceToHost, s.stream);
+    if (status == cudaSuccess) status = cudaStreamSynchronize(s.stream);
     if (status == cudaSuccess) {
         s.chunks.erase(it);
         s.free_slots.push_back(slot);
+        s.dirty_chunks.erase(chunk_id);
     }
     pthread_mutex_unlock(&s.lock);
     if (status != cudaSuccess) {
@@ -793,20 +829,21 @@ bool _pwc_hbm_load(long chunk_id, chunk_t *chunk, long csd) {
 
 void _pwc_hbm_report(const char *phase, long csd) {
     if (pwc_hbm_cache.initialized.load(std::memory_order_acquire) != 1) return;
-    uint64_t used = 0, capacity = 0;
+    uint64_t used = 0, capacity = 0, dirty = 0;
     for (int d = 0; d < hw::gpu_num; ++d) {
         pwc_hbm_shard_t &s = pwc_hbm_cache.shard[d];
         pthread_mutex_lock(&s.lock);
         used += s.chunks.size();
+        dirty += s.dirty_chunks.size();
         capacity += s.slots;
         pthread_mutex_unlock(&s.lock);
     }
     printf("[PWC-HBM] phase=%s csd=%ld used_chunks=%lu capacity_chunks=%lu "
-           "used_gib=%.3f stores=%lu loads=%lu overflows=%lu\n",
+           "used_gib=%.3f stores=%lu loads=%lu overflows=%lu dirty_chunks=%lu\n",
            phase ? phase : "unknown", csd, used, capacity,
            used * pwc_hbm_cache.slot_nbytes / 1073741824.0,
            pwc_hbm_cache.stores.load(), pwc_hbm_cache.loads.load(),
-           pwc_hbm_cache.overflows.load());
+           pwc_hbm_cache.overflows.load(), dirty);
     fflush(stdout);
 }
 
@@ -1746,6 +1783,7 @@ int Pool_hd_t::extend_left() {
     }
 
     pwc_manager->wait_work();
+    if (_pwc_hbm_writeback_enabled()) pwc_manager->flush();
     _pwc_hbm_reset();
     if (CSD > 120) {
         long target_cached_chunks = __pwc_between_sieve_target();
@@ -1777,6 +1815,7 @@ int Pool_hd_t::shrink_left() {
     lg_init();
 
     pwc_manager->wait_work();
+    if (_pwc_hbm_writeback_enabled()) pwc_manager->flush();
     _pwc_hbm_reset();
     if (CSD > 120) {
         long target_cached_chunks = __pwc_between_sieve_target();
@@ -1933,6 +1972,7 @@ int Pool_hd_t::insert(long index, double eta, long *pos, long auto_lll) {
     }
 
     pwc_manager->wait_work();
+    if (_pwc_hbm_writeback_enabled()) pwc_manager->flush();
     _pwc_hbm_reset();
     if (CSD > 120) {
         long target_cached_chunks = __pwc_between_sieve_target();

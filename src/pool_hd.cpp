@@ -167,6 +167,10 @@ int Pool_hd_t::set_sieving_context(long ind_l, long ind_r) {
                         new_CSD, host_vec_nbytes);
         return -1;
     }
+    if (_pwc_hbm_writeback_enabled() && pwc_manager) {
+        pwc_manager->wait_work();
+        pwc_manager->flush();
+    }
     _pwc_hbm_reset();
     this->CSD = new_CSD;
     this->index_l = ind_l;
