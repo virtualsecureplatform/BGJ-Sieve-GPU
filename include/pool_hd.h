@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <unordered_set>
 
 void _start_ck_allocator();
 void _destory_ck_allocator();
@@ -742,6 +743,8 @@ struct pwc_manager_tmpl {
     std::atomic<int32_t> _num_loading_chunks;
     std::atomic<int32_t> _num_syncing_chunks;
     std::queue<int32_t> _to_sync_chunks;
+    std::unordered_set<int32_t> _queued_sync_chunks;
+    std::mutex _sync_dispatch_mutex;
     pthread_spinlock_t _to_sync_chunks_lock;
 
     // Loading/syncing completion is also consumed by the bucket manager.
@@ -1397,7 +1400,7 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__load_chunk(long chu
 
     if (hbm_dirty) {
         pthread_spin_lock(&_to_sync_chunks_lock);
-        _to_sync_chunks.push(chunk_id);
+        if (_queued_sync_chunks.insert(chunk_id).second) _to_sync_chunks.push(chunk_id);
         pthread_spin_unlock(&_to_sync_chunks_lock);
     }
 
@@ -1513,6 +1516,10 @@ void pwc_manager_tmpl<logger_t>::__notify_chunk_io() {
 }
 
 template <class logger_t> void pwc_manager_tmpl<logger_t>::__signal_sync_done() {
+    // Completion callbacks must not contend in simultaneous full-queue scans.
+    // A caller already dispatching work will refill the queue; drain() retries.
+    std::unique_lock<std::mutex> dispatch(_sync_dispatch_mutex, std::try_to_lock);
+    if (!dispatch.owns_lock()) return;
     constexpr chunk_status_t _ck_busy = _ck_loading | _ck_syncing | 
                                         _ck_reading | _ck_writing;
     lg_init();
@@ -1523,31 +1530,6 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__signal_sync_done() 
 
     volatile chunk_status_t *_chunk_status_vol = reinterpret_cast<volatile chunk_status_t*>(_chunk_status);
 
-    if (queue_size > _max_cached_chunks * 5) {
-        for (int i = 0; i < queue_size; i++) {
-            pthread_spin_lock(&_to_sync_chunks_lock);
-            if (_to_sync_chunks.empty()) {
-                pthread_spin_unlock(&_to_sync_chunks_lock);
-                break;
-            }
-            int32_t chunk_id = _to_sync_chunks.front();
-            _to_sync_chunks.pop();
-            if (_chunk_status[chunk_id] & (_ck_busy | _ck_to_sync)) {
-                _to_sync_chunks.push(chunk_id);
-                pthread_spin_unlock(&_to_sync_chunks_lock);
-            } else {
-                pthread_spin_unlock(&_to_sync_chunks_lock);
-                pthread_spin_lock(&_locks[chunk_id % pwc_locks]);
-                if (_chunk_status_vol[chunk_id] & (_ck_busy | _ck_to_sync)) {
-                    pthread_spin_unlock(&_locks[chunk_id % pwc_locks]);
-                    pthread_spin_lock(&_to_sync_chunks_lock);
-                    _to_sync_chunks.push(chunk_id);
-                    pthread_spin_unlock(&_to_sync_chunks_lock);
-                } else pthread_spin_unlock(&_locks[chunk_id % pwc_locks]);
-            }
-        }
-    }
-
     while (num_try < queue_size && 
            _num_syncing_chunks.load() < pwc_max_parallel_sync_chunks) {
         pthread_spin_lock(&_to_sync_chunks_lock);
@@ -1557,31 +1539,29 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__signal_sync_done() 
         }
         int32_t chunk_id = _to_sync_chunks.front();
         _to_sync_chunks.pop();
+        _queued_sync_chunks.erase(chunk_id);
         pthread_spin_unlock(&_to_sync_chunks_lock);
 
-        if ((_chunk_status[chunk_id] & _ck_busy) ||
-            (_hbm_pool_tier && _pwc_hbm_writeback_enabled() &&
-             !_force_disk_flush.load() && !(_chunk_status[chunk_id] & _ck_disk_spill))) {
-            pthread_spin_lock(&_to_sync_chunks_lock);
-            _to_sync_chunks.push(chunk_id);
-            pthread_spin_unlock(&_to_sync_chunks_lock);
-        } else {
+        {
             pthread_spin_lock(&_locks[chunk_id % pwc_locks]);
             chunk_status_t status = _chunk_status_vol[chunk_id];
-            if (status & _ck_busy) {
+            if (!(status & _ck_to_sync)) {
+                // Includes stale entries whose dirty copy moved to HBM.
+                pthread_spin_unlock(&_locks[chunk_id % pwc_locks]);
+            } else if ((status & _ck_busy) ||
+                       (_hbm_pool_tier && _pwc_hbm_writeback_enabled() &&
+                        !_force_disk_flush.load() && !(status & _ck_disk_spill))) {
                 pthread_spin_unlock(&_locks[chunk_id % pwc_locks]);
                 pthread_spin_lock(&_to_sync_chunks_lock);
-                _to_sync_chunks.push(chunk_id);
+                if (_queued_sync_chunks.insert(chunk_id).second) _to_sync_chunks.push(chunk_id);
                 pthread_spin_unlock(&_to_sync_chunks_lock);
-            } else if (!(status & _ck_to_sync)) {
-                pthread_spin_unlock(&_locks[chunk_id % pwc_locks]);
             } else {
                 status &= ~_ck_to_sync;
                 status |= _ck_syncing;
                 _chunk_status[chunk_id] = status;
                 pthread_spin_unlock(&_locks[chunk_id % pwc_locks]);
-                _syncing_pool.push([=]() { __sync_chunk(chunk_id); });
                 _num_syncing_chunks++;
+                _syncing_pool.push([=]() { __sync_chunk(chunk_id); });
             }
         }
         
@@ -1942,7 +1922,7 @@ template <class logger_t> int pwc_manager_tmpl<logger_t>::release_sync(long chun
         // ever pin the whole cache, __fetch_cache_for pumps the queue.
         pthread_spin_lock(&_to_sync_chunks_lock);
         _chunk_status[chunk_id] |= _ck_to_sync;
-        _to_sync_chunks.push(chunk_id);
+        if (_queued_sync_chunks.insert(chunk_id).second) _to_sync_chunks.push(chunk_id);
         _chunk_status[chunk_id] &= ~(_ck_writing | _ck_reading);
         pthread_spin_unlock(&_to_sync_chunks_lock);
         lg_exit();
@@ -1955,11 +1935,11 @@ template <class logger_t> int pwc_manager_tmpl<logger_t>::release_sync(long chun
         new_status &= ~(_ck_writing | _ck_reading | _ck_to_sync);
         new_status |= _ck_syncing;
         _chunk_status[chunk_id] = new_status;
-        _syncing_pool.push([=]() { __sync_chunk(chunk_id); });
         _num_syncing_chunks++;
+        _syncing_pool.push([=]() { __sync_chunk(chunk_id); });
     } else {
         _chunk_status[chunk_id] |= _ck_to_sync;
-        _to_sync_chunks.push(chunk_id);
+        if (_queued_sync_chunks.insert(chunk_id).second) _to_sync_chunks.push(chunk_id);
         _chunk_status[chunk_id] &= ~(_ck_writing | _ck_reading);
     }
     pthread_spin_unlock(&_to_sync_chunks_lock);

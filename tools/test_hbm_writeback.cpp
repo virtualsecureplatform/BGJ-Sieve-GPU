@@ -38,7 +38,8 @@ int main(int argc, char **argv) {
         fill(pwc->fetch(id), id, 0);
         pwc->release_sync(id);
     }
-    for (int pass = 1; pass <= 3; ++pass) {
+    constexpr int passes = 48;
+    for (int pass = 1; pass <= passes; ++pass) {
         #pragma omp parallel for num_threads(8) schedule(static)
         for (long id = 0; id < count; ++id) {
             chunk_t *c = pwc->fetch(id);
@@ -71,16 +72,16 @@ int main(int argc, char **argv) {
         int8_t vec[64];
         constexpr long n = Pool_hd_t::chunk_max_nvecs;
         require(pread(fd, &size, 2, 0) == 2 && size == 1, "persisted size");
-        require(pread(fd, &score, 2, 12) == 2 && score == id + 3, "persisted score");
-        require(pread(fd, &norm, 4, 12 + 2*n) == 4 && norm == 10000 + id + 3, "persisted norm");
-        require(pread(fd, &uid, 8, 12 + 6*n) == 8 && uid == 100000 + id + 3, "persisted uid");
+        require(pread(fd, &score, 2, 12) == 2 && score == id + passes, "persisted score");
+        require(pread(fd, &norm, 4, 12 + 2*n) == 4 && norm == 10000 + id + passes, "persisted norm");
+        require(pread(fd, &uid, 8, 12 + 6*n) == 8 && uid == 100000 + id + passes, "persisted uid");
         require(pread(fd, vec, 64, 12 + 14*n) == 64, "persisted vector read");
-        for (int j = 0; j < 64; ++j) require(vec[j] == (id+j+3)%101, "persisted vector");
+        for (int j = 0; j < 64; ++j) require(vec[j] == (id+j+passes)%101, "persisted vector");
         close(fd);
     }
     require(files == count, "missing persisted chunks");
     for (long id = 0; id < count; ++id) {
-        check(pwc->fetch(id), id, 3);
+        check(pwc->fetch(id), id, passes);
         pwc->release(id);
     }
     pool.set_sieving_context(100, 164);
