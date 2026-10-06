@@ -12,15 +12,16 @@ SOURCE_COMMIT="${SOURCE_COMMIT:-$(git -C "${SLURM_SUBMIT_DIR}" rev-parse HEAD)}"
 FPLLL="${BASE}/deps/fplll-b0e38e31085e"
 GENERATOR="${BASE}/deps/ntl-9.3.0-svp-generator/bin/svp_challenge_generator"
 LAST_SEED="${LAST_SEED:-7}"
+FIRST_SEED="${FIRST_SEED:-0}"
 SEARCH_ONLY="${SEARCH_ONLY:-1}"
 SCAN_ALL="${SCAN_ALL:-1}"
-if [[ ! "${LAST_SEED}" =~ ^[0-9]+$ ]] || (( LAST_SEED > 63 )); then
-    echo "LAST_SEED must be 0..63" >&2
+if [[ ! "${LAST_SEED}" =~ ^[0-9]+$ || ! "${FIRST_SEED}" =~ ^[0-9]+$ ]] || (( FIRST_SEED > LAST_SEED || LAST_SEED > 127 )); then
+    echo "Seed range must satisfy 0 <= FIRST_SEED <= LAST_SEED <= 127" >&2
     exit 1
 fi
 mkdir -p "${RUN}/source"
 if [[ -n "${REUSE_RUN:-}" ]]; then
-    for (( seed=0; seed<=LAST_SEED; seed++ )); do
+    for (( seed=FIRST_SEED; seed<=LAST_SEED; seed++ )); do
         if [[ -s "${REUSE_RUN}/seed-${seed}/potlll.gso" && -s "${REUSE_RUN}/seed-${seed}/potlll.basis" ]]; then
             cp -a "${REUSE_RUN}/seed-${seed}" "${RUN}/seed-${seed}"
         fi
@@ -29,7 +30,7 @@ fi
 git -C "${SLURM_SUBMIT_DIR}" archive "${SOURCE_COMMIT}" | tar -x -C "${RUN}/source"
 SOURCE="${RUN}/source"
 cp "${SLURM_SUBMIT_DIR}/../pro-pnj-bkz/PnJBKZ_Simulator/Fig2_Fig3_Fig4_Verification_Experiments_of_PnjBKZ_Simulator_2025_LLL_practice.py" "${RUN}/reference-simulator.py"
-echo "Source ${SOURCE_COMMIT}; one GPU allocation; eight concurrent single-threaded PotLLL processes"
+echo "Source ${SOURCE_COMMIT}; seeds ${FIRST_SEED}..${LAST_SEED}; eight concurrent single-threaded PotLLL processes; search-only=${SEARCH_ONLY}"
 export APPTAINERENV_OMP_NUM_THREADS=1 APPTAINERENV_OPENBLAS_NUM_THREADS=1
 apptainer exec --bind "${BASE}" "${SIF}" env LD_LIBRARY_PATH="${FPLLL}/lib" \
     "${FPLLL}/bin/fplll" --help | grep -q potlll
@@ -57,7 +58,7 @@ prepare_seed() {
     apptainer exec --bind "${BASE}" "${SIF}" "${RUN}/dump_gso" "${DIR}/potlll.basis" > "${DIR}/potlll.gso"
 }
 SEED=none
-for (( first=0; first<=LAST_SEED; first+=8 )); do
+for (( first=FIRST_SEED; first<=LAST_SEED; first+=8 )); do
 last=$((first+7))
 if (( last > LAST_SEED )); then last="${LAST_SEED}"; fi
 PIDS=()
@@ -78,7 +79,7 @@ if [[ "${FAILED}" == 1 ]]; then
     echo "At least one seed failed; skipping simulation and BKZ submission." >&2
     exit 1
 fi
-apptainer exec --bind "${BASE}" "${SIF}" python3 "${SOURCE}/tools/plan_svp167_search.py" "${RUN}" "${RUN}/reference-simulator.py" --last-seed "${last}"
+apptainer exec --bind "${BASE}" "${SIF}" python3 "${SOURCE}/tools/plan_svp167_search.py" "${RUN}" "${RUN}/reference-simulator.py" --first-seed "${FIRST_SEED}" --last-seed "${last}"
 SEED=$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1]))["selected"]; print(s["seed"] if s else "none")' "${RUN}/summary.json")
 if [[ "${SEED}" != none && "${SCAN_ALL}" != 1 ]]; then break; fi
 done

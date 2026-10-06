@@ -56,9 +56,10 @@ def main():
     parser.add_argument('run_root', type=Path)
     parser.add_argument('simulator_source', type=Path)
     parser.add_argument('--last-seed', type=int, default=7)
+    parser.add_argument('--first-seed', type=int, default=0)
     args = parser.parse_args()
-    if not 0 <= args.last_seed <= 63:
-        parser.error('--last-seed must be between 0 and 63')
+    if not 0 <= args.first_seed <= args.last_seed <= 127:
+        parser.error('seed range must satisfy 0 <= first <= last <= 127')
     source = args.simulator_source.read_text()
     node = next(x for x in ast.parse(source).body
                 if isinstance(x, ast.FunctionDef) and x.name == 'pnjBKZ_simulator')
@@ -66,7 +67,7 @@ def main():
               lgamma=math.lgamma, pi=math.pi)
     exec(compile(ast.Module(body=[node],type_ignores=[]),'reference-simulator','exec'),ns)
     reports, candidates = [], []
-    for seed in range(args.last_seed+1):
+    for seed in range(args.first_seed,args.last_seed+1):
         profile_path = args.run_root / ('seed-%d' % seed) / 'potlll.gso'
         profile = list(map(float,profile_path.read_text().split()))
         paths = [simulate(profile,ns['pnjBKZ_simulator'],j) for j in (9,3,1)]

@@ -5,7 +5,7 @@
 #SBATCH --time=1-00:00:00
 #SBATCH --output=/LARGE0/gr20116/%u/BGJ-Sieve-GPU/logs/svp164-bgj/slurm-%x-%j.out
 set -euo pipefail
-export LAST_SEED=63 SEARCH_ONLY=1 SCAN_ALL=1
+export FIRST_SEED="${FIRST_SEED:-0}" LAST_SEED="${LAST_SEED:-63}" SEARCH_ONLY=1 SCAN_ALL=1
 export REUSE_RUN="${REUSE_RUN:-/LARGE0/gr20116/${USER}/BGJ-Sieve-GPU/runs/svp167-search/potlll-simulation-300481}"
 export SOURCE_COMMIT="${SOURCE_COMMIT:-$(git -C "${SLURM_SUBMIT_DIR}" rev-parse HEAD)}"
 # Execute the common CPU-only workflow; its SBATCH GPU directives are comments
