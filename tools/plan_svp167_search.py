@@ -58,8 +58,8 @@ def main():
     parser.add_argument('--last-seed', type=int, default=7)
     parser.add_argument('--first-seed', type=int, default=0)
     args = parser.parse_args()
-    if not 0 <= args.first_seed <= args.last_seed <= 127:
-        parser.error('seed range must satisfy 0 <= first <= last <= 127')
+    if not 0 <= args.first_seed <= args.last_seed <= 255:
+        parser.error('seed range must satisfy 0 <= first <= last <= 255')
     source = args.simulator_source.read_text()
     node = next(x for x in ast.parse(source).body
                 if isinstance(x, ast.FunctionDef) and x.name == 'pnjBKZ_simulator')

@@ -10,4 +10,8 @@ export REUSE_RUN="${REUSE_RUN:-/LARGE0/gr20116/${USER}/BGJ-Sieve-GPU/runs/svp167
 export SOURCE_COMMIT="${SOURCE_COMMIT:-$(git -C "${SLURM_SUBMIT_DIR}" rev-parse HEAD)}"
 # Execute the common CPU-only workflow; its SBATCH GPU directives are comments
 # here and do not apply to this allocation. No --nv or CUDA compilation is used.
-bash "${SLURM_SUBMIT_DIR}/reproduce/svp167-search/potlll_simulate_a100x1.sbatch"
+WORKFLOW_DIR="/LARGE0/gr20116/${USER}/BGJ-Sieve-GPU/builds/svp167-cpu-workflow-${SLURM_JOB_ID}"
+mkdir -p "${WORKFLOW_DIR}"
+git -C "${SLURM_SUBMIT_DIR}" archive "${SOURCE_COMMIT}" \
+    reproduce/svp167-search/potlll_simulate_a100x1.sbatch | tar -x -C "${WORKFLOW_DIR}"
+bash "${WORKFLOW_DIR}/reproduce/svp167-search/potlll_simulate_a100x1.sbatch"

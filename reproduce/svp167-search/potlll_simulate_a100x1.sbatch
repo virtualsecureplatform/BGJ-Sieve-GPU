@@ -15,8 +15,8 @@ LAST_SEED="${LAST_SEED:-7}"
 FIRST_SEED="${FIRST_SEED:-0}"
 SEARCH_ONLY="${SEARCH_ONLY:-1}"
 SCAN_ALL="${SCAN_ALL:-1}"
-if [[ ! "${LAST_SEED}" =~ ^[0-9]+$ || ! "${FIRST_SEED}" =~ ^[0-9]+$ ]] || (( FIRST_SEED > LAST_SEED || LAST_SEED > 127 )); then
-    echo "Seed range must satisfy 0 <= FIRST_SEED <= LAST_SEED <= 127" >&2
+if [[ ! "${LAST_SEED}" =~ ^[0-9]+$ || ! "${FIRST_SEED}" =~ ^[0-9]+$ ]] || (( FIRST_SEED > LAST_SEED || LAST_SEED > 255 )); then
+    echo "Seed range must satisfy 0 <= FIRST_SEED <= LAST_SEED <= 255" >&2
     exit 1
 fi
 mkdir -p "${RUN}/source"
