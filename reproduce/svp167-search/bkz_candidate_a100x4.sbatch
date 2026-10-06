@@ -16,6 +16,7 @@ BUILD="${BASE}/builds/svp167-seed${SELECTED_SEED}-${SLURM_JOB_ID}"
 mkdir -p "${BUILD}/source" "${RUN}"
 git -C "${SLURM_SUBMIT_DIR}" archive "${SOURCE_COMMIT}" | tar -x -C "${BUILD}/source"
 SOURCE="${BUILD}/source"
+SCHEDULE="${SCHEDULE_FILE:-${DIR}/schedule.json}"
 FLAGS="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_A100X4_PWC_GB=380 -DHD_A100X4_BWC_GB=8 -DHD_A100X4_SWC_GB=4 -DPOOL_HOST_VEC_MAX_DIM=144 -DENABLE_PROFILING=0"
 apptainer exec --nv --bind "${BASE}" "${SIF}" bash -lc \
     "make -B -C '${SOURCE}/src' -j 16 CPPFLAGS='${FLAGS}' && make -B -C '${SOURCE}/app' -j 4 hd_sieve CPPFLAGS='${FLAGS}'"
@@ -35,9 +36,9 @@ export APPTAINERENV_HD_HBM_PWC_GB=16 APPTAINERENV_HD_HBM_PWC_MIN_CSD=143
 export APPTAINERENV_HD_HBM_BWC_GB=12 APPTAINERENV_HD_HBM_BWC_MIN_CSD=100
 export APPTAINERENV_HD_BGJ2_REDUCER_THREADS=32 APPTAINERENV_HD_BUCKET_THREADS=20
 echo "SVP167 seed ${SELECTED_SEED}; source ${SOURCE_COMMIT}; target length <=3405"
-cat "${DIR}/schedule.json"
+cat "${SCHEDULE}"
 timeout --signal=TERM --kill-after=60s 604200s apptainer exec --nv --bind "${BASE}" "${SIF}" \
     python3 "${SOURCE}/tools/bkz_scheduler.py" --input "${DIR}/potlll.basis" \
-    --schedule "${DIR}/schedule.json" --binary "${SOURCE}/app/hd_sieve" \
+    --schedule "${SCHEDULE}" --binary "${SOURCE}/app/hd_sieve" \
     --work-dir "${RUN}" --output "${DIR}/result.basis"
 apptainer exec --bind "${BASE}" "${SIF}" python3 "${SOURCE}/tools/check_basis_det_mod.py" "${DIR}/input.raw" "${DIR}/result.basis"
