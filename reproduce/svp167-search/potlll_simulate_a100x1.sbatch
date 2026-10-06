@@ -12,6 +12,8 @@ SOURCE_COMMIT="${SOURCE_COMMIT:-$(git -C "${SLURM_SUBMIT_DIR}" rev-parse HEAD)}"
 FPLLL="${BASE}/deps/fplll-b0e38e31085e"
 GENERATOR="${BASE}/deps/ntl-9.3.0-svp-generator/bin/svp_challenge_generator"
 LAST_SEED="${LAST_SEED:-7}"
+SEARCH_ONLY="${SEARCH_ONLY:-1}"
+SCAN_ALL="${SCAN_ALL:-1}"
 if [[ ! "${LAST_SEED}" =~ ^[0-9]+$ ]] || (( LAST_SEED > 63 )); then
     echo "LAST_SEED must be 0..63" >&2
     exit 1
@@ -78,13 +80,15 @@ if [[ "${FAILED}" == 1 ]]; then
 fi
 apptainer exec --bind "${BASE}" "${SIF}" python3 "${SOURCE}/tools/plan_svp167_search.py" "${RUN}" "${RUN}/reference-simulator.py" --last-seed "${last}"
 SEED=$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1]))["selected"]; print(s["seed"] if s else "none")' "${RUN}/summary.json")
-if [[ "${SEED}" != none ]]; then break; fi
+if [[ "${SEED}" != none && "${SCAN_ALL}" != 1 ]]; then break; fi
 done
-if [[ "${SEED}" != none ]]; then
+if [[ "${SEED}" != none && "${SEARCH_ONLY}" != 1 ]]; then
     # Leave this one-GPU allocation before the four-GPU solver starts.
     sbatch --dependency="afterok:${SLURM_JOB_ID}" \
         --export="ALL,SEARCH_RUN=${RUN},SELECTED_SEED=${SEED},SOURCE_COMMIT=${SOURCE_COMMIT}" \
         "${SLURM_SUBMIT_DIR}/reproduce/svp167-search/bkz_candidate_a100x4.sbatch"
+elif [[ "${SEED}" != none ]]; then
+    echo "Candidate seed ${SEED} found; search-only mode: no BKZ submitted."
 else
     echo "No configuration predicted to reach 3405 with BSD <=143 through seed ${LAST_SEED}; no BKZ submitted."
 fi
