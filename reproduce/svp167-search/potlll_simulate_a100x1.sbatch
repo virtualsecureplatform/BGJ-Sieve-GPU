@@ -11,7 +11,19 @@ SIF="${BASE}/bgj-sieve-gpu-cuda13.3.sif"
 SOURCE_COMMIT="${SOURCE_COMMIT:-$(git -C "${SLURM_SUBMIT_DIR}" rev-parse HEAD)}"
 FPLLL="${BASE}/deps/fplll-b0e38e31085e"
 GENERATOR="${BASE}/deps/ntl-9.3.0-svp-generator/bin/svp_challenge_generator"
+LAST_SEED="${LAST_SEED:-7}"
+if [[ ! "${LAST_SEED}" =~ ^[0-9]+$ ]] || (( LAST_SEED > 63 )); then
+    echo "LAST_SEED must be 0..63" >&2
+    exit 1
+fi
 mkdir -p "${RUN}/source"
+if [[ -n "${REUSE_RUN:-}" ]]; then
+    for (( seed=0; seed<=LAST_SEED; seed++ )); do
+        if [[ -s "${REUSE_RUN}/seed-${seed}/potlll.gso" && -s "${REUSE_RUN}/seed-${seed}/potlll.basis" ]]; then
+            cp -a "${REUSE_RUN}/seed-${seed}" "${RUN}/seed-${seed}"
+        fi
+    done
+fi
 git -C "${SLURM_SUBMIT_DIR}" archive "${SOURCE_COMMIT}" | tar -x -C "${RUN}/source"
 SOURCE="${RUN}/source"
 cp "${SLURM_SUBMIT_DIR}/../pro-pnj-bkz/PnJBKZ_Simulator/Fig2_Fig3_Fig4_Verification_Experiments_of_PnjBKZ_Simulator_2025_LLL_practice.py" "${RUN}/reference-simulator.py"
@@ -27,6 +39,10 @@ prepare_seed() {
     local DIR
     DIR="${RUN}/seed-${seed}"
     mkdir -p "${DIR}"
+    if [[ -s "${DIR}/potlll.gso" && -s "${DIR}/potlll.basis" ]]; then
+        echo "Reusing completed PotLLL/GSO seed ${seed}"
+        return
+    fi
     apptainer exec --bind "${BASE}" "${SIF}" "${GENERATOR}" 167 "${seed}" > "${DIR}/input.raw.tmp"
     mv "${DIR}/input.raw.tmp" "${DIR}/input.raw"
     echo "PotLLL seed=${seed} start=$(date -Is)"
@@ -38,8 +54,12 @@ prepare_seed() {
     apptainer exec --bind "${BASE}" "${SIF}" python3 "${SOURCE}/tools/check_basis_det_mod.py" "${DIR}/input.raw" "${DIR}/potlll.basis"
     apptainer exec --bind "${BASE}" "${SIF}" "${RUN}/dump_gso" "${DIR}/potlll.basis" > "${DIR}/potlll.gso"
 }
+SEED=none
+for (( first=0; first<=LAST_SEED; first+=8 )); do
+last=$((first+7))
+if (( last > LAST_SEED )); then last="${LAST_SEED}"; fi
 PIDS=()
-for seed in 0 1 2 3 4 5 6 7; do
+for (( seed=first; seed<=last; seed++ )); do
     mkdir -p "${RUN}/seed-${seed}"
     prepare_seed "${seed}" > "${RUN}/seed-${seed}/prepare.log" 2>&1 &
     PIDS+=("$!")
@@ -48,7 +68,7 @@ FAILED=0
 for pid in "${PIDS[@]}"; do
     if ! wait "${pid}"; then FAILED=1; fi
 done
-for seed in 0 1 2 3 4 5 6 7; do
+for (( seed=first; seed<=last; seed++ )); do
     echo "=== seed ${seed} ==="
     cat "${RUN}/seed-${seed}/prepare.log"
 done
@@ -56,13 +76,15 @@ if [[ "${FAILED}" == 1 ]]; then
     echo "At least one seed failed; skipping simulation and BKZ submission." >&2
     exit 1
 fi
-apptainer exec --bind "${BASE}" "${SIF}" python3 "${SOURCE}/tools/plan_svp167_search.py" "${RUN}" "${RUN}/reference-simulator.py"
+apptainer exec --bind "${BASE}" "${SIF}" python3 "${SOURCE}/tools/plan_svp167_search.py" "${RUN}" "${RUN}/reference-simulator.py" --last-seed "${last}"
 SEED=$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1]))["selected"]; print(s["seed"] if s else "none")' "${RUN}/summary.json")
+if [[ "${SEED}" != none ]]; then break; fi
+done
 if [[ "${SEED}" != none ]]; then
     # Leave this one-GPU allocation before the four-GPU solver starts.
     sbatch --dependency="afterok:${SLURM_JOB_ID}" \
         --export="ALL,SEARCH_RUN=${RUN},SELECTED_SEED=${SEED},SOURCE_COMMIT=${SOURCE_COMMIT}" \
         "${SLURM_SUBMIT_DIR}/reproduce/svp167-search/bkz_candidate_a100x4.sbatch"
 else
-    echo "No configuration predicted to reach 3405 with BSD <=143; no BKZ submitted."
+    echo "No configuration predicted to reach 3405 with BSD <=143 through seed ${LAST_SEED}; no BKZ submitted."
 fi
