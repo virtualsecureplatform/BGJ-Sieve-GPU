@@ -75,7 +75,8 @@ def main():
         reports.append(report)
         for path in paths:
             if path['eligible']:
-                candidates.append((path['pump_count'],path['predicted_norm'],seed,path))
+                max_bsd = max(x['bsd'] for x in path['predictions'])
+                candidates.append((max_bsd,path['pump_count'],path['predicted_norm'],seed,path))
         (profile_path.parent / 'simulation.json').write_text(json.dumps(report,indent=2)+'\n')
         print('seed %d: %s' % (seed, ', '.join(
             'J%d %.3f (%s)' % (x['jump'],x['predicted_norm'],
@@ -83,13 +84,13 @@ def main():
     selected = None
     if candidates:
         # Pump count is only a coarse work proxy, not a measured runtime model.
-        _,_,seed,path = min(candidates,key=lambda x:x[:3])
+        max_bsd,_,_,seed,path = min(candidates,key=lambda x:x[:4])
         schedule = args.run_root / ('seed-%d' % seed) / 'schedule.json'
         schedule.write_text(json.dumps(path['schedule'],indent=2)+'\n')
-        selected = dict(seed=seed,jump=path['jump'],predicted_norm=path['predicted_norm'],
+        selected = dict(seed=seed,jump=path['jump'],max_bsd=max_bsd,predicted_norm=path['predicted_norm'],
                         schedule=str(schedule),pump_count=path['pump_count'])
     summary = dict(target_norm=3405,selected=selected,reports=reports,
-                   selection_rule='Fewest scheduled pumps, then shortest predicted norm; heuristic.')
+                   selection_rule='Smallest maximum BSD, then fewest pumps, then shortest predicted norm; heuristic.')
     (args.run_root / 'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
     print('Selected: '+json.dumps(selected),flush=True)
 
