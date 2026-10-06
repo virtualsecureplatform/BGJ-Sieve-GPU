@@ -21,7 +21,7 @@ apptainer exec --bind "${BASE}" "${SIF}" env LD_LIBRARY_PATH="${FPLLL}/lib" \
     "${FPLLL}/bin/fplll" --help | grep -q potlll
 # Build only CPU objects needed for GSO extraction, on the compute node.
 apptainer exec --bind "${BASE}" "${SIF}" bash -lc \
-    "make -C '${SOURCE}/src' -j 4 lattice.o quad.o lll.o vec.o && g++ -O2 -fopenmp '${SOURCE}/tools/dump_gso.cpp' '${SOURCE}/src/lattice.o' '${SOURCE}/src/quad.o' '${SOURCE}/src/lll.o' '${SOURCE}/src/vec.o' -lntl -lgmp -lm -o '${RUN}/dump_gso'"
+    "make -C '${SOURCE}/src' -j 4 lattice.o quad.o lll.o vec.o utils.o && g++ -O2 -fopenmp '${SOURCE}/tools/dump_gso.cpp' '${SOURCE}/src/lattice.o' '${SOURCE}/src/quad.o' '${SOURCE}/src/lll.o' '${SOURCE}/src/vec.o' '${SOURCE}/src/utils.o' -lntl -lgmp -lm -o '${RUN}/dump_gso'"
 prepare_seed() {
     local seed="$1"
     local DIR
