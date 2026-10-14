@@ -1,0 +1,15 @@
+{
+  "name": "svp167-seed38-bkz144-j9-two-tours",
+  "target_norm2": 11594025,
+  "defaults": {"jump": 9, "dual_hash_ratio": 0, "tours": 1},
+  "stages": [
+    {"sieve_dimension": 144, "d4f": 23, "start_index": 0, "stop_index": 9},
+    {"sieve_dimension": 144, "d4f": 23, "start_index": 9, "stop_index": 18},
+    {"sieve_dimension": 144, "d4f": 23, "start_index": 18, "stop_index": 27},
+    {"sieve_dimension": 144, "d4f": 23, "start_index": 27},
+    {"sieve_dimension": 144, "d4f": 23, "start_index": 0, "stop_index": 9},
+    {"sieve_dimension": 144, "d4f": 23, "start_index": 9, "stop_index": 18},
+    {"sieve_dimension": 144, "d4f": 23, "start_index": 18, "stop_index": 27},
+    {"sieve_dimension": 144, "d4f": 23, "start_index": 27}
+  ]
+}

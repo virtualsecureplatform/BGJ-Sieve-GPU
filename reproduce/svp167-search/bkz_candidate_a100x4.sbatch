@@ -17,7 +17,7 @@ mkdir -p "${BUILD}/source" "${RUN}"
 git -C "${SLURM_SUBMIT_DIR}" archive "${SOURCE_COMMIT}" | tar -x -C "${BUILD}/source"
 SOURCE="${BUILD}/source"
 SCHEDULE="${SCHEDULE_FILE:-${DIR}/schedule.json}"
-FLAGS="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_A100X4_PWC_GB=380 -DHD_A100X4_BWC_GB=8 -DHD_A100X4_SWC_GB=4 -DPOOL_HOST_VEC_MAX_DIM=144 -DENABLE_PROFILING=0"
+FLAGS="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_A100X4_PWC_GB=390 -DHD_A100X4_BWC_GB=8 -DHD_A100X4_SWC_GB=4 -DPOOL_HOST_VEC_MAX_DIM=144 -DENABLE_PROFILING=0"
 apptainer exec --nv --bind "${BASE}" "${SIF}" bash -lc \
     "make -B -C '${SOURCE}/src' -j 16 CPPFLAGS='${FLAGS}' && make -B -C '${SOURCE}/app' -j 4 hd_sieve CPPFLAGS='${FLAGS}'"
 ARCHIVE="${RUN}/interrupted-scratch-before-${SLURM_JOB_ID}"

@@ -72,6 +72,15 @@ struct pwc_hbm_cache_t {
                     (void **)&shard[d].base, (size_t)slots * slot_nbytes))
                 slots /= 2;
             if (!shard[d].base || slots <= 0) continue;
+            const char *require_capacity = getenv("HD_HBM_PWC_REQUIRE_CAPACITY");
+            if (require_capacity && atoi(require_capacity) != 0 &&
+                    (size_t)slots < (size_t)(gib_per_gpu * (1ULL << 30)) / slot_nbytes) {
+                fprintf(stderr, "[PWC-HBM-CAPACITY] GPU %d: requested %.3f GiB, obtained %.3f GiB; aborting\n",
+                        hw::gpu_id_list[d], gib_per_gpu,
+                        slots * slot_nbytes / 1073741824.0);
+                fflush(stderr);
+                abort();
+            }
             CHECK_CUDA_ERR(cudaStreamCreateWithFlags(&shard[d].stream, cudaStreamNonBlocking));
             shard[d].slots = slots;
             shard[d].free_slots.reserve(slots);
@@ -82,6 +91,13 @@ struct pwc_hbm_cache_t {
             printf("[PWC-HBM] GPU %d shard %.3f GiB, %d exact chunks\n",
                    hw::gpu_id_list[d], slots * slot_nbytes / 1073741824.0,
                    slots);
+        }
+        const char *require_capacity = getenv("HD_HBM_PWC_REQUIRE_CAPACITY");
+        if (require_capacity && atoi(require_capacity) != 0 && enabled != hw::gpu_num) {
+            fprintf(stderr, "[PWC-HBM-CAPACITY] only %d/%d GPU shards allocated; aborting\n",
+                    enabled, hw::gpu_num);
+            fflush(stderr);
+            abort();
         }
         initialized.store(enabled ? 1 : 2, std::memory_order_release);
         fflush(stdout);

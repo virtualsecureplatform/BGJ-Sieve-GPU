@@ -21,15 +21,30 @@ mapfile -t INPUTS < <(find "${BASE}/runs/svp164-seed1/potlll-scheduled-bkz/bkz-c
 export APPTAINERENV_HD_LAZY_SYNC=1 APPTAINERENV_HD_HBM_PWC_WRITEBACK=1
 export APPTAINERENV_HD_HBM_PWC_MIN_CSD=64 APPTAINERENV_HD_CACHE_WAIT_TIMEOUT_S=120
 export APPTAINERENV_HD_HOST_ARENA_INITIAL_GB=24 APPTAINERENV_HD_POOL_BUFFER_CACHE=0
-for mode in generous spill; do
+for mode in generous spill guarded-spill; do
     mkdir -p "${RUN}/${mode}"
     for kind in pool bucket sol uid; do
         for device in 0 1 2 3; do mkdir -p "${RUN}/${mode}/.${kind}/${device}"; done
     done
     if [[ "${mode}" == generous ]]; then
         export APPTAINERENV_HD_HBM_PWC_GB=0.125
+        export APPTAINERENV_HD_PWC_FAIL_ON_SPILL=1
     else
         export APPTAINERENV_HD_HBM_PWC_GB=0.01
+        export APPTAINERENV_HD_PWC_FAIL_ON_SPILL=0
+    fi
+    if [[ "${mode}" == guarded-spill ]]; then
+        export APPTAINERENV_HD_PWC_FAIL_ON_SPILL=1
+        set +e
+        timeout 600s apptainer exec --nv --bind "${BASE}" --pwd "${RUN}/${mode}" \
+            "${SIF}" "${RUN}/test" "${INPUTS[0]}" spill > "${RUN}/${mode}/test.log" 2>&1
+        status=$?
+        set -e
+        [[ "${status}" == 134 ]]
+        rg -q '\[PWC-SPILL-FORBIDDEN\]' "${RUN}/${mode}/test.log"
+        [[ -z "$(find "${RUN}/${mode}/.pool" -type f -print -quit)" ]]
+        echo "PASS: spill guard aborted before writing pool files"
+        continue
     fi
     timeout 600s apptainer exec --nv --bind "${BASE}" --pwd "${RUN}/${mode}" \
         "${SIF}" "${RUN}/test" "${INPUTS[0]}" "${mode}"

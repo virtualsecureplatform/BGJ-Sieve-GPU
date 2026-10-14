@@ -1247,6 +1247,13 @@ template <class logger_t> int32_t pwc_manager_tmpl<logger_t>::__fetch_cache_for(
             const bool stored = _hbm_pool_tier && _pwc_hbm_store(
                 old_chunk_id, &_cached_chunks[cache_id], _pool->CSD, dirty);
             if (dirty && !stored) {
+                const char *no_spill = getenv("HD_PWC_FAIL_ON_SPILL");
+                if (no_spill && atoi(no_spill) != 0 && !_force_disk_flush.load()) {
+                    fprintf(stderr, "[PWC-SPILL-FORBIDDEN] chunk=%d csd=%ld: host/HBM cache exhausted; aborting before disk spill\n",
+                            old_chunk_id, (long)_pool->CSD);
+                    fflush(stderr);
+                    abort();
+                }
                 // Keep the only current copy in host RAM. Spill only this
                 // chunk to disk; never evict dirty data on an HBM miss.
                 pthread_spin_unlock(&_cached_chunks_lock);
@@ -1415,6 +1422,14 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__load_chunk(long chu
 
 template <class logger_t> void pwc_manager_tmpl<logger_t>::__sync_chunk(long chunk_id) {
     lg_init();
+    const char *no_spill = getenv("HD_PWC_FAIL_ON_SPILL");
+    if (_hbm_pool_tier && no_spill && atoi(no_spill) != 0 &&
+            !_force_disk_flush.load()) {
+        fprintf(stderr, "[PWC-SPILL-FORBIDDEN] chunk=%ld csd=%ld: unforced pool disk write\n",
+                chunk_id, (long)_pool->CSD);
+        fflush(stderr);
+        abort();
+    }
     chunk_t *src_chunk = &_cached_chunks[_chunk_status[chunk_id] & _ck_cache_id_mask];
 
     char chunk_filename[256];
