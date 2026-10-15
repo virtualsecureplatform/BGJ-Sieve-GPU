@@ -32,7 +32,7 @@ def shell_join(arguments):
     return " ".join(shlex.quote(str(argument)) for argument in arguments)
 
 
-def run_identity(source, stages, final_sieve=None):
+def run_identity(source, stages, final_sieve=None, backend="serial"):
     digest = hashlib.sha256()
     with open(source, "rb") as handle:
         while True:
@@ -42,6 +42,8 @@ def run_identity(source, stages, final_sieve=None):
             digest.update(chunk)
     digest.update(json.dumps(stages, sort_keys=True, separators=(",", ":")).encode("utf-8"))
     digest.update(json.dumps(final_sieve, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    if backend != "serial":
+        digest.update(("backend=" + backend + ";world=2;checkpoint=v2").encode("ascii"))
     return digest.hexdigest()[:16]
 
 
@@ -138,6 +140,13 @@ def command_for(binary, input_name, output_name, stage):
     return command
 
 
+def mpi_command(command, checkpoint_root, frame_mib=256):
+    return ["srun", "--mpi=pmix_v2", "--nodes=2", "--ntasks=2",
+            "--ntasks-per-node=1", "--kill-on-bad-exit=1"] + command + [
+            "--checkpoint-root", str(checkpoint_root), "--resume", "auto",
+            "--mpi-frame-mib", str(frame_mib)]
+
+
 def final_sieve_command(binary, input_name, settings):
     command = [str(binary), "--input", input_name, "--task", "sieve"]
     for field, option in (("target_sieving_dimension", "--TSD"),
@@ -189,12 +198,20 @@ def main(argv=None):
                         help="job-local directory containing .pool/.bucket/.sol/.uid")
     parser.add_argument("--output", type=Path, help="copy the last checkpoint here")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--backend", choices=("serial", "mpi"), default="serial")
+    parser.add_argument("--mpi-frame-mib", type=int, default=256)
     args = parser.parse_args(argv)
 
     try:
         plan = load_plan(args.schedule, args.paper_preset)
         stages = normalize_stages(plan)
+        if not 1 <= args.mpi_frame_mib <= 1024:
+            raise ValueError("MPI frame size must be between 1 and 1024 MiB")
+        if args.backend == "mpi" and any(s["bdh"] != 0 for s in stages):
+            raise ValueError("MPI BKZ requires dual_hash_ratio=0")
         final_sieve = plan.get("final_sieve")
+        if args.backend == "mpi" and final_sieve is not None:
+            raise ValueError("MPI BKZ v1 does not support a scheduled final_sieve")
         if final_sieve is not None and not isinstance(final_sieve, dict):
             raise ValueError("final_sieve must be an object")
         target_norm2 = plan.get("target_norm2")
@@ -218,8 +235,11 @@ def main(argv=None):
             for tour in range(1, stage["tours"] + 1):
                 target = checkpoint_name(stage, tour)
                 print("DRY-RUN copy %s -> %s" % (current, scratch_input))
-                print("DRY-RUN " + shell_join(
-                    command_for(binary, scratch_input, scratch_output, stage)))
+                command = command_for(binary, scratch_input, scratch_output, stage)
+                if args.backend == "mpi":
+                    command = mpi_command(command, work_dir / "mpi-checkpoints" / "RUN_ID" / Path(target).stem,
+                                          args.mpi_frame_mib)
+                print("DRY-RUN " + shell_join(command))
                 print("DRY-RUN move %s -> %s" % (scratch_output, target))
                 current = target
         if final_sieve is not None:
@@ -231,7 +251,7 @@ def main(argv=None):
         parser.error("input does not exist: %s" % source)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         parser.error("hd_sieve is not executable: %s" % binary)
-    identity = run_identity(source, stages, final_sieve)
+    identity = run_identity(source, stages, final_sieve, args.backend)
     checkpoints = work_dir / "bkz-checkpoints" / identity
     first = checkpoints / "stage-000-input.basis"
     print("run identity: %s" % identity, flush=True)
@@ -263,8 +283,15 @@ def main(argv=None):
                     pass
             atomic_copy(current, local_input)
             command = command_for(binary, scratch_input, scratch_output, stage)
+            if args.backend == "mpi":
+                command = mpi_command(command, work_dir / "mpi-checkpoints" / identity / target.stem,
+                                      args.mpi_frame_mib)
             print("running: " + shell_join(command), flush=True)
-            subprocess.run(command, cwd=work_dir, check=True)
+            result = subprocess.run(command, cwd=work_dir)
+            if result.returncode == 75:
+                print("paused at a distributed phase checkpoint; rerun the same schedule", flush=True)
+                return 75
+            result.check_returncode()
             if not local_output.is_file() or local_output.stat().st_size == 0:
                 raise RuntimeError("hd_sieve returned success without %s" % local_output)
             os.replace(local_output, target)

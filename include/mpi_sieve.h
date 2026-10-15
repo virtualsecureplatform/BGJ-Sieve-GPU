@@ -7,7 +7,7 @@
 #include "pool_hd.h"
 
 int mpi_sieve_runtime_init(const char *checkpoint_root, int frame_mib,
-                           bool resume);
+                           bool resume, bool bkz = false);
 int mpi_sieve_runtime_finalize();
 void mpi_sieve_request_stop();
 bool mpi_sieve_should_stop();
@@ -40,5 +40,14 @@ int mpi_sieve_redistribute_pool(Pool_hd_t *pool);
 int mpi_sieve_prepare_working_pool(Pool_hd_t *pool);
 int mpi_sieve_checkpoint(Pool_hd_t *pool);
 void mpi_sieve_report_dimension(Pool_hd_t *pool, const char *phase);
+
+struct mpi_insert_candidate_t {
+    double objective = 0.0;
+    int32_t valid = 0, insert_pos = -1, remove_pos = -1;
+    int32_t coeff[256] = {};
+};
+int mpi_sieve_select_insert(mpi_insert_candidate_t *candidate);
+int mpi_sieve_agree_basis(Lattice_QP *basis, const char *phase);
+int mpi_bkz_run(void *task_config);
 
 #endif

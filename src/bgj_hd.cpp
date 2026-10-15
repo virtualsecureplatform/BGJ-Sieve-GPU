@@ -1068,6 +1068,52 @@ template <class logger_t> long bwc_manager_tmpl<logger_t>::bucket_num_chunks(lon
     return ret;
 }
 
+template <class logger_t> int bwc_manager_tmpl<logger_t>::mpi_export_bucket_chunk(
+        long bucket_id, std::vector<uint8_t> &records, int record_size,
+        bool first, bool *done) {
+    if (!done || bucket_id < 0 || bucket_id >= _num_buckets ||
+        record_size != (int)(sizeof(int32_t) + this->_pool->CSD)) return -1;
+    l0_bucket_t &bucket = _bucket[bucket_id];
+    if (bucket.status & l0_bucket_t::_bk_gpu_write) return -1;
+    if (first) {
+        for (;;) {
+            pthread_spin_lock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+            chunk_t *last = bucket.writing_chunk;
+            if (last == (chunk_t *)-1) {
+                pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+                continue;
+            }
+            bucket.writing_chunk = (chunk_t *)-1;
+            pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+            if (last) {
+                if (last->size) release_sync(last->id);
+                else {
+                    pthread_spin_lock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+                    if (bucket.num_chunks && bucket.chunk_ids[bucket.num_chunks-1] == last->id)
+                        --bucket.num_chunks;
+                    pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+                    release_del(last->id);
+                }
+            }
+            bucket.status = l0_bucket_t::_bk_reading;
+            __prefetch_for_reading(bucket_id);
+            break;
+        }
+    }
+    records.clear();
+    chunk_t *chunk = fetch_for_read(bucket_id);
+    *done = !chunk;
+    if (!chunk) { bucket_finalize(bucket_id); return 0; }
+    records.resize((size_t)chunk->size * record_size);
+    for (int i = 0; i < chunk->size; ++i) {
+        uint8_t *dst = records.data() + (size_t)i * record_size;
+        memcpy(dst, chunk->norm + i, 4);
+        memcpy(dst + 4, chunk->vec + (long)this->_pool->CSD * i, this->_pool->CSD);
+    }
+    read_done(chunk, bucket_id);
+    return 0;
+}
+
 template <class logger_t> int bwc_manager_tmpl<logger_t>::mpi_export_bucket(
         long bucket_id, std::vector<uint8_t> &records, int record_size) {
     if (bucket_id < 0 || bucket_id >= _num_buckets ||
@@ -1436,7 +1482,7 @@ template <class logger_t> void swc_manager_tmpl<logger_t>::chunk_finalize(chunk_
     
     pthread_spin_lock(&_locks[id % pwc_locks]);
     _chunk_status[id] |= _ck_writing;
-    pthread_spin_lock(&_locks[id % pwc_locks]);
+    pthread_spin_unlock(&_locks[id % pwc_locks]);
     release_del(id);
     lg_err("ready list full(%d), new chunk discarded", _num_ready);
     lg_exit();

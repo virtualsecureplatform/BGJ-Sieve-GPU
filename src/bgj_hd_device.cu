@@ -2175,6 +2175,26 @@ int Bucketer_t::run() {
             traits::taskChunks + _num_threads;
     const long gpu_native_bucket_capacity =
         max_task_batches * __buc_out_max_size(this);
+    if (mpi_sieve_active() && getenv("HD_FAIL_ON_SPILL") && atoi(getenv("HD_FAIL_ON_SPILL"))) {
+        // Bound two overlapping bucket waves, including the peer fragment.
+        // kernel_chooser supports powers of two >=16; never silently drop centers.
+        const uint64_t global_capacity = mpi_sieve_global_u64(gpu_native_bucket_capacity);
+        const uint64_t per_bucket = global_capacity * BWC_HOST_VEC_SLOT_NBYTES;
+        const uint64_t reserve = 1024ULL * Pool_hd_t::chunk_max_nvecs * BWC_HOST_VEC_SLOT_NBYTES;
+        const uint64_t available = BWC_DRAM_SLIMIT > reserve ? BWC_DRAM_SLIMIT-reserve : 0;
+        const uint64_t bound = per_bucket ? available / (2 * per_bucket) : 0;
+        int window = 16;
+        while ((uint64_t)window*2 <= bound && window*2 <= _max_batch0) window *= 2;
+        if (bound < 16 || _max_batch0 < 16) {
+            fprintf(stderr, "[MPI-CAPACITY] bucket cache cannot hold a bounded 16-center wave: bound=%llu\n",
+                    (unsigned long long)bound);
+            abort();
+        }
+        _max_batch0 = mpi_sieve_min_int(window);
+        _min_batch0 = std::min(_min_batch0, _max_batch0);
+        printf("[MPI-CAPACITY] CSD=%ld window=%d global_bucket_bound=%llu bytes\n",
+               _pool->CSD, _max_batch0, (unsigned long long)per_bucket); fflush(stdout);
+    }
     _bwc->configure_gpu_native_buckets(true, gpu_native_bucket_capacity);
     _buc_buf = new buc_buffer_holder_t(this);
     pthread_spin_init(&score_stat_lock, PTHREAD_PROCESS_SHARED);

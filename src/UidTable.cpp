@@ -172,6 +172,10 @@ int UidTable::check(uint64_t uid) {
 }
 
 int UidTable::dump_table(long table_id) {
+    if (getenv("HD_FAIL_ON_SPILL") && atoi(getenv("HD_FAIL_ON_SPILL"))) {
+        fprintf(stderr, "[CACHE-SPILL-FORBIDDEN] UID table %ld\n", table_id);
+        abort();
+    }
     if (table_id < 0 || table_id >= ut_split) return -2;
     
     char filename[64];
@@ -229,8 +233,8 @@ int UidTable::load_table(long table_id) {
     return 0;
 }
 
-int UidTable::reset_hash_function(long CSD) {
-    for (long i = 0; i < CSD; i++) _coeffs[i] = sampleU();
+int UidTable::reset_hash_function(long CSD, const uint64_t *restored) {
+    for (long i = 0; i < CSD; i++) _coeffs[i] = restored ? restored[i] : sampleU();
     if (mpi_sieve_sync_uid_coeffs(_coeffs, CSD)) return -1;
     
     #pragma omp parallel for num_threads(_num_threads)

@@ -553,6 +553,8 @@ int _get_real_context(int *ind_l, int *ind_r, uint64_t &hash) {
 }
 
 int task_config_t::run() {
+    if (mpi_sieve_active() && (task == task_bkz || task == task_local_pump))
+        return mpi_bkz_run(this);
     const char *dir_list[] = {".bucket", ".sol", ".uid", ".pool"};
     const bool resume_pump_pool = getenv("HD_PUMP_RESUME_CSD") != NULL &&
         (task == task_bkz || (task == task_local_pump && ind_l == 0));

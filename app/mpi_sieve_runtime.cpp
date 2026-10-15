@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cerrno>
 #include <climits>
+#include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -88,6 +89,12 @@ int exchange_bytes(const uint8_t *send_data, uint64_t send_bytes,
         return -1;
     }
     const uint64_t recv_bytes = recv_header.bytes;
+    // All callers stream bounded windows. Reject a corrupt/oversized header
+    // before allocating peer-controlled memory.
+    if (recv_bytes > (1ULL << 30) || send_bytes > (1ULL << 30)) {
+        fprintf(stderr, "[MPI] oversized exchange payload\n");
+        MPI_Abort(MPI_COMM_WORLD, 2);
+    }
     recv.resize(recv_bytes);
     uint64_t so = 0, ro = 0;
     while (so < send_bytes || ro < recv_bytes) {
@@ -154,7 +161,7 @@ int make_dir(const std::string &path) {
 } // namespace
 
 int mpi_sieve_runtime_init(const char *checkpoint_root, int frame_mib,
-                           bool resume) {
+                           bool resume, bool bkz) {
     MPI_Comm_rank(MPI_COMM_WORLD, &g_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &g_world);
     if (g_world != 2) {
@@ -187,7 +194,7 @@ int mpi_sieve_runtime_init(const char *checkpoint_root, int frame_mib,
     const fs::path rank_root = fs::path(g_checkpoint_root) /
                                ("rank" + std::to_string(g_rank));
     fs::create_directories(rank_root);
-    if (resume) {
+    if (resume && !bkz) {
         std::ifstream latest(fs::path(g_checkpoint_root) / "LATEST");
         std::string line;
         long csd = -1;
@@ -237,6 +244,41 @@ int mpi_sieve_runtime_finalize() {
     if (g_send_frame) cudaFreeHost(g_send_frame);
     if (g_recv_frame) cudaFreeHost(g_recv_frame);
     g_send_frame = g_recv_frame = nullptr;
+    return 0;
+}
+
+int mpi_sieve_select_insert(mpi_insert_candidate_t *candidate) {
+    mpi_insert_candidate_t candidates[2];
+    if (MPI_Allgather(candidate, sizeof(*candidate), MPI_BYTE, candidates,
+                      sizeof(*candidate), MPI_BYTE, MPI_COMM_WORLD) != MPI_SUCCESS) return -1;
+    int best = -1;
+    for (int r = 0; r < 2; ++r) {
+        const auto &c = candidates[r];
+        if (!c.valid || !std::isfinite(c.objective)) continue;
+        if (best < 0 || c.objective < candidates[best].objective ||
+            (c.objective == candidates[best].objective && c.insert_pos < candidates[best].insert_pos))
+            best = r;
+    }
+    *candidate = best < 0 ? mpi_insert_candidate_t{} : candidates[best];
+    return 0;
+}
+
+int mpi_sieve_agree_basis(Lattice_QP *basis, const char *phase) {
+    // Compare both quad-float components, not a rounded display of the basis.
+    uint64_t h = 1469598103934665603ULL;
+    auto b = basis->get_b();
+    for (long i = 0; i < basis->NumRows(); ++i) {
+        h ^= checksum64((const uint8_t *)b.hi[i], basis->NumCols() * sizeof(double));
+        h *= 1099511628211ULL;
+        h ^= checksum64((const uint8_t *)b.lo[i], basis->NumCols() * sizeof(double));
+        h *= 1099511628211ULL;
+    }
+    uint64_t hashes[2];
+    MPI_Allgather(&h, 1, MPI_UINT64_T, hashes, 1, MPI_UINT64_T, MPI_COMM_WORLD);
+    if (hashes[0] != hashes[1]) {
+        fprintf(stderr, "[MPI] basis disagreement phase=%s\n", phase);
+        MPI_Abort(MPI_COMM_WORLD, 2);
+    }
     return 0;
 }
 
@@ -299,6 +341,10 @@ int mpi_sieve_filter_candidates(int csd, int8_t *vec, int32_t *norm,
             ++local;
         } else {
             const std::size_t old = g_remote_candidates.size();
+            if (old + stride > (1ULL << 30)) {
+                fprintf(stderr, "[MPI] bounded candidate queue exhausted (1 GiB); reduce bucket window\n");
+                abort();
+            }
             g_remote_candidates.resize(old + stride);
             uint8_t *dst = g_remote_candidates.data() + old;
             memcpy(dst, uid + i, 8); memcpy(dst + 8, norm + i, 4);
@@ -315,11 +361,22 @@ int mpi_sieve_flush_candidates(int csd, swc_manager_t *swc,
         std::lock_guard<std::mutex> lock(g_candidate_mutex);
         outgoing.swap(g_remote_candidates);
     }
-    std::vector<uint8_t> incoming;
     const uint64_t sequence = g_candidate_sequence.fetch_add(1);
-    if (exchange_bytes(outgoing.data(), outgoing.size(), incoming,
-                       tag_candidate_count, tag_candidate_data, csd, sequence)) return -1;
-    return commit_candidates(incoming, csd, swc, ut_checker);
+    const size_t stride = csd + 14;
+    const size_t window = std::max(stride, g_frame_bytes / stride * stride);
+    const uint64_t local_rounds = (outgoing.size() + window - 1) / window;
+    uint64_t rounds = 0;
+    MPI_Allreduce(&local_rounds, &rounds, 1, MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
+    for (uint64_t i = 0; i < rounds; ++i) {
+        const size_t offset = std::min<size_t>(i * window, outgoing.size());
+        const size_t bytes = std::min(window, outgoing.size() - offset);
+        std::vector<uint8_t> incoming;
+        if (exchange_bytes(bytes ? outgoing.data() + offset : nullptr, bytes, incoming,
+                           tag_candidate_count, tag_candidate_data, csd,
+                           (sequence << 32) | i) ||
+                commit_candidates(incoming, csd, swc, ut_checker)) MPI_Abort(MPI_COMM_WORLD, 2);
+    }
+    return 0;
 }
 
 int mpi_sieve_exchange_buckets(bwc_manager_t *bwc, swc_manager_t *swc,
@@ -330,17 +387,20 @@ int mpi_sieve_exchange_buckets(bwc_manager_t *bwc, swc_manager_t *swc,
     for (int i = 0; i < num_buckets; ++i) {
         const uint64_t sequence = g_bucket_sequence.fetch_add(1);
         const int owner = sequence % g_world;
-        std::vector<uint8_t> outgoing;
-        if (g_rank != owner && bwc->mpi_export_bucket(ids[i], outgoing, stride)) return -1;
-        std::vector<uint8_t> incoming;
-        if (exchange_bytes(outgoing.data(), outgoing.size(), incoming,
-                           tag_bucket_count, tag_bucket_data, csd, sequence)) return -1;
-        if (g_rank == owner) {
-            if (incoming.size() % stride) return -1;
-            if (bwc->mpi_append_bucket(ids[i], incoming.data(), incoming.size() / stride,
-                                       stride)) return -1;
-            bwc->bucket_finalize(ids[i]);
+        for (uint64_t part = 0;; ++part) {
+            std::vector<uint8_t> outgoing, incoming;
+            bool done = true;
+            if (g_rank != owner && bwc->mpi_export_bucket_chunk(
+                    ids[i], outgoing, stride, part == 0, &done)) MPI_Abort(MPI_COMM_WORLD, 2);
+            if (mpi_sieve_min_int(done ? 1 : 0)) break;
+            if (exchange_bytes(outgoing.data(), outgoing.size(), incoming,
+                               tag_bucket_count, tag_bucket_data, csd,
+                               (sequence << 32) | part)) MPI_Abort(MPI_COMM_WORLD, 2);
+            if (g_rank == owner && (incoming.size() % stride ||
+                bwc->mpi_append_bucket(ids[i], incoming.data(), incoming.size() / stride, stride)))
+                MPI_Abort(MPI_COMM_WORLD, 2);
         }
+        if (g_rank == owner) bwc->bucket_finalize(ids[i]);
     }
     return 0;
 }

@@ -11,6 +11,20 @@ SPEC.loader.exec_module(SCHEDULER)
 
 
 class BkzSchedulerTests(unittest.TestCase):
+    def test_mpi_command_has_two_ranks_and_stable_checkpoint_root(self):
+        command = SCHEDULER.mpi_command(["solver", "--task", "bkz"], "/checkpoint", 64)
+        self.assertIn("--nodes=2", command)
+        self.assertIn("--ntasks-per-node=1", command)
+        self.assertEqual(command[-6:], ["--checkpoint-root", "/checkpoint", "--resume", "auto",
+                                      "--mpi-frame-mib", "64"])
+
+    def test_mpi_identity_does_not_reuse_serial_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            basis = Path(directory)/"basis"
+            basis.write_text("[[3 4][0 1]]")
+            serial = SCHEDULER.run_identity(basis, [])
+            self.assertEqual(serial, SCHEDULER.run_identity(basis, [], backend="serial"))
+            self.assertNotEqual(serial, SCHEDULER.run_identity(basis, [], backend="mpi"))
     def test_algorithm_9_d4f(self):
         self.assertEqual(SCHEDULER.default_d4f(40), 0)
         self.assertEqual(SCHEDULER.default_d4f(100), 19)

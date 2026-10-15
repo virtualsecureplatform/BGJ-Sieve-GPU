@@ -94,6 +94,8 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
     // exact compact vec+norm records, and recycle it.
     int mpi_export_bucket(long bucket_id, std::vector<uint8_t> &records,
                           int record_size);
+    int mpi_export_bucket_chunk(long bucket_id, std::vector<uint8_t> &records,
+                                int record_size, bool first, bool *done);
     int mpi_append_bucket(long bucket_id, const uint8_t *records, long count,
                           int record_size);
 

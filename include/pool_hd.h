@@ -1422,6 +1422,12 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__load_chunk(long chu
 
 template <class logger_t> void pwc_manager_tmpl<logger_t>::__sync_chunk(long chunk_id) {
     lg_init();
+    const char *all_no_spill = getenv("HD_FAIL_ON_SPILL");
+    if (all_no_spill && atoi(all_no_spill) && !_force_disk_flush.load()) {
+        fprintf(stderr, "[CACHE-SPILL-FORBIDDEN] manager=%s chunk=%ld\n", _pfx, chunk_id);
+        fflush(stderr);
+        abort();
+    }
     const char *no_spill = getenv("HD_PWC_FAIL_ON_SPILL");
     if (_hbm_pool_tier && no_spill && atoi(no_spill) != 0 &&
             !_force_disk_flush.load()) {
@@ -1564,6 +1570,8 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__signal_sync_done() 
                 // Includes stale entries whose dirty copy moved to HBM.
                 pthread_spin_unlock(&_locks[chunk_id % pwc_locks]);
             } else if ((status & _ck_busy) ||
+                       (getenv("HD_FAIL_ON_SPILL") && atoi(getenv("HD_FAIL_ON_SPILL")) &&
+                        !_force_disk_flush.load()) ||
                        (_hbm_pool_tier && _pwc_hbm_writeback_enabled() &&
                         !_force_disk_flush.load() && !(status & _ck_disk_spill))) {
                 pthread_spin_unlock(&_locks[chunk_id % pwc_locks]);
@@ -2055,7 +2063,8 @@ template <class logger_t> void pwc_manager_tmpl<logger_t>::__drain_sync_queue() 
 template <class logger_t> int pwc_manager_tmpl<logger_t>::flush() {
     // Caller must quiesce mutating workers. Persist resident dirty chunks,
     // then page authoritative HBM copies through the same disk serializer.
-    const bool writeback = _hbm_pool_tier && _pwc_hbm_writeback_enabled();
+    const bool writeback = (_hbm_pool_tier && _pwc_hbm_writeback_enabled()) ||
+        (getenv("HD_FAIL_ON_SPILL") && atoi(getenv("HD_FAIL_ON_SPILL")));
     if (writeback) _force_disk_flush.store(true);
     if (_lazy_sync) __drain_sync_queue();
     if (writeback) {

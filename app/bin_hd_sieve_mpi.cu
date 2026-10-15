@@ -19,6 +19,7 @@
 #define main bgj_serial_main
 #include "bin_hd_sieve.cu"
 #undef main
+#include "mpi_bkz_driver.inc"
 
 static int mkdir_one(const std::string &path) {
     return (!mkdir(path.c_str(), 0755) || errno == EEXIST) ? 0 : -1;
@@ -61,10 +62,18 @@ int main(int argc, char **argv) {
         if (!rank) fprintf(stderr, "[MPI] --checkpoint-root is required\n");
         MPI_Abort(MPI_COMM_WORLD, 2);
     }
-    if (!resume) {
+    bool bkz_mode = false;
+    for (size_t i = 1; i+1 < kept.size(); ++i)
+        if ((kept[i] == "--task" || kept[i] == "-t") &&
+            (kept[i+1] == "bkz" || kept[i+1] == "b" || kept[i+1] == "pump" || kept[i+1] == "p"))
+            bkz_mode = true;
+    if (!resume && !bkz_mode) {
         const char *job = getenv("SLURM_JOB_ID");
         checkpoint_root += "/run-" + std::string(job ? job : "manual");
     }
+    checkpoint_root = std::filesystem::absolute(checkpoint_root).lexically_normal().string();
+    mpi_bkz::root = checkpoint_root;
+    mpi_bkz::resume_enabled = resume;
 
     // Make input/output paths independent of the rank-local working directory.
     for (std::size_t i = 1; i < kept.size(); ++i) {
@@ -73,11 +82,16 @@ int main(int argc, char **argv) {
         if (path_arg && i + 1 < kept.size()) {
             char resolved[PATH_MAX];
             if (realpath(kept[i + 1].c_str(), resolved)) kept[i + 1] = resolved;
+            else kept[i + 1] = std::filesystem::absolute(kept[i+1]).lexically_normal().string();
+            if (kept[i+1].size() >= 240) {
+                fprintf(stderr, "[MPI] input/output path exceeds task parser capacity\n");
+                MPI_Abort(MPI_COMM_WORLD, 2);
+            }
             ++i;
         }
     }
 
-    if (mpi_sieve_runtime_init(checkpoint_root.c_str(), frame_mib, resume))
+    if (mpi_sieve_runtime_init(checkpoint_root.c_str(), frame_mib, resume, bkz_mode))
         MPI_Abort(MPI_COMM_WORLD, 2);
     signal(SIGUSR1, request_mpi_stop);
     signal(SIGTERM, request_mpi_stop);
@@ -116,7 +130,21 @@ int main(int argc, char **argv) {
 
     std::vector<char *> serial_argv;
     for (std::string &arg : kept) serial_argv.push_back(arg.data());
-    int rc = bgj_serial_main((int)serial_argv.size(), serial_argv.data());
+    int rc = 0;
+    try {
+        if (bkz_mode) {
+            task_config_t task;
+            if (task.parse_args((int)serial_argv.size(), serial_argv.data()))
+                throw std::runtime_error("invalid MPI BKZ arguments");
+            rc = task.run();
+            _destroy_pool_hd_device_buffers();
+            _destory_ck_allocator();
+        } else rc = bgj_serial_main((int)serial_argv.size(), serial_argv.data());
+        if (rc && rc != 75) MPI_Abort(MPI_COMM_WORLD, rc);
+    } catch (const std::exception &error) {
+        fprintf(stderr, "[MPI rank %d] %s\n", rank, error.what()); fflush(stderr);
+        MPI_Abort(MPI_COMM_WORLD, 2);
+    }
     mpi_sieve_runtime_finalize();
     MPI_Finalize();
     return rc;

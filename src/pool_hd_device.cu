@@ -2056,6 +2056,24 @@ int Pool_hd_t::insert(long index, double eta, long *pos, long auto_lll) {
         }
     }
 
+    if (mpi_sieve_active()) {
+        mpi_insert_candidate_t candidate;
+        candidate.valid = insert_pos >= 0 && remove_pos >= 0;
+        candidate.objective = best_ratio;
+        candidate.insert_pos = insert_pos;
+        candidate.remove_pos = remove_pos;
+        if (candidate.valid)
+            memcpy(candidate.coeff, res[0] + 2 * min_lift_traits::max_boost_dim +
+                   (insert_pos - index_l + ESD) * 256, sizeof(candidate.coeff));
+        if (mpi_sieve_select_insert(&candidate)) abort();
+        insert_pos = candidate.valid ? candidate.insert_pos : -1;
+        remove_pos = candidate.valid ? candidate.remove_pos : -1;
+        if (candidate.valid)
+            memcpy(res[0] + 2 * min_lift_traits::max_boost_dim +
+                   (insert_pos - index_l + ESD) * 256, candidate.coeff,
+                   sizeof(candidate.coeff));
+    }
+
     if (insert_pos == -1 || remove_pos == -1) {
         if (insert_pos != -1 && remove_pos == -1) 
             lg_err("all coeff is not 1 or -1, please check");
@@ -2117,7 +2135,10 @@ int Pool_hd_t::check_dim_lose() {
     }
 
     int ret = 0;
-    long num_vec = pwc_manager->num_vec();
+    if (mpi_sieve_active()) {
+        for (long i = 0; i < CSD; ++i) res[i] = mpi_sieve_global_u64(res[i]);
+    }
+    long num_vec = mpi_sieve_global_u64(pwc_manager->num_vec());
     for (long i = 0; i < CSD; i++) {
         if (res[i] == 0) {
             ret = -1;

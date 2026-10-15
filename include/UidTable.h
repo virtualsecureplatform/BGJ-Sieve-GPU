@@ -42,7 +42,7 @@ struct UidTable {
 
     int dump_table(long table_id);
     int load_table(long table_id);
-    int reset_hash_function(long CSD);
+    int reset_hash_function(long CSD, const uint64_t *restored = nullptr);
 
     #if MULTI_SSD
     char _dir[32] = {};
