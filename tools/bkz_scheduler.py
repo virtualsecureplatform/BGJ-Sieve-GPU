@@ -142,7 +142,8 @@ def command_for(binary, input_name, output_name, stage):
 
 def mpi_command(command, checkpoint_root, frame_mib=256):
     return ["srun", "--mpi=pmix_v2", "--nodes=2", "--ntasks=2",
-            "--ntasks-per-node=1", "--kill-on-bad-exit=1"] + command + [
+            "--ntasks-per-node=1", "--cpus-per-task=128", "--cpu-bind=none",
+            "--kill-on-bad-exit=1"] + command + [
             "--checkpoint-root", str(checkpoint_root), "--resume", "auto",
             "--mpi-frame-mib", str(frame_mib)]
 

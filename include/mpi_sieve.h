@@ -49,5 +49,10 @@ struct mpi_insert_candidate_t {
 int mpi_sieve_select_insert(mpi_insert_candidate_t *candidate);
 int mpi_sieve_agree_basis(Lattice_QP *basis, const char *phase);
 int mpi_bkz_run(void *task_config);
+struct mpi_sieve_metrics_t {
+    uint64_t buckets, candidate_exchanges, pending_candidate_bytes, sent_bytes, received_bytes;
+};
+mpi_sieve_metrics_t mpi_sieve_metrics();
+int mpi_sieve_control_test(Lattice_QP *basis, bool mismatch);
 
 #endif

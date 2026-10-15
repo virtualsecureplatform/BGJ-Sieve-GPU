@@ -37,3 +37,4 @@ BGJ_WEAK void mpi_sieve_report_dimension(Pool_hd_t *, const char *) {}
 BGJ_WEAK int mpi_sieve_select_insert(mpi_insert_candidate_t *) { return 0; }
 BGJ_WEAK int mpi_sieve_agree_basis(Lattice_QP *, const char *) { return 0; }
 BGJ_WEAK int mpi_bkz_run(void *) { return -1; }
+BGJ_WEAK mpi_sieve_metrics_t mpi_sieve_metrics() { return {}; }

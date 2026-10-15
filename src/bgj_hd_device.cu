@@ -2192,7 +2192,7 @@ int Bucketer_t::run() {
         }
         _max_batch0 = mpi_sieve_min_int(window);
         _min_batch0 = std::min(_min_batch0, _max_batch0);
-        printf("[MPI-CAPACITY] CSD=%ld window=%d global_bucket_bound=%llu bytes\n",
+        printf("[MPI-CAPACITY] CSD=%ld window=%ld global_bucket_bound=%llu bytes\n",
                _pool->CSD, _max_batch0, (unsigned long long)per_bucket); fflush(stdout);
     }
     _bwc->configure_gpu_native_buckets(true, gpu_native_bucket_capacity);

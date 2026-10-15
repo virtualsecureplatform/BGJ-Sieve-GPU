@@ -136,7 +136,10 @@ int main(int argc, char **argv) {
             task_config_t task;
             if (task.parse_args((int)serial_argv.size(), serial_argv.data()))
                 throw std::runtime_error("invalid MPI BKZ arguments");
-            rc = task.run();
+            if (const char *control = getenv("HD_MPI_CONTROL_TEST")) {
+                Lattice_QP basis(task.basis_file);
+                rc = mpi_sieve_control_test(&basis, !strcmp(control, "mismatch"));
+            } else rc = task.run();
             _destroy_pool_hd_device_buffers();
             _destory_ck_allocator();
         } else rc = bgj_serial_main((int)serial_argv.size(), serial_argv.data());

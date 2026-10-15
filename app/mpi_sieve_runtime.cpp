@@ -32,8 +32,8 @@ std::atomic<uint64_t> g_bucket_sequence{0};
 std::atomic<uint64_t> g_candidate_sequence{0};
 std::atomic<bool> g_stop_requested{false};
 int g_resumed_csd = -1;
-uint64_t g_sent_bytes = 0;
-uint64_t g_recv_bytes = 0;
+std::atomic<uint64_t> g_sent_bytes{0};
+std::atomic<uint64_t> g_recv_bytes{0};
 double g_mpi_seconds = 0.0;
 uint8_t *g_send_frame = nullptr;
 uint8_t *g_recv_frame = nullptr;
@@ -260,6 +260,30 @@ int mpi_sieve_select_insert(mpi_insert_candidate_t *candidate) {
             best = r;
     }
     *candidate = best < 0 ? mpi_insert_candidate_t{} : candidates[best];
+    return 0;
+}
+
+mpi_sieve_metrics_t mpi_sieve_metrics() {
+    std::lock_guard<std::mutex> lock(g_candidate_mutex);
+    return {g_bucket_sequence.load(), g_candidate_sequence.load(), g_remote_candidates.size(),
+            g_sent_bytes.load(), g_recv_bytes.load()};
+}
+
+int mpi_sieve_control_test(Lattice_QP *basis, bool mismatch) {
+    for (int test = 0; test < 5; ++test) {
+        mpi_insert_candidate_t c;
+        c.valid = test != 3 && !(test == 4 && g_rank == 0);
+        c.objective = test == 0 ? (2-g_rank) : 1;
+        c.insert_pos = test == 1 ? (2-g_rank) : 1;
+        c.remove_pos = 5; c.coeff[0] = 7+g_rank;
+        mpi_sieve_select_insert(&c);
+        const int winner = test == 0 || test == 1 || test == 4 ? 1 : 0;
+        if ((test == 3 && c.valid) || (test != 3 && (!c.valid || c.coeff[0] != 7+winner)))
+            MPI_Abort(MPI_COMM_WORLD, 2);
+    }
+    if (mismatch) basis->get_b().hi[0][0] += g_rank;
+    mpi_sieve_agree_basis(basis, "control-test");
+    if (!g_rank) { printf("PASS: global insertion remote winner, ties, invalid candidates, basis agreement\n"); fflush(stdout); }
     return 0;
 }
 

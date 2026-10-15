@@ -2,6 +2,7 @@
 /// @brief Implementation of device related pool operations
 
 #include "../include/pool_hd_device.h"
+#include "../include/mpi_sieve.h"
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/memcpy_async.h>
@@ -1343,6 +1344,7 @@ void insert_traits::_prep_device_local_data(int CSD16, int ESD8, local_data_t *&
     if (max_fperr > 0.1) {
         fprintf(stderr, "[Error] insert_traits::_prep_device_local_data: "
                         "large floating point error(%.2f)\n", max_fperr);
+        if (mpi_sieve_active()) abort();
     } else if (max_fperr > 0.01) {
         fprintf(stderr, "[Warning] insert_traits::_prep_device_local_data: "
                         "floating point error(%.2f) warning\n", max_fperr);

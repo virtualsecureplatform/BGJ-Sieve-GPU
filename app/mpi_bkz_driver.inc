@@ -53,6 +53,15 @@ void save_basis(Lattice_QP &basis, const fs::path &path) {
         out.write((char *)b.hi[i], shape[1] * sizeof(double));
         out.write((char *)b.lo[i], shape[1] * sizeof(double));
     }
+    for (auto matrix : {basis.get_b_star(), basis.get_miu()}) {
+        for (long i = 0; i < basis.NumRows(); ++i) {
+            out.write((char *)matrix.hi[i], shape[1] * sizeof(double));
+            out.write((char *)matrix.lo[i], shape[1] * sizeof(double));
+        }
+    }
+    auto norms = basis.get_B();
+    out.write((char *)norms.hi, shape[0] * sizeof(double));
+    out.write((char *)norms.lo, shape[0] * sizeof(double));
     out.close(); require(bool(out), "basis snapshot write"); durable(path);
 }
 std::unique_ptr<Lattice_QP> load_basis(const fs::path &path) {
@@ -65,8 +74,17 @@ std::unique_ptr<Lattice_QP> load_basis(const fs::path &path) {
         in.read((char *)b.hi[i], shape[1] * sizeof(double));
         in.read((char *)b.lo[i], shape[1] * sizeof(double));
     }
+    for (auto matrix : {basis->get_b_star(), basis->get_miu()}) {
+        for (long i = 0; i < basis->NumRows(); ++i) {
+            in.read((char *)matrix.hi[i], shape[1] * sizeof(double));
+            in.read((char *)matrix.lo[i], shape[1] * sizeof(double));
+        }
+    }
+    auto norms = basis->get_B();
+    in.read((char *)norms.hi, shape[0] * sizeof(double));
+    in.read((char *)norms.lo, shape[0] * sizeof(double));
     require(bool(in) && in.peek() == EOF, "truncated or oversized basis snapshot");
-    basis->compute_gso_QP();
+    basis->set_gso_status(GSO_COMPUTED_QP);
     return basis;
 }
 struct state_t {
@@ -136,6 +154,13 @@ void commit(state_t &s, Lattice_QP &full, Lattice_QP *local, Pool_hd_t *pool) {
         s.left = pool->index_l; s.right = pool->index_r; s.csd = pool->CSD;
         s.basis_hash = pool->basis_hash; s.local_vectors = pool->pwc_manager->num_vec();
         for (long i = 0; i < pool->CSD; ++i) s.coeff[i] = pool->uid_table->coeff(i);
+        uint64_t bytes = 0;
+        for (const auto &file : fs::recursive_directory_iterator(".pool"))
+            if (file.is_regular_file()) bytes += file.file_size();
+        const uint64_t needed = mpi_sieve_global_u64(bytes);
+        uint64_t available = fs::space(root).available, minimum = 0;
+        MPI_Allreduce(&available, &minimum, 1, MPI_UINT64_T, MPI_MIN, MPI_COMM_WORLD);
+        require(minimum > needed + needed/10 + (1ULL<<30), "insufficient free filesystem space for both snapshots");
     }
     const uint64_t previous = s.sequence;
     if (!rank) {
@@ -204,6 +229,14 @@ NTL::mat_ZZ integers(Lattice_QP &basis) {
     }
     return out;
 }
+std::unique_ptr<Lattice_QP> clone_basis(Lattice_QP &basis) {
+    auto copy = std::make_unique<Lattice_QP>(basis.NumRows(), basis.NumCols());
+    for (long i = 0; i < basis.NumRows(); ++i) {
+        memcpy(copy->get_b().hi[i], basis.get_b().hi[i], basis.NumCols()*sizeof(double));
+        memcpy(copy->get_b().lo[i], basis.get_b().lo[i], basis.NumCols()*sizeof(double));
+    }
+    copy->compute_gso_QP(); return copy;
+}
 void exact_equivalent(const NTL::mat_ZZ &before, Lattice_QP &after) {
     if (mpi_sieve_rank()) return;
     NTL::mat_ZZ adj, product; NTL::ZZ det;
@@ -223,9 +256,14 @@ struct heartbeat_t {
     heartbeat_t() : worker([this] {
         std::unique_lock<std::mutex> lock(mutex);
         while (!cv.wait_for(lock, std::chrono::seconds(60), [this] { return stop; })) {
-            printf("[MPI-BKZ heartbeat] rank=%d epoch=%ld pump=%ld csd=%ld next=%d completed_phases=%ld\n",
+            const auto metrics = mpi_sieve_metrics();
+            printf("[MPI-BKZ heartbeat] rank=%d epoch=%ld pump=%ld csd=%ld next=%d completed_phases=%ld "
+                   "buckets=%llu candidate_exchanges=%llu pending_candidate_bytes=%llu sent_bytes=%llu received_bytes=%llu\n",
                    mpi_sieve_rank(), (long)time(nullptr), live_pump.load(), live_csd.load(),
-                   live_phase.load(), completed_phases.load());
+                   live_phase.load(), completed_phases.load(),
+                   (unsigned long long)metrics.buckets, (unsigned long long)metrics.candidate_exchanges,
+                   (unsigned long long)metrics.pending_candidate_bytes,
+                   (unsigned long long)metrics.sent_bytes, (unsigned long long)metrics.received_bytes);
             report_host_memory("mpi-bkz-heartbeat", live_csd.load()); fflush(stdout);
         }
     }) {}
@@ -327,6 +365,14 @@ int mpi_bkz_run(void *opaque) {
                     long pos = -1; int ret = pool.insert(s.cursor++, 1.2, &pos);
                     require(ret == 0 || ret == -1, "insertion failed");
                     redistribute(pool);
+                    // Validate an insertion before publishing its phase checkpoint.
+                    // trans_to consumes the projected basis, so use private copies.
+                    if (!mpi_sieve_rank()) {
+                        auto probe = clone_basis(*full), projection = clone_basis(*local);
+                        require(probe->trans_to(begin, end, projection.get()) == 1, "insertion reconstruction");
+                        exact_equivalent(original, *probe);
+                    }
+                    MPI_Barrier(MPI_COMM_WORLD);
                     if (s.cursor <= pos) s.cursor = pos+1;
                     if (s.cursor >= pool.index_l) s.cursor = pool.index_l-1;
                     const long target = BGJ4_SIZE_RATIO * pow(4./3., pool.CSD*.5) - 5;

@@ -16,7 +16,7 @@ def main():
     if not os.environ.get('SLURM_JOB_ID'):
         parser.error('requires a two-node Slurm allocation')
     launch = ['srun', '--mpi=pmix_v2', '--nodes=2', '--ntasks=2', '--ntasks-per-node=1',
-              '--kill-on-bad-exit=1', str(args.wrapper)]
+              '--cpus-per-task=128', '--cpu-bind=none', '--kill-on-bad-exit=1', str(args.wrapper)]
 
     def run(name, options, overrides=None, expected=0):
         root = args.root / name
@@ -37,6 +37,8 @@ def main():
         return root
 
     pump = ['--task', 'pump', '--ind_l', '0', '--ind_r', '80', '--SSD', '58', '--MSD', '60', '--DS']
+    run('control', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': '1'})
+    run('control-mismatch', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': 'mismatch'}, expected=None)
     root = run('phase-resume', pump, {'APPTAINERENV_HD_MPI_BKZ_STOP_AFTER': 'top'}, 75)
     seq = int((root/'LATEST-BKZ').read_text())
     state = (root/('generation-%d/rank0/STATE' % seq)).read_text().split()
