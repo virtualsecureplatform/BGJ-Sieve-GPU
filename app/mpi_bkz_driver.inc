@@ -146,6 +146,7 @@ void inventory(const fs::path &dir, bool verify) {
 }
 void commit(state_t &s, Lattice_QP &full, Lattice_QP *local, Pool_hd_t *pool) {
     const int rank = mpi_sieve_rank();
+    live_phase.store(100); // Explicit checkpoint I/O, not a stalled GPU sieve.
     mpi_sieve_agree_basis(&full, "checkpoint-full");
     if (local) mpi_sieve_agree_basis(local, "checkpoint-local");
     if (pool) {
@@ -265,6 +266,12 @@ struct heartbeat_t {
                    (unsigned long long)metrics.pending_candidate_bytes,
                    (unsigned long long)metrics.sent_bytes, (unsigned long long)metrics.received_bytes);
             report_host_memory("mpi-bkz-heartbeat", live_csd.load()); fflush(stdout);
+            std::ifstream io("/proc/self/io"); std::string key; uint64_t value;
+            while (io >> key >> value)
+                if (key == "read_bytes:" || key == "write_bytes:")
+                    printf("[MPI-BKZ io] rank=%d %s %llu\n", mpi_sieve_rank(),
+                           key.c_str(), (unsigned long long)value);
+            fflush(stdout);
         }
     }) {}
     ~heartbeat_t() { { std::lock_guard<std::mutex> lock(mutex); stop = true; } cv.notify_all(); worker.join(); }
@@ -288,6 +295,7 @@ void redistribute(Pool_hd_t &pool) {
 int mpi_bkz_run(void *opaque) {
     using namespace mpi_bkz;
     auto &t = *static_cast<task_config_t *>(opaque);
+    require(!fs::exists(root/"LATEST"), "cannot mix version1 final-sieve and BKZ checkpoints");
     const bool bkz = t.task == task_config_t::task_bkz;
     require((bkz ? t.bkz_dual_hash_ratio == 0 : !t.enable_dual_hash),
             "distributed dual-hash insertion is unsupported; use --BDH 0");

@@ -23,8 +23,10 @@ def main():
         root.mkdir(exist_ok=True)
         env = dict(os.environ)
         env.update(overrides or {})
-        command = launch + ['--input', str(args.basis), '--output', str(root/'out.basis'),
-                            '--checkpoint-root', str(root), '--mpi-frame-mib', '1'] + options
+        output = [] if '--task' in options and options[options.index('--task')+1] == 'sieve' else [
+            '--output', str(root/'out.basis')]
+        command = launch + ['--input', str(args.basis)] + output + [
+            '--checkpoint-root', str(root), '--mpi-frame-mib', '1'] + options
         result = subprocess.run(command, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, timeout=1200)
         with (root/'test.log').open('ab') as log:
@@ -39,6 +41,13 @@ def main():
     pump = ['--task', 'pump', '--ind_l', '0', '--ind_r', '80', '--SSD', '58', '--MSD', '60', '--DS']
     run('control', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': '1'})
     run('control-mismatch', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': 'mismatch'}, expected=None)
+    for kind in ('pool', 'bucket', 'sol', 'uid'):
+        forbidden = run('forbidden-' + kind, pump, {'APPTAINERENV_HD_MPI_SPILL_TEST': kind}, expected=None)
+        logs = (forbidden/'test.log').read_text()
+        assert '[CACHE-SPILL-FORBIDDEN]' in logs
+        for directory in forbidden.glob('rank*/.*'):
+            if directory.is_dir():
+                assert not any(p.is_file() for p in directory.rglob('*')), directory
     root = run('phase-resume', pump, {'APPTAINERENV_HD_MPI_BKZ_STOP_AFTER': 'top'}, 75)
     seq = int((root/'LATEST-BKZ').read_text())
     state = (root/('generation-%d/rank0/STATE' % seq)).read_text().split()
@@ -77,7 +86,7 @@ def main():
             with (snapshot/'full.qp').open('ab') as f: f.write(b'corrupt')
         run(name, pump, expected=None)
     # Existing final-sieve entrypoint remains usable with immutable v1 checkpoints.
-    run('final-sieve', ['--task', 'sieve', '--CSD', '60', '--TSD', '61', '--MLD', '80'])
+    run('final-sieve', ['--task', 'sieve', '--TSD', '61', '--MLD', '80'])
     print('PASS: all MPI BKZ integration tests', flush=True)
 
 

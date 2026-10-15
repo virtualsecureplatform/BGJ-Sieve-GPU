@@ -136,7 +136,23 @@ int main(int argc, char **argv) {
             task_config_t task;
             if (task.parse_args((int)serial_argv.size(), serial_argv.data()))
                 throw std::runtime_error("invalid MPI BKZ arguments");
-            if (const char *control = getenv("HD_MPI_CONTROL_TEST")) {
+            if (const char *spill = getenv("HD_MPI_SPILL_TEST")) {
+                Lattice_QP basis(task.basis_file);
+                Pool_hd_t pool(&basis);
+                if (pool.set_sieving_context(16, 80)) MPI_Abort(MPI_COMM_WORLD, 2);
+                if (!strcmp(spill, "uid")) pool.uid_table->dump_table(0);
+                else {
+                    pwc_manager_t manager(1, 1, 256, !strcmp(spill, "bucket"));
+                    manager.set_pool(&pool);
+                    std::string dir = std::string(".") + spill;
+                    manager.set_dirname(dir.c_str());
+                    long id = manager.create_chunk();
+                    chunk_t *chunk = manager.fetch(id); chunk->size = 1;
+                    chunk->norm[0] = 1; chunk->vec[0] = 1;
+                    manager.sync_release(id); // Must fail before opening a disk file.
+                }
+                throw std::runtime_error("spill guard failed to abort");
+            } else if (const char *control = getenv("HD_MPI_CONTROL_TEST")) {
                 Lattice_QP basis(task.basis_file);
                 rc = mpi_sieve_control_test(&basis, !strcmp(control, "mismatch"));
             } else rc = task.run();

@@ -16,8 +16,23 @@ SOURCE="${RUN}/source"
 MPI_CPPFLAGS="$(mpicxx --showme:compile)"
 export MPI_LIBDIR="$(mpicxx --showme:link | tr ' ' '\n' | sed -n 's/^-L//p' | head -1)"
 FLAGS="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_A100X4_PWC_GB=300 -DHD_A100X4_BWC_GB=32 -DHD_A100X4_SWC_GB=16 -DPOOL_HOST_VEC_MAX_DIM=144 -DENABLE_PROFILING=0"
+REUSED=0
+if [[ -n "${REUSE_BUILD:-}" && -f "${REUSE_BUILD}/source/src/libllib.a" ]]; then
+    # Reuse only an identical library source/configuration, never merely newer mtimes.
+    [[ "$(sed -n '/^FLAGS=/p' "${SOURCE}/reproduce/svp167-search/mpi_bkz_validate.sbatch")" == \
+       "$(sed -n '/^FLAGS=/p' "${REUSE_BUILD}/source/reproduce/svp167-search/mpi_bkz_validate.sbatch")" ]]
+    while IFS= read -r path; do
+        cmp "${SOURCE}/${path}" "${REUSE_BUILD}/source/${path}"
+    done < <(git -C "${SLURM_SUBMIT_DIR}" ls-tree -r --name-only "${SOURCE_COMMIT}" src include)
+    cp "${REUSE_BUILD}/source/src/libllib.a" "${SOURCE}/src/libllib.a"
+    REUSED=1
+fi
+if [[ "${REUSED}" == 0 ]]; then
+    apptainer exec --nv --bind /opt/system,"${MPI_BASE}" "${MPI_SIF}" bash -lc \
+        "make -B -C '${SOURCE}/src' -j 16 CPPFLAGS='${FLAGS}'"
+fi
 apptainer exec --nv --bind /opt/system,"${MPI_BASE}" "${MPI_SIF}" bash -lc \
-    "make -B -C '${SOURCE}/src' -j 16 CPPFLAGS='${FLAGS}' && make -B -C '${SOURCE}/app' -j 4 hd_sieve hd_sieve_mpi CPPFLAGS='${FLAGS}' MPI_CPPFLAGS='${MPI_CPPFLAGS}' MPI_LIBDIR='${MPI_LIBDIR}'"
+    "make -B -C '${SOURCE}/app' -j 4 hd_sieve hd_sieve_mpi CPPFLAGS='${FLAGS}' MPI_CPPFLAGS='${MPI_CPPFLAGS}' MPI_LIBDIR='${MPI_LIBDIR}'"
 if [[ "${BUILD_ONLY:-0}" == 1 ]]; then
     echo "PASS: MPI and serial binaries compiled; source=${SOURCE_COMMIT} run=${RUN}"
     exit 0
