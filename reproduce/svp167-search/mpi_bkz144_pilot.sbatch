@@ -32,6 +32,7 @@ export APPTAINERENV_HD_BGJ2_REDUCER_THREADS=16 APPTAINERENV_HD_BUCKET_THREADS=16
 # Start with the BGJ2 path already exercised at CSD143, rather than the
 # disk-oriented BGJ3L crossover. Pool size and saturation goals are unchanged.
 export APPTAINERENV_HD_BGJ3_MIN_CSD=177
+unset APPTAINERENV_HD_MPI_SPILL_TEST APPTAINERENV_HD_MPI_CONTROL_TEST APPTAINERENV_HD_MPI_BKZ_FAULT || true
 if [[ "${PILOT_RESUME:-0}" == 1 ]]; then
     [[ -f "${PILOT_ROOT}/LATEST-BKZ" ]]
     export APPTAINERENV_HD_MPI_BKZ_MAX_PHASES=1
@@ -58,7 +59,23 @@ solver_rc=$?
 if kill -0 "${STEP_PID}" 2>/dev/null; then wait "${STEP_PID}"; solver_rc=$?; fi
 set -e
 if [[ "${solver_rc}" == 75 && -f "${PILOT_ROOT}/LATEST-BKZ" ]]; then
+    python3 - "${PILOT_ROOT}" "${PILOT_RESUME:-0}" <<'PY'
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+sequence = int((root/'LATEST-BKZ').read_text())
+expected = 142 if sys.argv[2] == '1' else 143
+states = [(root/('generation-%d/rank%d/STATE' % (sequence, rank))).read_text().split()
+          for rank in (0, 1)]
+assert all(s[0] == 'BGJ_MPI_BKZ_V2' and int(s[9]) == expected and int(s[11]) == 2 for s in states)
+assert states[0][6:12] == states[1][6:12]
+print('PASS: both ranks committed the expected CSD%d pump-down boundary' % expected)
+PY
     echo "PASS: pilot paused at a committed phase; no full production chain launched"
     exit 0
+fi
+if [[ "${solver_rc}" == 0 ]]; then
+    echo "FAIL: pump finished before the requested pilot boundary" >&2
+    exit 1
 fi
 exit "${solver_rc}"

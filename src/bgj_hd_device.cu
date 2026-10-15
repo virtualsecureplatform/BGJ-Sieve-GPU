@@ -2654,6 +2654,7 @@ int Bucketer_t::_batch(int tid, int replace_th, int batch0) {
             }
 
             _buc_buf->gpu_native_wait(tid);
+            mpi_sieve_note_progress(task_chunks);
             if (_buc_buf->gpu_native_verify_enabled) {
                 for (int i = 0; i < batch0;
                      i += _buc_buf->gpu_native_verify_stride)

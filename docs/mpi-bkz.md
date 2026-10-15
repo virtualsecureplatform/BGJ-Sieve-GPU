@@ -1,5 +1,8 @@
 # Two-node pump-and-jump BKZ
 
+Experimental: passing a build does not establish distributed correctness or
+CSD144 feasibility. Gate real work on the integration tests and bounded pilot.
+
 The MPI backend extends the existing distributed sieve to `--task pump` and
 `--task bkz`. It requires two distinct nodes, one rank and four visible GPUs per
 node. The full basis is replicated; the vector pool and UID entries are sharded
@@ -49,9 +52,9 @@ flushes still write to disk. This is not an entirely disk-free mode.
 Bucket windows are bounded from the full cross-rank bucket-size upper bound and
 host-cache budget, including in-flight reduction buckets. Transport receives
 are bounded, bucket records are streamed by chunk, candidates are routed in
-frame-sized windows, and the pending remote candidate queue has a hard1GiB
+frame-sized windows, and the pending remote candidate queue has a hard 1 GiB
 limit. Capacity violations abort rather than truncate vectors or silently spill.
-Every60seconds a local heartbeat reports phase, memory and communication/queue
+Every 60 seconds a local heartbeat reports phase, memory and communication/queue
 counters without issuing MPI collectives. An unchanged heartbeat is evidence to
 investigate, not an automatic deadlock verdict.
 
@@ -71,12 +74,12 @@ expected pause as success). Submit the same commit and root with
 chain is automatically launched. Every job is limited to two nodes; builds and
 GPU tests must never run on the login node.
 
-Initial per-node budgets are260GiB PWC,128GiB BWC and16GiB SWC, with16 reducer
+Initial per-node budgets are 260 GiB PWC, 128 GiB BWC and 16 GiB SWC, with 16 reducer
 workers. HBM PWC is disabled. The pilot keeps BGJ2 through CSD144 instead of
 crossing into disk-oriented BGJ3L; vector-count and saturation targets remain
 unchanged. These are candidate settings, not established high-dimension results.
-The originally planned300/32GiB split fails the conservative CSD144 bucket-window
-bound: two16-center waves require about109GiB of BWC. Lossless chunk compaction
-after redistribution and pruning keeps each half-pool near its234GiB packed size.
+The originally planned 300/32 GiB split fails the conservative CSD144 bucket-window
+bound: two 16-center waves require about 109 GiB of BWC. Lossless chunk compaction
+after redistribution and pruning keeps each half-pool near its 234 GiB packed size.
 Phase snapshots can be large and expensive: check available filesystem space
 for live scratch plus both retained generations before starting a large pilot.

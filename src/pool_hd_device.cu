@@ -1620,6 +1620,7 @@ int Pool_hd_t::stream_task_template(int num_devices, cudaDeviceProp device_props
                 if (chunk == NULL) continue;
                 WRITE_BACK_TO_CHUNK(chunk);            
             }
+            mpi_sieve_note_progress(task_chunks);
         }
 
         #if ENABLE_PROFILING

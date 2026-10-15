@@ -1,7 +1,12 @@
 import importlib.util
+import contextlib
+import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
+import subprocess
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "tools" / "bkz_scheduler.py"
@@ -11,6 +16,32 @@ SPEC.loader.exec_module(SCHEDULER)
 
 
 class BkzSchedulerTests(unittest.TestCase):
+    def test_mpi_pause_does_not_publish_a_completed_pump(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            basis, schedule, work = root/'input', root/'plan.json', root/'work'
+            basis.write_text('[[3 4]\n[0 1]]\n')
+            schedule.write_text(json.dumps({'stages': [
+                {'sieve_dimension': 60, 'd4f': 20, 'dual_hash_ratio': 0, 'jump': 9}]}))
+            with mock.patch.object(SCHEDULER.subprocess, 'run',
+                                   return_value=subprocess.CompletedProcess([], 75)) as runner:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    status = SCHEDULER.main(['--input', str(basis), '--schedule', str(schedule),
+                        '--binary', '/bin/true', '--backend', 'mpi', '--work-dir', str(work)])
+            self.assertEqual(status, 75)
+            self.assertIn('--nodes=2', runner.call_args[0][0])
+            self.assertEqual(list(work.glob('bkz-checkpoints/*/stage-001-*.basis')), [])
+
+    def test_mpi_rejects_dual_hash_before_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            schedule = root/'plan.json'
+            schedule.write_text(json.dumps({'stages': [{'block_size': 80}]}))
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    SCHEDULER.main(['--input', str(root/'input'), '--schedule', str(schedule),
+                        '--backend', 'mpi', '--work-dir', str(root/'work'), '--dry-run'])
+
     def test_mpi_command_has_two_ranks_and_stable_checkpoint_root(self):
         command = SCHEDULER.mpi_command(["solver", "--task", "bkz"], "/checkpoint", 64)
         self.assertIn("--nodes=2", command)

@@ -265,12 +265,13 @@ struct heartbeat_t {
         while (!cv.wait_for(lock, std::chrono::seconds(60), [this] { return stop; })) {
             const auto metrics = mpi_sieve_metrics();
             printf("[MPI-BKZ heartbeat] rank=%d epoch=%ld pump=%ld csd=%ld next=%d completed_phases=%ld "
-                   "buckets=%llu candidate_exchanges=%llu pending_candidate_bytes=%llu sent_bytes=%llu received_bytes=%llu\n",
+                   "buckets=%llu candidate_exchanges=%llu pending_candidate_bytes=%llu sent_bytes=%llu received_bytes=%llu processed_chunks=%llu\n",
                    mpi_sieve_rank(), (long)time(nullptr), live_pump.load(), live_csd.load(),
                    live_phase.load(), completed_phases.load(),
                    (unsigned long long)metrics.buckets, (unsigned long long)metrics.candidate_exchanges,
                    (unsigned long long)metrics.pending_candidate_bytes,
-                   (unsigned long long)metrics.sent_bytes, (unsigned long long)metrics.received_bytes);
+                   (unsigned long long)metrics.sent_bytes, (unsigned long long)metrics.received_bytes,
+                   (unsigned long long)metrics.processed_chunks);
             report_host_memory("mpi-bkz-heartbeat", live_csd.load()); fflush(stdout);
             std::ifstream io("/proc/self/io"); std::string key; uint64_t value;
             while (io >> key >> value)

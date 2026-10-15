@@ -30,6 +30,7 @@ std::mutex g_candidate_mutex;
 std::vector<uint8_t> g_remote_candidates;
 std::atomic<uint64_t> g_bucket_sequence{0};
 std::atomic<uint64_t> g_candidate_sequence{0};
+std::atomic<uint64_t> g_processed_chunks{0};
 std::atomic<bool> g_stop_requested{false};
 int g_resumed_csd = -1;
 std::atomic<uint64_t> g_sent_bytes{0};
@@ -266,8 +267,9 @@ int mpi_sieve_select_insert(mpi_insert_candidate_t *candidate) {
 mpi_sieve_metrics_t mpi_sieve_metrics() {
     std::lock_guard<std::mutex> lock(g_candidate_mutex);
     return {g_bucket_sequence.load(), g_candidate_sequence.load(), g_remote_candidates.size(),
-            g_sent_bytes.load(), g_recv_bytes.load()};
+            g_sent_bytes.load(), g_recv_bytes.load(), g_processed_chunks.load()};
 }
+void mpi_sieve_note_progress(uint64_t chunks) { g_processed_chunks.fetch_add(chunks, std::memory_order_relaxed); }
 
 int mpi_sieve_control_test(Lattice_QP *basis, bool mismatch) {
     for (int test = 0; test < 5; ++test) {
