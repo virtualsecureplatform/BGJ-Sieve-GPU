@@ -200,7 +200,13 @@ void commit(state_t &s, Lattice_QP &full, Lattice_QP *local, Pool_hd_t *pool) {
             const std::string suffix = name.substr(11);
             if (!suffix.empty() && suffix.find_first_not_of("0123456789") == std::string::npos) {
                 const uint64_t seq = std::stoull(suffix);
-                if (seq < s.sequence && seq != previous) fs::remove_all(entry.path());
+                if (seq < s.sequence && seq != previous && fs::exists(entry.path()/"rank0/STATE")) {
+                    try {
+                        if (decode(entry.path()/"rank0/STATE").identity == s.identity) fs::remove_all(entry.path());
+                    } catch (const std::exception &) {
+                        fprintf(stderr, "[MPI-BKZ] keeping unrecognized generation %s\n", name.c_str());
+                    }
+                }
             }
         }
     }
@@ -284,11 +290,19 @@ bool pause(const state_t &s) {
         (after && !strcmp(after, "first-down") && s.next == 2 && s.cursor > 0);
     return mpi_sieve_global_u64(requested ? 1 : 0) || mpi_sieve_should_stop();
 }
+void compact(Pool_hd_t &pool) {
+    const long before = pool.pwc_manager->num_vec();
+    if (before) require(pool.shrink(before) == 0, "lossless pool compaction");
+    require(pool.pwc_manager->num_vec() == before, "compaction changed the vector count");
+    require(pool.pwc_manager->num_chunks() <= (before + Pool_hd_t::chunk_max_nvecs-1)/Pool_hd_t::chunk_max_nvecs,
+            "pool compaction left chunk holes");
+}
 void redistribute(Pool_hd_t &pool) {
     pool.pwc_manager->wait_work();
     require(mpi_sieve_agree_basis(pool.basis, "basis-transition") == 0, "basis agreement");
     require(mpi_sieve_redistribute_pool(&pool) == 0, "pool redistribution");
     require(pool.mpi_retain_owner(mpi_sieve_rank(), 2) == 0, "score/ownership rebuild");
+    compact(pool);
 }
 } // namespace mpi_bkz
 
@@ -300,12 +314,33 @@ int mpi_bkz_run(void *opaque) {
     require((bkz ? t.bkz_dual_hash_ratio == 0 : !t.enable_dual_hash),
             "distributed dual-hash insertion is unsupported; use --BDH 0");
     const long max_dim = bkz ? t.bkz_sieving_dim : t.max_sieving_dim;
-    require(max_dim >= 40 && max_dim <= Pool_hd_t::host_vec_nbytes, "unsupported sieving dimension");
+    require(max_dim >= 40 && max_dim <= 144 && max_dim <= Pool_hd_t::host_vec_nbytes,
+            "MPI BKZ v1 supports sieve dimensions 40..144 within the build limit");
+    if (bkz) {
+        require(t.bkz_jump_step > 0 && t.bkz_dim_for_free >= 0 && t.bkz_start_index >= 0,
+                "invalid BKZ jump/D4F/start index");
+    }
+    if (getenv("HD_SIZE_RATIO")) require(std::fabs(atof(getenv("HD_SIZE_RATIO"))-3.2) < 1e-12,
+            "MPI BKZ v1 requires the full size ratio 3.2");
     state_t s; s.identity = identity(t);
     uint64_t ids[2]; MPI_Allgather(&s.identity, 1, MPI_UINT64_T, ids, 1, MPI_UINT64_T, MPI_COMM_WORLD);
     require(ids[0] == ids[1], "rank configuration disagreement");
+    if (!mpi_sieve_rank()) {
+        if (fs::exists(root/"IDENTITY-BKZ")) {
+            uint64_t id = 0; std::ifstream in(root/"IDENTITY-BKZ"); in >> id;
+            require(in && id == s.identity, "checkpoint root belongs to a different run/configuration");
+        } else {
+            require(!fs::exists(root/"LATEST-BKZ"), "checkpoint root lacks its identity manifest");
+            atomic_text(root/"IDENTITY-BKZ", std::to_string(s.identity)+"\n");
+        }
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
     auto full = std::make_unique<Lattice_QP>(t.basis_file);
     require(full->NumRows() > max_dim && full->NumRows() <= 176, "invalid lattice dimension");
+    if (bkz) require(t.bkz_start_index < full->NumRows() &&
+        (t.bkz_stop_index == task_config_t::val_not_assigned ||
+         (t.bkz_stop_index > t.bkz_start_index && t.bkz_stop_index <= full->NumRows())),
+        "invalid BKZ stop index");
     bool restored = resume_enabled && fs::exists(root/"LATEST-BKZ");
     fs::path restored_dir;
     if (restored) {
@@ -385,6 +420,7 @@ int mpi_bkz_run(void *opaque) {
                     if (s.cursor >= pool.index_l) s.cursor = pool.index_l-1;
                     const long target = BGJ4_SIZE_RATIO * pow(4./3., pool.CSD*.5) - 5;
                     require(mpi_sieve_prune_pool(&pool, target) == 0, "global prune");
+                    compact(pool);
                     if (mpi_sieve_global_u64(pool.pwc_manager->num_vec()) < 0.7*target) { s.next = 3; break; }
                     if (!bkz && !t.enable_down_sieve) {
                         if (s.cursor > 10) { s.next = 3; break; }

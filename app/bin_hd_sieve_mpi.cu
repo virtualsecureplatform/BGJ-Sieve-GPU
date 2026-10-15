@@ -12,6 +12,7 @@
 
 #include <limits.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 #include "../include/mpi_sieve.h"
@@ -93,6 +94,15 @@ int main(int argc, char **argv) {
 
     if (mpi_sieve_runtime_init(checkpoint_root.c_str(), frame_mib, resume, bkz_mode))
         MPI_Abort(MPI_COMM_WORLD, 2);
+    int run_lock = -1;
+    if (bkz_mode && rank == 0) {
+        run_lock = open((checkpoint_root + "/RUN.lock").c_str(), O_CREAT | O_RDWR, 0644);
+        if (run_lock < 0 || flock(run_lock, LOCK_EX | LOCK_NB)) {
+            fprintf(stderr, "[MPI] checkpoint root is already in use\n");
+            MPI_Abort(MPI_COMM_WORLD, 2);
+        }
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
     signal(SIGUSR1, request_mpi_stop);
     signal(SIGTERM, request_mpi_stop);
 
@@ -166,5 +176,6 @@ int main(int argc, char **argv) {
     }
     mpi_sieve_runtime_finalize();
     MPI_Finalize();
+    if (run_lock >= 0) close(run_lock);
     return rc;
 }

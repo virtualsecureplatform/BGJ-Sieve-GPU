@@ -71,9 +71,12 @@ expected pause as success). Submit the same commit and root with
 chain is automatically launched. Every job is limited to two nodes; builds and
 GPU tests must never run on the login node.
 
-Initial per-node budgets are300GiB PWC,32GiB BWC and16GiB SWC, with16 reducer
+Initial per-node budgets are260GiB PWC,128GiB BWC and16GiB SWC, with16 reducer
 workers. HBM PWC is disabled. The pilot keeps BGJ2 through CSD144 instead of
 crossing into disk-oriented BGJ3L; vector-count and saturation targets remain
 unchanged. These are candidate settings, not established high-dimension results.
+The originally planned300/32GiB split fails the conservative CSD144 bucket-window
+bound: two16-center waves require about109GiB of BWC. Lossless chunk compaction
+after redistribution and pruning keeps each half-pool near its234GiB packed size.
 Phase snapshots can be large and expensive: check available filesystem space
 for live scratch plus both retained generations before starting a large pilot.
