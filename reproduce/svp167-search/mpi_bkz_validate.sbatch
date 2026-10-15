@@ -18,6 +18,10 @@ export MPI_LIBDIR="$(mpicxx --showme:link | tr ' ' '\n' | sed -n 's/^-L//p' | he
 FLAGS="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_A100X4_PWC_GB=300 -DHD_A100X4_BWC_GB=32 -DHD_A100X4_SWC_GB=16 -DPOOL_HOST_VEC_MAX_DIM=144 -DENABLE_PROFILING=0"
 apptainer exec --nv --bind /opt/system,"${MPI_BASE}" "${MPI_SIF}" bash -lc \
     "make -B -C '${SOURCE}/src' -j 16 CPPFLAGS='${FLAGS}' && make -B -C '${SOURCE}/app' -j 4 hd_sieve hd_sieve_mpi CPPFLAGS='${FLAGS}' MPI_CPPFLAGS='${MPI_CPPFLAGS}' MPI_LIBDIR='${MPI_LIBDIR}'"
+if [[ "${BUILD_ONLY:-0}" == 1 ]]; then
+    echo "PASS: MPI and serial binaries compiled; source=${SOURCE_COMMIT} run=${RUN}"
+    exit 0
+fi
 export MPI_BINARY="${SOURCE}/app/hd_sieve_mpi"
 export OMPI_MCA_pml=ucx OMPI_MCA_osc=ucx OMPI_MCA_pml_ucx_tls=any OMPI_MCA_pml_ucx_devices=any PMIX_MCA_gds=hash
 export APPTAINERENV_HD_SOURCE_COMMIT="${SOURCE_COMMIT}"

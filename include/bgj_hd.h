@@ -79,6 +79,7 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
     void bucket_finalize(long bucket_id);
     // return the number of buckets that are ready
     long num_ready();
+    long num_active();
     
     // make sure the bucket is in prepare, otherwise return NULL
     chunk_t *fetch_for_write(long bucket_id);

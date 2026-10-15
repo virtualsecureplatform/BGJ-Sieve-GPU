@@ -2269,6 +2269,17 @@ int Bucketer_t::run() {
         long old_nss = logger->ev_new_score_sum;
         #endif
 
+        if (mpi_sieve_active() && getenv("HD_FAIL_ON_SPILL") && atoi(getenv("HD_FAIL_ON_SPILL"))) {
+            // Account for buckets already being reduced, not just the ready list.
+            const auto start_wait = std::chrono::steady_clock::now();
+            while (_bwc->num_active() > _max_batch0) {
+                if (std::chrono::steady_clock::now()-start_wait > std::chrono::hours(1)) {
+                    fprintf(stderr, "[MPI-CAPACITY] bucket window did not drain within one hour\n");
+                    abort();
+                }
+                usleep(1000);
+            }
+        }
         int batch0 = traits::l0_max_batch0_under(_num_buc_slimit - _bwc->num_ready());
         if (batch0 > _max_batch0) batch0 = _max_batch0;
         batch0 = mpi_sieve_min_int(batch0);

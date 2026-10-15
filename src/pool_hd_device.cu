@@ -2058,13 +2058,25 @@ int Pool_hd_t::insert(long index, double eta, long *pos, long auto_lll) {
 
     if (mpi_sieve_active()) {
         mpi_insert_candidate_t candidate;
-        candidate.valid = insert_pos >= 0 && remove_pos >= 0;
-        candidate.objective = best_ratio;
-        candidate.insert_pos = insert_pos;
-        candidate.remove_pos = remove_pos;
-        if (candidate.valid)
-            memcpy(candidate.coeff, res[0] + 2 * min_lift_traits::max_boost_dim +
-                   (insert_pos - index_l + ESD) * 256, sizeof(candidate.coeff));
+        // Search valid lifts on this shard using the weighted insertion objective.
+        // A locally shorter, non-primitive candidate must not hide a valid lift.
+        for (int i = 0; i < ESD; ++i) {
+            const double ratio = ((float *)res[0])[i] /
+                (_boost_data->evec[i*ESD+i] * _boost_data->evec[i*ESD+i]);
+            if (!std::isfinite(ratio) || ratio >= 0.9995) continue;
+            int *coeff = res[0] + 2*min_lift_traits::max_boost_dim + i*256;
+            int unit = -1, sign = 1;
+            for (int j = CSD-1; j >= 0; --j)
+                if (coeff[boost_data_t::max_boost_dim+j] == 1 ||
+                    coeff[boost_data_t::max_boost_dim+j] == -1) {
+                    unit = index_l+j; sign = coeff[boost_data_t::max_boost_dim+j]; break;
+                }
+            const double objective = ratio * pow(eta, i);
+            if (unit < 0 || (candidate.valid && objective >= candidate.objective)) continue;
+            candidate.valid = 1; candidate.objective = objective;
+            candidate.insert_pos = index_l-ESD+i; candidate.remove_pos = unit;
+            for (int j = 0; j < 256; ++j) candidate.coeff[j] = sign * coeff[j];
+        }
         if (mpi_sieve_select_insert(&candidate)) abort();
         insert_pos = candidate.valid ? candidate.insert_pos : -1;
         remove_pos = candidate.valid ? candidate.remove_pos : -1;

@@ -869,6 +869,13 @@ template <class logger_t> void bwc_manager_tmpl<logger_t>::bucket_finalize(long 
     return;
 }
 
+template <class logger_t> long bwc_manager_tmpl<logger_t>::num_active() {
+    pthread_spin_lock(&_bwc_lock);
+    long ret = _num_buckets - _num_deleted_buckets;
+    pthread_spin_unlock(&_bwc_lock);
+    return ret;
+}
+
 template <class logger_t> long bwc_manager_tmpl<logger_t>::num_ready() {
     pthread_spin_lock(&_bwc_lock);
     long ret = _num_ready_buckets;
