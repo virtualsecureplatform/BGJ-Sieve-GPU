@@ -226,7 +226,7 @@ NTL::mat_ZZ integers(Lattice_QP &basis) {
     for (long i = 0; i < basis.NumRows(); ++i) for (long j = 0; j < basis.NumCols(); ++j) {
         NTL::quad_float q(b.hi[i][j], b.lo[i][j]);
         NTL::conv(out[i][j], q);
-        require(abs(q - NTL::to_quad_float(out[i][j])) < 1e-8, "non-integral full basis");
+        require(std::fabs((q - NTL::to_quad_float(out[i][j])).hi) < 1e-8, "non-integral full basis");
     }
     return out;
 }
