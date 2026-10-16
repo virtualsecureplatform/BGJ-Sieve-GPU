@@ -697,17 +697,26 @@ int Pool_hd_t::shrink(long N) {
 
     ut_checker_t ut_checker(ut_checker_t::type_shrink, this, this->uid_table, NULL);
     
-    int score_th = 1;
-    long th_max_del = -N;
-    for (; score_th < 65536; score_th++) {
-        th_max_del += score_stat[score_th];
-        if (th_max_del >= 0) break;
-    }
-    if (th_max_del < 0) lg_err("th_max_del < 0, something must be wrong, ignored");
-
-    score_stat[score_th] -= th_max_del;
-    for (int i = score_th + 1; i < 65536; i++) {
-        score_stat[i] = 0;
+    // Pure packing must not depend on a quality histogram. In particular,
+    // zero-score live vectors are omitted by the legacy cutoff scan. Running
+    // past its end used to write score_stat[65536], corrupting the adjacent CSD.
+    int score_th = 65535;
+    long th_max_del = 0;
+    if (N != num_vec) {
+        score_th = 1;
+        th_max_del = -N;
+        for (; score_th < 65536; score_th++) {
+            th_max_del += score_stat[score_th];
+            if (th_max_del >= 0) break;
+        }
+        if (score_th == 65536 || th_max_del < 0) {
+            fprintf(stderr, "[Error] Pool_hd_t::shrink: inconsistent score histogram; refusing out-of-bounds cutoff\n");
+            return -1;
+        }
+        score_stat[score_th] -= th_max_del;
+        for (int i = score_th + 1; i < 65536; i++) {
+            score_stat[i] = 0;
+        }
     }
     
     std::atomic<int32_t> th_to_del(th_max_del);

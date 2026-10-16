@@ -292,8 +292,11 @@ bool pause(const state_t &s) {
     return mpi_sieve_global_u64(requested ? 1 : 0) || mpi_sieve_should_stop();
 }
 void compact(Pool_hd_t &pool) {
+    const long csd = pool.CSD, left = pool.index_l, right = pool.index_r;
     const long before = pool.pwc_manager->num_vec();
     if (before) require(pool.shrink(before) == 0, "lossless pool compaction");
+    require(pool.CSD == csd && pool.index_l == left && pool.index_r == right,
+            "compaction changed the sieving context");
     require(pool.pwc_manager->num_vec() == before, "compaction changed the vector count");
     require(pool.pwc_manager->num_chunks() <= (before + Pool_hd_t::chunk_max_nvecs-1)/Pool_hd_t::chunk_max_nvecs,
             "pool compaction left chunk holes");
