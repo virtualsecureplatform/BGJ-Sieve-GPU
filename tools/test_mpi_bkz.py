@@ -44,6 +44,8 @@ def main():
     for kind in ('pool', 'bucket', 'sol', 'uid'):
         forbidden = run('forbidden-' + kind, pump, {'APPTAINERENV_HD_MPI_SPILL_TEST': kind}, expected=None)
         logs = (forbidden/'test.log').read_text()
+        for diagnostic in forbidden.glob('rank*/rank.err'):
+            logs += diagnostic.read_text()
         assert '[CACHE-SPILL-FORBIDDEN]' in logs
         for directory in forbidden.glob('rank*/.*'):
             if directory.is_dir():

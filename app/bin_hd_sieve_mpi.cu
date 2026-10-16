@@ -154,8 +154,8 @@ int main(int argc, char **argv) {
                 else {
                     pwc_manager_t manager(1, 1, 256, !strcmp(spill, "bucket"));
                     manager.set_pool(&pool);
-                    std::string dir = std::string(".") + spill;
-                    manager.set_dirname(dir.c_str());
+                    // set_dirname adds the leading dot itself (MULTI_SSD).
+                    manager.set_dirname(spill);
                     long id = manager.create_chunk();
                     chunk_t *chunk = manager.fetch(id); chunk->size = 1;
                     chunk->norm[0] = 1; chunk->vec[0] = 1;
