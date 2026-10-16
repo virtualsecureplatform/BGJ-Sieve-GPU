@@ -961,6 +961,8 @@ int Pool_hd_t::mpi_append_records(const uint8_t *records, long count,
             memcpy(&uid, src, sizeof(uid));
             memcpy(&norm, src + 8, sizeof(norm));
             memcpy(&score, src + 12, sizeof(score));
+            // Score zero denotes an empty/deleted slot, never a live record.
+            if (!score) return -1;
             if (uid_table->insert(uid)) {
                 const int dst = chunk->size++;
                 chunk->u[dst] = uid;

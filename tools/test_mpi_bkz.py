@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 
 
@@ -39,6 +40,26 @@ def main():
         return root
 
     pump = ['--task', 'pump', '--ind_l', '0', '--ind_r', '80', '--SSD', '58', '--MSD', '60', '--DS']
+
+    def check_snapshot_pool(root, sequence):
+        # The cache serializer places scores immediately after the 12-byte
+        # header, including in its padded direct-I/O layout.
+        for rank in (0, 1):
+            shard = root/('generation-%d/rank%d' % (sequence, rank))
+            expected = int((shard/'STATE').read_text().split()[5])
+            total = 0
+            for path in (shard/'pool').rglob('*'):
+                if not path.is_file():
+                    continue
+                with path.open('rb') as stream:
+                    header = stream.read(12)
+                    scores = struct.unpack('<8192H', stream.read(8192*2))
+                count = struct.unpack('<H', header[:2])[0]
+                assert sum(score != 0 for score in scores) == count, path
+                assert all(scores[i] != 0 for i in range(count)), path
+                total += count
+            assert total == expected, (rank, total, expected)
+
     run('control', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': '1'})
     run('control-mismatch', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': 'mismatch'}, expected=None)
     for kind in ('pool', 'bucket', 'sol', 'uid'):
@@ -52,10 +73,12 @@ def main():
                 assert not any(p.is_file() for p in directory.rglob('*')), directory
     root = run('phase-resume', pump, {'APPTAINERENV_HD_MPI_BKZ_STOP_AFTER': 'top'}, 75)
     seq = int((root/'LATEST-BKZ').read_text())
+    check_snapshot_pool(root, seq)
     state = (root/('generation-%d/rank0/STATE' % seq)).read_text().split()
     assert int(state[9]) == 60 and int(state[11]) == 2
     run('phase-resume', pump, {'APPTAINERENV_HD_MPI_BKZ_MAX_PHASES': '1'}, 75)
     seq2 = int((root/'LATEST-BKZ').read_text())
+    check_snapshot_pool(root, seq2)
     assert seq2 > seq
     state = (root/('generation-%d/rank0/STATE' % seq2)).read_text().split()
     assert int(state[9]) == 59 and int(state[11]) == 3

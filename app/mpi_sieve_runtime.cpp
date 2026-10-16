@@ -544,6 +544,18 @@ int mpi_sieve_redistribute_pool(Pool_hd_t *pool) {
         if (cid < (uint64_t)original_chunks) {
             chunk_t *chunk = pool->pwc_manager->fetch(cid);
             if (chunk) {
+                // Basis transforms and UID dedup leave sparse live slots.
+                // size is a count, not the last occupied index: pack before
+                // prefix iteration or empty slots replace live tail vectors.
+                int live = 0;
+                for (int i = 0; i < Pool_hd_t::chunk_max_nvecs; ++i)
+                    live += chunk->score[i] != 0;
+                if (live != chunk->size) {
+                    fprintf(stderr, "[MPI] sparse chunk count mismatch id=%llu live=%d size=%d\n",
+                            (unsigned long long)cid, live, chunk->size);
+                    MPI_Abort(MPI_COMM_WORLD, 2);
+                }
+                _normalize_chunk(chunk, pool->CSD);
                 const int old_size = chunk->size;
                 int out = 0;
                 for (int i = 0; i < old_size; ++i) {

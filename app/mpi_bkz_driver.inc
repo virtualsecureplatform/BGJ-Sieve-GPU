@@ -389,8 +389,11 @@ int mpi_bkz_run(void *opaque) {
             if (restored) {
                 pool.basis_hash = s.basis_hash; pool.pwc_manager->set_pool(&pool);
                 require(pool.uid_table->reset_hash_function(pool.CSD, s.coeff) == 0, "restore UID coefficients");
-                require(pool.load(0) == 0 && pool.pwc_manager->num_vec() == (long)s.local_vectors,
-                        "pool recovery count mismatch");
+                const int load_rc = pool.load(0);
+                const long loaded_vectors = pool.pwc_manager->num_vec();
+                require(load_rc == 0 && loaded_vectors == (long)s.local_vectors,
+                        "pool recovery count mismatch: expected=" + std::to_string(s.local_vectors) +
+                        " actual=" + std::to_string(loaded_vectors) + " load_rc=" + std::to_string(load_rc));
                 require(pool.check(0) == 0, "recovered pool check");
             } else {
                 s.cursor = 0; s.next = 0;

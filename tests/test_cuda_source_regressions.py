@@ -6,6 +6,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CudaSourceRegressionTests(unittest.TestCase):
+    def test_mpi_redistribution_packs_sparse_chunks(self):
+        source = (ROOT / "app" / "mpi_sieve_runtime.cpp").read_text()
+        redistribute = source.split("int mpi_sieve_redistribute_pool(", 1)[1]
+        self.assertLess(redistribute.index("_normalize_chunk(chunk, pool->CSD)"),
+                        redistribute.index("const int old_size = chunk->size"))
+
     def test_lossless_compaction_bypasses_histogram_cutoff(self):
         source = (ROOT / "src" / "pool_hd.cpp").read_text()
         shrink = source.split("int Pool_hd_t::shrink(long N)", 1)[1].split("int Pool_hd_t::", 1)[0]
