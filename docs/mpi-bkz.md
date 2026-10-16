@@ -83,3 +83,11 @@ bound: two 16-center waves require about 109 GiB of BWC. Lossless chunk compacti
 after redistribution and pruning keeps each half-pool near its 234 GiB packed size.
 Phase snapshots can be large and expensive: check available filesystem space
 for live scratch plus both retained generations before starting a large pilot.
+
+Remote candidate producers now wait at the 1 GiB queue limit instead of
+aborting. The bucketer coordinator drains candidates between bucket fragments,
+while waiting for bucket capacity, and before reducer shutdown. Workers never
+issue MPI calls, and no candidate is dropped or spilled. An additional outgoing
+buffer of at most 1 GiB can coexist with the producer queue during exchange.
+`HD_MPI_CANDIDATE_QUEUE_KIB` (1 through 1048576) lowers the queue limit for
+stress tests; validation forces 1 KiB to exercise producer waits and draining.

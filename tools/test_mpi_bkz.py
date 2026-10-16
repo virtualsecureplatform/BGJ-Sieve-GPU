@@ -62,6 +62,13 @@ def main():
 
     run('control', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': '1'})
     run('control-mismatch', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': 'mismatch'}, expected=None)
+    pressure = run('candidate-backpressure', pump, {
+        'APPTAINERENV_HD_MPI_CANDIDATE_QUEUE_KIB': '1',
+        'APPTAINERENV_HD_MPI_BKZ_STOP_AFTER': 'top'}, 75)
+    diagnostics = (pressure/'test.log').read_text()
+    for diagnostic in pressure.glob('rank*/rank.err'):
+        diagnostics += diagnostic.read_text()
+    assert '[MPI-CANDIDATE-BACKPRESSURE]' in diagnostics
     for kind in ('pool', 'bucket', 'sol', 'uid'):
         forbidden = run('forbidden-' + kind, pump, {'APPTAINERENV_HD_MPI_SPILL_TEST': kind}, expected=None)
         logs = (forbidden/'test.log').read_text()

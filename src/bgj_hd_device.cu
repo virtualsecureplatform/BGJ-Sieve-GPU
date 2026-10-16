@@ -2240,6 +2240,10 @@ int Bucketer_t::run() {
     int first_batch = 1;
 
     for (;;) {
+        if (mpi_sieve_active()) {
+            if (mpi_sieve_drain_buckets(_bwc, _swc, _ut_checker, _pool->CSD, _max_batch0))
+                abort();
+        }
         std::unique_lock<std::mutex> buc_lock(_buc_mtx);
         #if 0
         _buc_cv.wait(buc_lock, [this] {
@@ -2250,7 +2254,7 @@ int Bucketer_t::run() {
         #else
         for (;;) {
             int bwc_num_ready = _bwc->num_ready();
-            if ((_num_buc_slimit - bwc_num_ready > _min_batch0 && bwc_num_ready < 2 * _min_batch0) ||
+            if (mpi_sieve_active() || (_num_buc_slimit - bwc_num_ready > _min_batch0 && bwc_num_ready < 2 * _min_batch0) ||
                 (flag & flag_stuck)) break;
             _buc_cv.wait_for(buc_lock, std::chrono::milliseconds(5000));
         }
@@ -2258,6 +2262,10 @@ int Bucketer_t::run() {
         buc_lock.unlock();
 
         if (flag & flag_stuck) {
+            // Finish producers while this coordinator is still servicing
+            // their bounded remote queue. Reducer shutdown waits for them.
+            if (mpi_sieve_active() &&
+                mpi_sieve_drain_buckets(_bwc, _swc, _ut_checker, _pool->CSD, 0)) abort();
             _signal_buc_done();
             break;
         }
@@ -2269,17 +2277,6 @@ int Bucketer_t::run() {
         long old_nss = logger->ev_new_score_sum;
         #endif
 
-        if (mpi_sieve_active() && getenv("HD_FAIL_ON_SPILL") && atoi(getenv("HD_FAIL_ON_SPILL"))) {
-            // Account for buckets already being reduced, not just the ready list.
-            const auto start_wait = std::chrono::steady_clock::now();
-            while (_bwc->num_active() > _max_batch0) {
-                if (std::chrono::steady_clock::now()-start_wait > std::chrono::hours(1)) {
-                    fprintf(stderr, "[MPI-CAPACITY] bucket window did not drain within one hour\n");
-                    abort();
-                }
-                usleep(1000);
-            }
-        }
         int batch0 = traits::l0_max_batch0_under(_num_buc_slimit - _bwc->num_ready());
         if (batch0 > _max_batch0) batch0 = _max_batch0;
         batch0 = mpi_sieve_min_int(batch0);
@@ -2364,6 +2361,8 @@ int Bucketer_t::run() {
             _buc_pool[tid]->wait_sleep();
 
         if (_sieve_is_over() || (flag & flag_stuck)) {
+            if (mpi_sieve_active() &&
+                mpi_sieve_drain_buckets(_bwc, _swc, _ut_checker, _pool->CSD, 0)) abort();
             _signal_buc_done();
             break;
         }

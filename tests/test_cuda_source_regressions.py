@@ -6,6 +6,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CudaSourceRegressionTests(unittest.TestCase):
+    def test_mpi_candidates_wait_instead_of_aborting_on_capacity(self):
+        source = (ROOT / "app" / "mpi_sieve_runtime.cpp").read_text()
+        filtering = source.split("int mpi_sieve_filter_candidates(", 1)[1].split("int mpi_sieve_flush_candidates(", 1)[0]
+        self.assertIn("g_candidate_space.wait(lock", filtering)
+        self.assertNotIn("abort()", filtering)
+        self.assertIn("g_candidate_space.notify_all()", source)
+        self.assertIn("mpi_sieve_drain_buckets", source)
+
     def test_mpi_redistribution_packs_sparse_chunks(self):
         source = (ROOT / "app" / "mpi_sieve_runtime.cpp").read_text()
         redistribute = source.split("int mpi_sieve_redistribute_pool(", 1)[1]

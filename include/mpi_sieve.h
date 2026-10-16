@@ -56,5 +56,6 @@ mpi_sieve_metrics_t mpi_sieve_metrics();
 // Worker-safe local telemetry only; never issues an MPI call.
 void mpi_sieve_note_progress(uint64_t chunks);
 int mpi_sieve_control_test(Lattice_QP *basis, bool mismatch);
+int mpi_sieve_drain_buckets(bwc_manager_t *, swc_manager_t *, ut_checker_t *, int csd, long limit);
 
 #endif

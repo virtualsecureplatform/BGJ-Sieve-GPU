@@ -39,3 +39,4 @@ BGJ_WEAK int mpi_sieve_agree_basis(Lattice_QP *, const char *) { return 0; }
 BGJ_WEAK int mpi_bkz_run(void *) { return -1; }
 BGJ_WEAK mpi_sieve_metrics_t mpi_sieve_metrics() { return {}; }
 BGJ_WEAK void mpi_sieve_note_progress(uint64_t) {}
+BGJ_WEAK int mpi_sieve_drain_buckets(bwc_manager_t *, swc_manager_t *, ut_checker_t *, int, long) { return 0; }
