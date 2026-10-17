@@ -41,6 +41,14 @@ static void trace_mpi_crash(int signal, siginfo_t *, void *context) {
     char hex[17]; hex[16] = '\n';
     for (int i = 15; i >= 0; --i) { hex[i] = "0123456789abcdef"[pc & 15]; pc >>= 4; }
     write(STDERR_FILENO, hex, sizeof(hex));
+    // A null indirect call has RIP=0; its caller's return address is still
+    // at RSP. Print it without invoking an unwinder or touching heap state.
+    const char caller[] = "[MPI-CRASH] stack-return image-relative=0x";
+    write(STDERR_FILENO, caller, sizeof(caller)-1);
+    const uintptr_t *stack = reinterpret_cast<const uintptr_t *>(uc->uc_mcontext.gregs[REG_RSP]);
+    pc = stack[0] - crash_image_base;
+    for (int i = 15; i >= 0; --i) { hex[i] = "0123456789abcdef"[pc & 15]; pc >>= 4; }
+    write(STDERR_FILENO, hex, sizeof(hex));
     _exit(128 + signal);
 }
 
