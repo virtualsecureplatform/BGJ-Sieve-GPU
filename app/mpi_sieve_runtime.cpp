@@ -15,7 +15,6 @@
 #include <fstream>
 #include <filesystem>
 #include <mutex>
-#include <condition_variable>
 #include <string>
 #include <vector>
 
@@ -28,7 +27,6 @@ int g_world = 1;
 std::size_t g_frame_bytes = 256ULL << 20;
 std::string g_checkpoint_root;
 std::mutex g_candidate_mutex;
-std::condition_variable g_candidate_space;
 std::size_t g_candidate_limit = 1ULL << 30;
 std::vector<uint8_t> g_remote_candidates;
 std::atomic<uint64_t> g_bucket_sequence{0};
@@ -397,9 +395,15 @@ int mpi_sieve_filter_candidates(int csd, int8_t *vec, int32_t *norm,
                     fflush(stderr);
                 }
             }
-            g_candidate_space.wait(lock, [&] {
-                return g_remote_candidates.size() + stride <= g_candidate_limit;
-            });
+            // Use the cache subsystem's polling idiom rather than the new
+            // libstdc++ condition-variable wait entrypoint. GPU-node testing
+            // reached a null indirect call immediately after entering that
+            // path. Never hold the queue mutex while waiting for the drain.
+            while (g_remote_candidates.size() + stride > g_candidate_limit) {
+                lock.unlock();
+                usleep(1000);
+                lock.lock();
+            }
             const std::size_t old = g_remote_candidates.size();
             g_remote_candidates.resize(old + stride);
             uint8_t *dst = g_remote_candidates.data() + old;
@@ -417,7 +421,6 @@ int mpi_sieve_flush_candidates(int csd, swc_manager_t *swc,
         std::lock_guard<std::mutex> lock(g_candidate_mutex);
         outgoing.swap(g_remote_candidates);
     }
-    g_candidate_space.notify_all();
     const uint64_t sequence = g_candidate_sequence.fetch_add(1);
     const size_t stride = csd + 14;
     const size_t window = std::max(stride, g_frame_bytes / stride * stride);
