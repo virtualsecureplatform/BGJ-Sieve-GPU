@@ -6,6 +6,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CudaSourceRegressionTests(unittest.TestCase):
+    def test_received_candidates_pack_reused_swc_chunks(self):
+        source = (ROOT / "app" / "mpi_sieve_runtime.cpp").read_text()
+        commit = source.split("int commit_candidates(", 1)[1].split("int make_dir(", 1)[0]
+        self.assertLess(commit.index("_normalize_chunk(dst, csd)"),
+                        commit.index("const int p = dst->size++"))
+        self.assertIn("memset(dst->score + dst->size", commit)
+
     def test_mpi_candidates_wait_instead_of_aborting_on_capacity(self):
         source = (ROOT / "app" / "mpi_sieve_runtime.cpp").read_text()
         filtering = source.split("int mpi_sieve_filter_candidates(", 1)[1].split("int mpi_sieve_flush_candidates(", 1)[0]
