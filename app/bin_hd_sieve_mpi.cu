@@ -14,7 +14,8 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <unistd.h>
-#include <execinfo.h>
+#include <ucontext.h>
+#include <dlfcn.h>
 
 #include "../include/mpi_sieve.h"
 
@@ -29,12 +30,17 @@ static int mkdir_one(const std::string &path) {
 
 static void request_mpi_stop(int) { mpi_sieve_request_stop(); }
 
-static void trace_mpi_crash(int signal) {
-    const char label[] = "[MPI-CRASH] native stack\n";
+static uintptr_t crash_image_base = 0;
+static void trace_mpi_crash(int signal, siginfo_t *, void *context) {
+    const char label[] = "[MPI-CRASH] image-relative pc=0x";
     write(STDERR_FILENO, label, sizeof(label)-1);
-    void *frames[48];
-    const int n = backtrace(frames, 48);
-    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    // Avoid malloc, stdio and stack unwinding: another crashing worker may
+    // hold their internal locks. x86_64 is the supported GPU-node platform.
+    const auto *uc = static_cast<ucontext_t *>(context);
+    uintptr_t pc = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP] - crash_image_base;
+    char hex[17]; hex[16] = '\n';
+    for (int i = 15; i >= 0; --i) { hex[i] = "0123456789abcdef"[pc & 15]; pc >>= 4; }
+    write(STDERR_FILENO, hex, sizeof(hex));
     _exit(128 + signal);
 }
 
@@ -48,10 +54,12 @@ int main(int argc, char **argv) {
 
     int rank = 0;
     if (getenv("HD_MPI_CRASH_TRACE")) {
+        Dl_info info = {};
+        if (dladdr((void *)&trace_mpi_crash, &info)) crash_image_base = (uintptr_t)info.dli_fbase;
         struct sigaction action = {};
-        action.sa_handler = trace_mpi_crash;
+        action.sa_sigaction = trace_mpi_crash;
         sigemptyset(&action.sa_mask);
-        action.sa_flags = SA_RESETHAND;
+        action.sa_flags = SA_RESETHAND | SA_SIGINFO;
         sigaction(SIGSEGV, &action, nullptr);
         sigaction(SIGABRT, &action, nullptr);
     }
