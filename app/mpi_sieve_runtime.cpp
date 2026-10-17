@@ -136,6 +136,11 @@ int commit_candidates(const std::vector<uint8_t> &records, int csd,
         if (!dst) {
             dst = swc->fetch_for_write();
             if (!dst) return -1;
+            // Returned partial SWC chunks can contain holes after UID dedup.
+            // Match the local reducer's packing contract before appending.
+            _normalize_chunk(dst, csd);
+            if (dst->size < 0 || dst->size >= Pool_hd_t::chunk_max_nvecs)
+                return -1;
         }
         const uint8_t *src = records.data() + i * (long)stride;
         const int p = dst->size++;
@@ -148,7 +153,13 @@ int commit_candidates(const std::vector<uint8_t> &records, int csd,
             dst = nullptr;
         }
     }
-    if (dst) ut->task_commit(dst);
+    if (dst) {
+        memset(dst->score + dst->size, 0,
+               (Pool_hd_t::chunk_max_nvecs - dst->size) * sizeof(uint16_t));
+        memset(dst->norm + dst->size, 0,
+               (Pool_hd_t::chunk_max_nvecs - dst->size) * sizeof(int32_t));
+        ut->task_commit(dst);
+    }
     return 0;
 }
 

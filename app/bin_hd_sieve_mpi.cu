@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <unistd.h>
+#include <execinfo.h>
 
 #include "../include/mpi_sieve.h"
 
@@ -28,6 +29,15 @@ static int mkdir_one(const std::string &path) {
 
 static void request_mpi_stop(int) { mpi_sieve_request_stop(); }
 
+static void trace_mpi_crash(int signal) {
+    const char label[] = "[MPI-CRASH] native stack\n";
+    write(STDERR_FILENO, label, sizeof(label)-1);
+    void *frames[48];
+    const int n = backtrace(frames, 48);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    _exit(128 + signal);
+}
+
 int main(int argc, char **argv) {
     int provided = 0;
     if (MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &provided) != MPI_SUCCESS ||
@@ -37,6 +47,14 @@ int main(int argc, char **argv) {
     }
 
     int rank = 0;
+    if (getenv("HD_MPI_CRASH_TRACE")) {
+        struct sigaction action = {};
+        action.sa_handler = trace_mpi_crash;
+        sigemptyset(&action.sa_mask);
+        action.sa_flags = SA_RESETHAND;
+        sigaction(SIGSEGV, &action, nullptr);
+        sigaction(SIGABRT, &action, nullptr);
+    }
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     std::string checkpoint_root;
     int frame_mib = 256;
