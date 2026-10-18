@@ -6,6 +6,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CudaSourceRegressionTests(unittest.TestCase):
+    def test_transform_finalization_recounts_and_packs_live_slots(self):
+        source = (ROOT / "src" / "pool_hd.cpp").read_text()
+        finalization = source.split("if (_type == type_others) {\n        uint32_t _score_stat", 1)[1]
+        self.assertIn("live += _in_check[i].score[j] != 0;", finalization)
+        self.assertLess(finalization.index("_normalize_chunk(&_in_check[i], CSD)"),
+                        finalization.index("_pwc_manager->release_sync"))
+
     def test_mpi_bucket_wave_requires_supported_kernel(self):
         source = (ROOT / "src" / "bgj_hd_device.cu").read_text()
         self.assertIn("if (lim <= 0) return 0;", source)

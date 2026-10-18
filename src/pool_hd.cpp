@@ -1481,11 +1481,19 @@ int ut_checker_t::batch(long tid, long table_size, long current_hold) {
     if (_type == type_others) {
         uint32_t _score_stat[65536] = {};
         for (long i = tid; i < _num_in_check; i += _num_threads) {
-            _pwc_manager->_cached_chunks[_pwc_manager->_chunk_status[_in_check[i].id] & 
-                                         pwc_manager_t::_ck_cache_id_mask].size = _in_check[i].size;
+            // GPU transforms and UID filtering mark deleted/invalid slots
+            // with score zero. Rebuild the authoritative count from those
+            // slots rather than carrying a pre-filter copied size forward.
+            // Recovery and MPI redistribution use the same live-slot rule.
+            int live = 0;
             for (int j = 0; j < Pool_hd_t::chunk_max_nvecs; j++) {
                 _score_stat[_in_check[i].score[j]]++;
+                live += _in_check[i].score[j] != 0;
             }
+            _in_check[i].size = live;
+            _normalize_chunk(&_in_check[i], CSD);
+            _pwc_manager->_cached_chunks[_pwc_manager->_chunk_status[_in_check[i].id] &
+                                         pwc_manager_t::_ck_cache_id_mask].size = live;
             _pwc_manager->release_sync(_in_check[i].id);
         }
         pthread_spin_lock(&_score_stat_lock);
