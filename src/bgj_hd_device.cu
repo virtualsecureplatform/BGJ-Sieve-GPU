@@ -243,6 +243,7 @@ int32_t buc_traits_t::l0_gbuc_freq(double alpha0, long CSD) {
 }
 
 int32_t buc_traits_t::l0_max_batch0_under(long lim) {
+    if (lim <= 0) return 0;
     return 1 << (31 - __builtin_clz(lim));
 }
 
@@ -1445,6 +1446,11 @@ int buc_buffer_holder_t::center_prep(int batch0, int &first_batch) {
     for (int i = 0; i < num_threads; i++) task_vecs[i] = 0;
 
     kernel = traits::kernel_chooser(batch0, CSD16);
+    if (!kernel) {
+        fprintf(stderr, "[BUCKET-KERNEL] unsupported batch0=%ld CSD16=%ld; refusing null launch\n",
+                (long)batch0, (long)CSD16);
+        abort();
+    }
 
     if (kernel == NULL) lg_err("Unsupported batch0 %d, CSD16 %d", batch0, CSD16);
 
@@ -2241,7 +2247,10 @@ int Bucketer_t::run() {
 
     for (;;) {
         if (mpi_sieve_active()) {
-            if (mpi_sieve_drain_buckets(_bwc, _swc, _ut_checker, _pool->CSD, _max_batch0))
+            // A candidate drain does not imply enough free bucket IDs for
+            // the next supported (>=16-center) kernel. Finish the old wave
+            // before selecting the new one; keep servicing blocked workers.
+            if (mpi_sieve_drain_buckets(_bwc, _swc, _ut_checker, _pool->CSD, 0))
                 abort();
         }
         std::unique_lock<std::mutex> buc_lock(_buc_mtx);
@@ -2280,6 +2289,10 @@ int Bucketer_t::run() {
         int batch0 = traits::l0_max_batch0_under(_num_buc_slimit - _bwc->num_ready());
         if (batch0 > _max_batch0) batch0 = _max_batch0;
         batch0 = mpi_sieve_min_int(batch0);
+        if (batch0 < 16) {
+            fprintf(stderr, "[MPI-CAPACITY] insufficient free bucket slots for a 16-center kernel: batch=%d\n", batch0);
+            abort();
+        }
 
         #if ENABLE_PROFILING
         struct timeval batch_start;
