@@ -153,6 +153,11 @@ void commit(state_t &s, Lattice_QP &full, Lattice_QP *local, Pool_hd_t *pool) {
     if (local) mpi_sieve_agree_basis(local, "checkpoint-local");
     if (pool) {
         pool->pwc_manager->wait_work();
+        if (getenv("HD_MPI_BKZ_CHECK_PHASES")) {
+            const int check_rc = pool->check(3);
+            fflush(stdout); fflush(stderr);
+            require(check_rc == 0, "pre-checkpoint pool check");
+        }
         require(pool->store(true) == 0, "pool flush");
         s.left = pool->index_l; s.right = pool->index_r; s.csd = pool->CSD;
         s.basis_hash = pool->basis_hash; s.local_vectors = pool->pwc_manager->num_vec();
@@ -459,7 +464,9 @@ int mpi_bkz_run(void *opaque) {
                 require(loaded_vectors == (long)s.local_vectors,
                         "pool recovery count mismatch: expected=" + std::to_string(s.local_vectors) +
                         " actual=" + std::to_string(loaded_vectors));
-                require(pool.check(0) == 0, "recovered pool check");
+                const int check_rc = pool.check(3);
+                fflush(stdout); fflush(stderr);
+                require(check_rc == 0, "recovered pool check");
             } else {
                 s.cursor = 0; s.next = 0;
                 const long target = BGJ1_SIZE_RATIO * pow(4./3., pool.CSD*.5) - 5;
