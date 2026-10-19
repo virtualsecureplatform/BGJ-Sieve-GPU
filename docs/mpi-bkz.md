@@ -91,3 +91,9 @@ issue MPI calls, and no candidate is dropped or spilled. An additional outgoing
 buffer of at most 1 GiB can coexist with the producer queue during exchange.
 `HD_MPI_CANDIDATE_QUEUE_KIB` (1 through 1048576) lowers the queue limit for
 stress tests; validation forces 1 KiB to exercise producer waits and draining.
+
+BKZ v2 snapshot recovery uses a lossless record loader, not the legacy GPU
+pool-repair loader. It verifies filenames, chunk lengths and headers, dense live
+slots, UID uniqueness/ownership and the recorded total, then rebuilds UID tables
+and score statistics without re-rounding coordinates or filtering records. The
+snapshot inventory and recovered-pool check remain mandatory.

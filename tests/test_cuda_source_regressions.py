@@ -6,6 +6,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CudaSourceRegressionTests(unittest.TestCase):
+    def test_checkpoint_restore_does_not_repair_saved_vectors(self):
+        source = (ROOT / "app" / "mpi_bkz_driver.inc").read_text()
+        self.assertIn("restore_pool_exact(pool, s);", source)
+        self.assertNotIn("pool.load(0)", source)
+        restore = source.split("void restore_pool_exact(", 1)[1].split("} // namespace mpi_bkz", 1)[0]
+        self.assertIn("duplicate exact-restore UID", restore)
+        self.assertIn("exact-restore vector count mismatch", restore)
+        self.assertIn("in.read((char *)chunk->vec", restore)
+
     def test_transform_finalization_recounts_and_packs_live_slots(self):
         source = (ROOT / "src" / "pool_hd.cpp").read_text()
         finalization = source.split("if (_type == type_others) {\n        uint32_t _score_stat", 1)[1]

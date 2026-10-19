@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <iomanip>
 #include <memory>
+#include <map>
 #include <stdexcept>
 #include <thread>
 #include <fcntl.h>
@@ -308,6 +309,69 @@ void redistribute(Pool_hd_t &pool) {
     require(pool.mpi_retain_owner(mpi_sieve_rank(), 2) == 0, "score/ownership rebuild");
     compact(pool);
 }
+
+// The legacy pool.load() repairs arbitrary disk pools through the GPU check
+// kernel, re-rounding coordinates and filtering collisions. A committed v2
+// snapshot instead requires a lossless byte restore after inventory checks.
+void restore_pool_exact(Pool_hd_t &pool, const state_t &s) {
+    require(pool.pwc_manager->num_chunks() == 0, "exact restore requires an empty pool");
+    std::map<long, fs::path> chunks;
+    const std::string prefix = pool.pwc_manager->pfx();
+    for (const auto &entry : fs::recursive_directory_iterator(".pool")) {
+        if (!entry.is_regular_file()) continue;
+        const std::string name = entry.path().filename().string();
+        require(name.size() == prefix.size()+6 && name.rfind(prefix, 0) == 0,
+                "unexpected exact-restore chunk filename");
+        const std::string suffix = name.substr(prefix.size());
+        require(suffix.find_first_not_of("0123456789abcdef") == std::string::npos,
+                "invalid exact-restore chunk id");
+        const long id = std::stol(suffix, nullptr, 16);
+        require(entry.path().parent_path().filename() == hw::ssd_name(id), "wrong chunk SSD shard");
+        require(chunks.emplace(id, entry.path()).second, "duplicate exact-restore chunk id");
+    }
+    require(chunks.size() <= (size_t)pool.pwc_manager->max_cached_chunks(),
+            "snapshot exceeds host pool cache capacity");
+    require(_ensure_regular_chunk_capacity(chunks.size()+256) >= (long)chunks.size()+256,
+            "exact-restore host arena capacity");
+    uint64_t total = 0;
+    memset(pool.score_stat, 0, sizeof(pool.score_stat));
+    for (const auto &entry : chunks) {
+        const long id = entry.first;
+        require(id == pool.pwc_manager->num_chunks(), "noncontiguous exact-restore chunks");
+        std::ifstream in(entry.second, std::ios::binary);
+        char header[12]; in.read(header, sizeof(header));
+        uint16_t count; uint64_t hash;
+        memcpy(&count, header, 2); memcpy(&hash, header+2, 8);
+        require(in && count > 0 && count <= Pool_hd_t::chunk_max_nvecs &&
+                hash == s.basis_hash && (uint8_t)header[10] == s.left &&
+                (uint8_t)header[11] == s.right, "invalid exact-restore chunk header");
+        const uint64_t expected = (ONE_TIME_IO ? 4096 : 12) +
+            Pool_hd_t::chunk_max_nvecs * (uint64_t)(14 + pool.CSD);
+        require(fs::file_size(entry.second) == expected, "invalid exact-restore chunk length");
+        require(pool.pwc_manager->create_chunk() == id, "exact-restore allocation order");
+        chunk_t *chunk = pool.pwc_manager->fetch(id);
+        require(chunk != nullptr, "exact-restore cache allocation");
+        in.read((char *)chunk->score, Pool_hd_t::chunk_max_nvecs * sizeof(uint16_t));
+        in.read((char *)chunk->norm, Pool_hd_t::chunk_max_nvecs * sizeof(int32_t));
+        in.read((char *)chunk->u, Pool_hd_t::chunk_max_nvecs * sizeof(uint64_t));
+        in.read((char *)chunk->vec, Pool_hd_t::chunk_max_nvecs * pool.CSD);
+        require(bool(in), "truncated exact-restore records");
+        for (long i = 0; i < Pool_hd_t::chunk_max_nvecs; ++i) {
+            require((chunk->score[i] != 0) == (i < count), "sparse exact-restore records");
+            if (i >= count) continue;
+            require(pool.uid_table->normalize(chunk->u[i]) % 2 == (uint64_t)mpi_sieve_rank(),
+                    "wrong exact-restore UID owner");
+            require(pool.uid_table->insert(chunk->u[i]) == 1, "duplicate exact-restore UID");
+            ++pool.score_stat[chunk->score[i]];
+        }
+        chunk->size = count;
+        pool.pwc_manager->release(id); // Backing file is already durable; no rewrite.
+        total += count;
+    }
+    require(total == s.local_vectors, "exact-restore vector count mismatch");
+    fprintf(stderr, "[MPI-BKZ] exact pool restore rank=%d vectors=%llu chunks=%zu\n",
+            mpi_sieve_rank(), (unsigned long long)total, chunks.size());
+}
 } // namespace mpi_bkz
 
 int mpi_bkz_run(void *opaque) {
@@ -389,11 +453,11 @@ int mpi_bkz_run(void *opaque) {
             if (restored) {
                 pool.basis_hash = s.basis_hash; pool.pwc_manager->set_pool(&pool);
                 require(pool.uid_table->reset_hash_function(pool.CSD, s.coeff) == 0, "restore UID coefficients");
-                const int load_rc = pool.load(0);
+                restore_pool_exact(pool, s);
                 const long loaded_vectors = pool.pwc_manager->num_vec();
-                require(load_rc == 0 && loaded_vectors == (long)s.local_vectors,
+                require(loaded_vectors == (long)s.local_vectors,
                         "pool recovery count mismatch: expected=" + std::to_string(s.local_vectors) +
-                        " actual=" + std::to_string(loaded_vectors) + " load_rc=" + std::to_string(load_rc));
+                        " actual=" + std::to_string(loaded_vectors));
                 require(pool.check(0) == 0, "recovered pool check");
             } else {
                 s.cursor = 0; s.next = 0;
