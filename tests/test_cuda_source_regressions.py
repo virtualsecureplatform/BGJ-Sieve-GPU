@@ -6,6 +6,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CudaSourceRegressionTests(unittest.TestCase):
+    def test_insertion_reconstructs_before_redistribution(self):
+        source = (ROOT / "app" / "mpi_bkz_driver.inc").read_text()
+        insertion = source.split("pool.insert(s.cursor++", 1)[1]
+        self.assertLess(insertion.index("pool.canonicalize_records()"),
+                        insertion.index("redistribute(pool)"))
+
     def test_checkpoint_restore_does_not_repair_saved_vectors(self):
         source = (ROOT / "app" / "mpi_bkz_driver.inc").read_text()
         self.assertIn("restore_pool_exact(pool, s);", source)

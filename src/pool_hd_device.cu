@@ -2650,6 +2650,23 @@ struct load_ckpfcher_t {
     pwc_manager_t *pwc_manager;
 };
 
+int Pool_hd_t::canonicalize_records() {
+    pwc_manager->wait_work();
+    if (_pwc_hbm_writeback_enabled()) pwc_manager->flush();
+    _pwc_hbm_reset();
+    uint64_t coeff[vec_nbytes];
+    for (long i = 0; i < CSD; ++i) coeff[i] = uid_table->coeff(i);
+    // Rebuild UID membership from reconstructed records using the same hash.
+    if (uid_table->reset_hash_function(CSD, coeff)) return -1;
+    int devices;
+    cudaDeviceProp properties[MAX_NUM_DEVICE];
+    if (_prepare_device_prop(devices, properties)) return -1;
+    local_data_t *local[MAX_NUM_DEVICE] = {};
+    stream_task_template<check_traits>(devices, properties, local);
+    for (int i = 0; i < devices; ++i) CHECK_CUDA_ERR(cudaFree(local[i]));
+    return 0;
+}
+
 int Pool_hd_t::load(long log_level) {
     lg_init();
     const bool recovery_trace = getenv("HD_PUMP_RECOVERY_TRACE") != NULL;

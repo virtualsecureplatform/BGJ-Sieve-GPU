@@ -486,6 +486,10 @@ int mpi_bkz_run(void *opaque) {
                     pool.down_sieve_flag = 1;
                     long pos = -1; int ret = pool.insert(s.cursor++, 1.2, &pos);
                     require(ret == 0 || ret == -1, "insertion failed");
+                    // Insertion changes the quantization basis. Reconstruct
+                    // before routing: unrepresentable rounded coordinates
+                    // and new collisions must not enter an immutable phase.
+                    require(pool.canonicalize_records() == 0, "post-insertion reconstruction");
                     redistribute(pool);
                     // Validate an insertion before publishing its phase checkpoint.
                     // trans_to consumes the projected basis, so use private copies.

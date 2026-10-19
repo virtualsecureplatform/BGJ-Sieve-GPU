@@ -449,6 +449,9 @@ struct Pool_hd_t {
     int mpi_append_records(const uint8_t *records, long count, int record_size);
     /// @brief try to recover the pool from disk
     int load(long log_level = 0);
+    // Reconstruct quantized records in the current basis, dropping invalid
+    // coordinates/collisions before immutable phase publication.
+    int canonicalize_records();
     /// @brief check for dimension lose
     /// @return 0 if passed, -1 otherwise
     int check_dim_lose();
