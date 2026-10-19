@@ -828,6 +828,54 @@ int Pool_hd_t::store(bool force) {
     return 0;
 }
 
+int Pool_hd_t::mpi_compact_dense() {
+    pwc_manager->wait_work();
+    const long expected = pwc_manager->num_vec();
+    long left = 0, right = pwc_manager->num_chunks()-1;
+    // Each chunk has one owner here. Unlike the parallel shrink iterator,
+    // no worker can finish while another owns the last partial destination.
+    while (left <= right) {
+        chunk_t *dst = pwc_manager->fetch(left);
+        if (!dst) return -1;
+        _normalize_chunk(dst, CSD);
+        if (dst->size == chunk_max_nvecs) {
+            pwc_manager->release_sync(left++);
+            continue;
+        }
+        if (left == right) {
+            if (!dst->size) { pwc_manager->release_del(right--); }
+            else pwc_manager->release_sync(left);
+            break;
+        }
+        chunk_t *src = pwc_manager->fetch(right);
+        if (!src) return -1;
+        _normalize_chunk(src, CSD);
+        const long moved = std::min(chunk_max_nvecs-dst->size, (long)src->size);
+        const long from = src->size-moved, to = dst->size;
+        memcpy(dst->score+to, src->score+from, moved*sizeof(uint16_t));
+        memcpy(dst->norm+to, src->norm+from, moved*sizeof(int32_t));
+        memcpy(dst->u+to, src->u+from, moved*sizeof(uint64_t));
+        memcpy(dst->vec+to*CSD, src->vec+from*CSD, moved*CSD);
+        memset(src->score+from, 0, moved*sizeof(uint16_t));
+        memset(src->norm+from, 0, moved*sizeof(int32_t));
+        memset(src->u+from, 0, moved*sizeof(uint64_t));
+        dst->size += moved; src->size -= moved;
+        const bool full = dst->size == chunk_max_nvecs;
+        const bool empty = src->size == 0;
+        pwc_manager->release_sync(left);
+        if (empty) pwc_manager->release_del(right--);
+        else pwc_manager->release_sync(right);
+        if (full) ++left;
+    }
+    pwc_manager->wait_work();
+    pthread_spin_lock(&pwc_manager->_deleted_ids_lock);
+    pwc_manager->_num_chunks = right+1;
+    pwc_manager->_num_deleted_ids = 0;
+    pthread_spin_unlock(&pwc_manager->_deleted_ids_lock);
+    return pwc_manager->num_vec() == expected && right+1 ==
+        (expected+chunk_max_nvecs-1)/chunk_max_nvecs ? 0 : -1;
+}
+
 int Pool_hd_t::mpi_retain_owner(int rank, int world) {
     if (world < 1 || rank < 0 || rank >= world) return -1;
     uint32_t rebuilt[65536] = {};

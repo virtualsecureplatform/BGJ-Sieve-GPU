@@ -6,6 +6,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CudaSourceRegressionTests(unittest.TestCase):
+    def test_mpi_compaction_uses_exclusive_two_ended_packing(self):
+        source = (ROOT / "src" / "pool_hd.cpp").read_text()
+        packing = source.split("int Pool_hd_t::mpi_compact_dense()", 1)[1].split("int Pool_hd_t::mpi_retain_owner", 1)[0]
+        self.assertIn("while (left <= right)", packing)
+        self.assertNotIn("#pragma omp", packing)
+        self.assertIn("pwc_manager->num_vec() == expected", packing)
+        driver = (ROOT / "app" / "mpi_bkz_driver.inc").read_text()
+        self.assertIn("pool.mpi_compact_dense()", driver)
+
     def test_insertion_reconstructs_before_redistribution(self):
         source = (ROOT / "app" / "mpi_bkz_driver.inc").read_text()
         insertion = source.split("pool.insert(s.cursor++", 1)[1]

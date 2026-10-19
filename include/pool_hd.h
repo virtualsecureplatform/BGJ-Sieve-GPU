@@ -445,6 +445,7 @@ struct Pool_hd_t {
     // MPI helpers operate only at quiescent sieve/dimension boundaries.
     int mpi_retain_owner(int rank, int world);
     int mpi_trim_exact(long target);
+    int mpi_compact_dense();
     void mpi_reset_append_hint() { _mpi_append_hint = 0; }
     int mpi_append_records(const uint8_t *records, long count, int record_size);
     /// @brief try to recover the pool from disk

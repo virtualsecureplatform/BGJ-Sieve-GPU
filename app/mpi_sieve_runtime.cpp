@@ -290,6 +290,44 @@ mpi_sieve_metrics_t mpi_sieve_metrics() {
 void mpi_sieve_note_progress(uint64_t chunks) { g_processed_chunks.fetch_add(chunks, std::memory_order_relaxed); }
 
 int mpi_sieve_control_test(Lattice_QP *basis, bool mismatch) {
+    {
+        Pool_hd_t pool(basis);
+        if (pool.set_sieving_context(basis->NumRows()-60, basis->NumRows()))
+            MPI_Abort(MPI_COMM_WORLD, 2);
+        const int sizes[] = {0, 37, 8192, 0, 1, 511, 0, 8191};
+        std::vector<uint64_t> expected, actual;
+        for (int k = 0; k < 8; ++k) {
+            const long id = pool.pwc_manager->create_chunk();
+            chunk_t *chunk = pool.pwc_manager->fetch(id);
+            memset(chunk->score, 0, Pool_hd_t::chunk_max_nvecs*sizeof(uint16_t));
+            memset(chunk->norm, 0, Pool_hd_t::chunk_max_nvecs*sizeof(int32_t));
+            chunk->size = sizes[k];
+            for (int i = 0; i < sizes[k]; ++i) {
+                uint64_t value = k*10000+i+1;
+                expected.push_back(value);
+                chunk->u[i] = value; chunk->norm[i] = value;
+                chunk->score[i] = 1+value%65534;
+                memset(chunk->vec + (long)i*pool.CSD, value%127, pool.CSD);
+            }
+            pool.pwc_manager->release_sync(id);
+        }
+        if (pool.mpi_compact_dense()) MPI_Abort(MPI_COMM_WORLD, 2);
+        for (long id = 0; id < pool.pwc_manager->num_chunks(); ++id) {
+            chunk_t *chunk = pool.pwc_manager->fetch(id);
+            for (int i = 0; i < chunk->size; ++i) {
+                const uint64_t value = chunk->u[i]; actual.push_back(value);
+                if (chunk->norm[i] != (int32_t)value || chunk->score[i] != 1+value%65534)
+                    MPI_Abort(MPI_COMM_WORLD, 2);
+                for (int j = 0; j < pool.CSD; ++j)
+                    if (chunk->vec[(long)i*pool.CSD+j] != (int8_t)(value%127))
+                        MPI_Abort(MPI_COMM_WORLD, 2);
+            }
+            pool.pwc_manager->release(id);
+        }
+        std::sort(expected.begin(), expected.end()); std::sort(actual.begin(), actual.end());
+        if (actual != expected) MPI_Abort(MPI_COMM_WORLD, 2);
+        if (!g_rank) { printf("PASS: lossless dense packing of empty and partial chunks\n"); fflush(stdout); }
+    }
     for (int test = 0; test < 5; ++test) {
         mpi_insert_candidate_t c;
         c.valid = test != 3 && !(test == 4 && g_rank == 0);
