@@ -796,6 +796,7 @@ struct pwc_manager_tmpl {
 
     private:
     friend int Pool_hd_t::shrink(long N);
+    friend int Pool_hd_t::mpi_compact_dense();
     friend struct shrink_iterator_t;
 };
 
