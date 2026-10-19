@@ -27,6 +27,10 @@ export APPTAINERENV_HD_FAIL_ON_SPILL=1 APPTAINERENV_HD_LAZY_SYNC=1 APPTAINERENV_
 export APPTAINERENV_HD_HBM_PWC_WRITEBACK=1 APPTAINERENV_HD_HBM_PWC_GB=0
 export APPTAINERENV_HD_HBM_BWC_GB=12
 export APPTAINERENV_HD_HOST_ARENA_INITIAL_GB=64 APPTAINERENV_HD_PWC_NO_GROW=1
+# Managers retain allocated cache slots even as logical residency fluctuates.
+# Staged pool-count sizing can run out of the 64-GiB arena with free node RAM.
+# Reserve the configured 260-GiB PWC + 16-GiB SWC + slack before workers start.
+export APPTAINERENV_HD_EAGER_HOST_ARENA=1
 export APPTAINERENV_HD_POOL_BUFFER_CACHE=0 APPTAINERENV_HD_CACHE_WAIT_TIMEOUT_S=600
 export APPTAINERENV_HD_BGJ2_REDUCER_THREADS=16 APPTAINERENV_HD_BUCKET_THREADS=16
 # Start with the BGJ2 path already exercised at CSD143, rather than the
@@ -38,11 +42,15 @@ if [[ "${PILOT_RESUME:-0}" == 1 ]]; then
     export APPTAINERENV_HD_MPI_BKZ_MAX_PHASES=1
     unset APPTAINERENV_HD_MPI_BKZ_STOP_AFTER || true
 else
-    [[ ! -f "${PILOT_ROOT}/LATEST-BKZ" ]]
+    if [[ "${PILOT_RECOVER:-0}" == 1 ]]; then
+        [[ -f "${PILOT_ROOT}/LATEST-BKZ" ]]
+    else
+        [[ ! -f "${PILOT_ROOT}/LATEST-BKZ" ]]
+    fi
     export APPTAINERENV_HD_MPI_BKZ_STOP_AFTER=first-down
     unset APPTAINERENV_HD_MPI_BKZ_MAX_PHASES || true
 fi
-echo "pilot root=${PILOT_ROOT} source=${SOURCE_COMMIT} resume=${PILOT_RESUME:-0} basis=${BASIS}"
+echo "pilot root=${PILOT_ROOT} source=${SOURCE_COMMIT} resume=${PILOT_RESUME:-0} recover=${PILOT_RECOVER:-0} eager_host_arena=1 basis=${BASIS}"
 STEP_PID=''
 trap 'if [[ -n "${STEP_PID}" ]]; then kill -USR1 "${STEP_PID}" || true; fi' USR1
 set +e
