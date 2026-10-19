@@ -1,4 +1,5 @@
 // Included by bin_hd_sieve_mpi.cu after the serial task definitions.
+#include "../include/bgj_hd.h"
 #include <atomic>
 #include <condition_variable>
 #include <iomanip>
