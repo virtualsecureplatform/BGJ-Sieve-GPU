@@ -113,8 +113,12 @@ default four per rank (`HD_MPI_CHECKPOINT_THREADS=1..8`). Publication still
 waits for all workers, and errors abort instead of publishing a partial image.
 All snapshot files and directories remain explicitly synced.
 
-`mpi_phase_bench.sbatch` compares one real serial sieve phase (four GPUs) with
-one two-rank phase (eight GPUs), sequentially in a two-node allocation. It uses
+`submit_phase_bench.sh` queues separate jobs using `mpi_phase_bench.sbatch`:
+one real serial sieve phase (one node/four GPUs), followed by one two-rank
+phase (two nodes/eight GPUs). MPI uses an `afterany` dependency so a serial
+failure does not suppress the independent measurement, and the pair never
+reserves more than two nodes simultaneously. Export `SOURCE_COMMIT` and
+`VALIDATED_BUILD` before running the helper with `bash`. Each job uses
 the same input basis, global pool-size target and algorithm settings, reports
 sampling separately, and excludes checkpoint/insertion I/O from the sieve
 timer. Randomized pools differ between partitionings; this is a throughput
@@ -140,7 +144,15 @@ Timeout diagnostics identify the manager kind and chunk totals. Sampling start
 and completion are logged separately because a cold pool is not comparable
 to the much shorter warm CSD128 phase in a progressive BKZ pump.
 
-The phase benchmark explicitly requests four GPUs per participating node.
-Its serial step overrides the allocation's inherited eight-GPU total, and
-step creation fails after 60 seconds rather than waiting for the full sieve
-timeout on an impossible resource request.
+The phase benchmark defaults to serial with a one-node allocation. Direct MPI
+submission requires `--rsc=g=8` and `BENCH_BACKEND=mpi`; the script rejects a
+backend/allocation mismatch. Both backends explicitly request four GPUs per
+participating node, and step creation fails after 60 seconds rather than
+waiting for the full sieve timeout on an impossible resource request.
+
+Diagnostic launches additionally run `phase_bench_rank.sh` on each allocated
+node. It records GPU utilization, process/thread CPU and wait states, RSS and
+I/O counters every minute, plus bounded GDB thread backtraces every 20 minutes
+when available. The launcher is archived from `BENCH_LAUNCH_COMMIT`, separately
+from the already-validated binary source. Attaching GDB slightly perturbs the
+timing; treat these reruns as diagnostic, not clean performance measurements.
