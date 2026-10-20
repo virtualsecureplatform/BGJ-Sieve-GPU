@@ -1,5 +1,6 @@
 #include "../include/mpi_sieve.h"
 #include "../include/bgj_hd.h"
+#include "../include/sieve_cache_budget.h"
 
 #include <mpi.h>
 #include <cuda_runtime.h>
@@ -299,6 +300,63 @@ mpi_sieve_metrics_t mpi_sieve_metrics() {
 void mpi_sieve_note_progress(uint64_t chunks) { g_processed_chunks.fetch_add(chunks, std::memory_order_relaxed); }
 
 int mpi_sieve_control_test(Lattice_QP *basis, bool mismatch) {
+    {
+        // Regression for the cold CSD128 failure: 38,712 pool chunks, but
+        // only 13,273 SWC slots despite ample unused PWC reservation.
+        const long pool_capacity = (260L << 30) / (8192L * 158);
+        const long base_swc = 13273, phase_pool = 38712, headroom = 1336;
+        const long slots = no_spill_swc_cache_chunks(pool_capacity, base_swc,
+                                                    phase_pool, headroom);
+        if (slots != phase_pool + headroom ||
+            phase_pool + slots > pool_capacity + base_swc ||
+            no_spill_swc_cache_chunks(100, 10, 100, 5) != 10 ||
+            no_spill_swc_cache_chunks(100, 10, 120, 5) != 10 ||
+            no_spill_swc_cache_chunks(100, 10, 5, 1) != 10 ||
+            no_spill_swc_cache_chunks(100, 10, 90, 5) != 20)
+            MPI_Abort(MPI_COMM_WORLD, 2);
+        if (!g_rank) { printf("PASS: bounded no-spill SWC cache borrowing\n"); fflush(stdout); }
+    }
+    {
+        // Exercise the actual asynchronous cache, not only budget arithmetic.
+        // Retain more dirty ready chunks than the former fixed SWC capacity,
+        // then drain and verify every synthetic record without writing files.
+        NTL::Mat<NTL::ZZ> identity;
+        identity.SetDims(167, 167);
+        for (long i = 0; i < 167; ++i) identity[i][i] = 1;
+        Lattice_QP synthetic_basis(identity);
+        Pool_hd_t pool(&synthetic_basis);
+        if (pool.set_sieving_context(167-128, 167)) MPI_Abort(MPI_COMM_WORLD, 2);
+        swc_manager_t swc(&pool);
+        const long count = SWC_DEFAULT_MAX_CACHED_CHUNKS +
+                           swc_manager_t::swc_auto_prefetch_for_read +
+                           2 * swc_manager_t::swc_auto_prefetch_for_write;
+        if (swc.max_cached_chunks() < count + swc_manager_t::swc_auto_prefetch_for_write)
+            MPI_Abort(MPI_COMM_WORLD, 2);
+        for (long i = 0; i < count; ++i) {
+            chunk_t *chunk = swc.fetch_for_write();
+            chunk->size = 1;
+            chunk->score[0] = 1;
+            chunk->norm[0] = i+1;
+            chunk->u[0] = i+1;
+            memset(chunk->vec, 0, 128);
+            swc.chunk_finalize(chunk);
+        }
+        long drained = 0;
+        uint64_t sum = 0;
+        for (chunk_t *chunk; (chunk = swc.fetch_for_read()); ) {
+            if (chunk->size != 1 || chunk->score[0] != 1 ||
+                chunk->norm[0] != (int32_t)chunk->u[0]) MPI_Abort(MPI_COMM_WORLD, 2);
+            sum += chunk->u[0];
+            ++drained;
+            swc.read_done(chunk);
+        }
+        if (drained != count || sum != (uint64_t)count*(count+1)/2)
+            MPI_Abort(MPI_COMM_WORLD, 2);
+        if (!g_rank) {
+            printf("PASS: SWC dirty-ready pressure drained %ld records beyond old capacity\n", count);
+            fflush(stdout);
+        }
+    }
     {
         std::vector<uint8_t> sent((2ULL<<20)+31), received;
         for (size_t i = 0; i < sent.size(); ++i) sent[i] = (i*17+g_rank*19)&255;

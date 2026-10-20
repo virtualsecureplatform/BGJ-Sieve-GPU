@@ -122,3 +122,25 @@ comparison, not a bit-identical trajectory. Default CSD is 128. No production
 pilot should be restarted on an assumption of speedup: inspect the measured
 phase times and transfer counts first. Capacity and solution quality are not
 established by this benchmark.
+
+With `HD_FAIL_ON_SPILL=1`, SWC can borrow the phase's unused PWC chunk
+reservation. The phase pool bound matches the bucket iterator, including the
+local MPI shard and an oversized existing pool. Borrowing is limited by the
+original combined PWC+SWC budget and by the reducer's solution bound plus
+worker/prefetch headroom; it does not allocate an additional PWC-sized arena,
+shrink the vector target, or enable disk spill. Explicit `HD_SWC_GROW_GB` still
+requests extra memory separately under its existing physical-memory guard.
+
+This fixes the cold CSD128 benchmark's logical/cache capacity mismatch:
+the reducer could retain about 39,700 solution chunks, while the fixed 16 GiB
+SWC held only 13,273. It now borrows about 32 GiB of otherwise unused pool
+reservation. At larger dimensions unused PWC space may be insufficient to
+cover the entire solution bound; this does not prove CSD144 feasibility.
+Timeout diagnostics identify the manager kind and chunk totals. Sampling start
+and completion are logged separately because a cold pool is not comparable
+to the much shorter warm CSD128 phase in a progressive BKZ pump.
+
+The phase benchmark explicitly requests four GPUs per participating node.
+Its serial step overrides the allocation's inherited eight-GPU total, and
+step creation fails after 60 seconds rather than waiting for the full sieve
+timeout on an impossible resource request.

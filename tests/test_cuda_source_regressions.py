@@ -6,6 +6,40 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CudaSourceRegressionTests(unittest.TestCase):
+    def test_no_spill_swc_borrows_only_unused_pool_budget(self):
+        policy = (ROOT / "include" / "sieve_cache_budget.h").read_text()
+        self.assertIn('pool_capacity - phase_pool_chunks', policy)
+        self.assertIn('std::min(unused_pool,', policy)
+        source = (ROOT / "src" / "bgj_hd.cpp").read_text()
+        self.assertIn('base = no_spill_swc_cache_chunks(', source)
+        self.assertIn('1000 + RED_MAX_NUM_THREADS +', source)
+        self.assertIn('host_pool + requested_chunks + 256', source)
+        self.assertNotIn('PWC_DEFAULT_MAX_CACHED_CHUNKS +\n                                       requested_chunks', source)
+        native = (ROOT / "app" / "mpi_sieve_runtime.cpp").read_text()
+        self.assertIn('PASS: bounded no-spill SWC cache borrowing', native)
+        self.assertIn('phase_pool + slots > pool_capacity + base_swc', native)
+
+    def test_cache_timeout_identifies_manager(self):
+        source = (ROOT / "include" / "pool_hd.h").read_text()
+        self.assertIn('[cache-wait-timeout] manager=%s kind=%s', source)
+
+    def test_phase_benchmark_reports_sampling_boundaries(self):
+        source = (ROOT / "app" / "bin_hd_phase_bench.cu").read_text()
+        self.assertIn('[PHASE-BENCH] sampling_start', source)
+        self.assertIn('[PHASE-BENCH] sampling_done', source)
+
+    def test_phase_benchmark_limits_step_gpu_requests(self):
+        source = (ROOT / "reproduce" / "svp167-search" / "mpi_phase_bench.sbatch").read_text()
+        serial = source.split('export MPI_BINARY="${SOURCE}/app/hd_phase_bench"', 1)[1].split(
+            'export MPI_BINARY="${SOURCE}/app/hd_phase_bench_mpi"', 1)[0]
+        parallel = source.split('export MPI_BINARY="${SOURCE}/app/hd_phase_bench_mpi"', 1)[1]
+        for step, total_gpus, nodes in ((serial, 4, 1), (parallel, 8, 2)):
+            self.assertIn('--gpus=%d --gres=gpu:4' % total_gpus, step)
+            self.assertIn('--nodes=%d --ntasks=%d' % (nodes, nodes), step)
+            self.assertIn('--ntasks-per-node=1', step)
+            self.assertIn('--cpus-per-task=128', step)
+            self.assertIn('--immediate=60', step)
+
     def test_mpi_bucket_transport_batches_columnar_blocks(self):
         source = (ROOT / "app" / "mpi_sieve_runtime.cpp").read_text()
         exchange = source.split("int mpi_sieve_exchange_buckets(", 1)[1].split("int mpi_sieve_global_stuck", 1)[0]

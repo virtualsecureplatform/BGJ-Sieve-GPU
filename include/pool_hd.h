@@ -1199,9 +1199,12 @@ template <class logger_t> int32_t pwc_manager_tmpl<logger_t>::__fetch_cache_for(
             scanned = 0;
             if (timeout_s > 0 && std::chrono::steady_clock::now() - wait_start >
                     std::chrono::seconds(timeout_s)) {
-                fprintf(stderr, "[cache-wait-timeout] chunk=%ld capacity=%ld loading=%d syncing=%d csd=%d\n",
+                fprintf(stderr, "[cache-wait-timeout] manager=%s kind=%s chunk=%ld "
+                        "capacity=%ld loading=%d syncing=%d csd=%d chunks=%ld deleted=%d\n",
+                        _pfx, _hbm_pool_tier ? "pool" : (_compact_vec_norm ? "bucket" : "solution"),
                         chunk_id, _max_cached_chunks, (int)_num_loading_chunks.load(),
-                        (int)_num_syncing_chunks.load(), _pool ? (int)_pool->CSD : -1);
+                        (int)_num_syncing_chunks.load(), _pool ? (int)_pool->CSD : -1,
+                        _num_chunks, _num_deleted_ids);
                 fflush(stderr);
                 abort();
             }

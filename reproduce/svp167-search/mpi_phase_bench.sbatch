@@ -29,15 +29,23 @@ BENCH="${MPI_BASE}/diagnostics/mpi-phase-bench-${SLURM_JOB_ID}"
 mkdir -p "${BENCH}"
 BASIS="${MPI_BASE}/runs/svp167-search/potlll-simulation-8744618/seed-38/result.basis"
 FIRST_NODE="$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -1)"
+# --rsc=g=8 exports a total eight-GPU request. Override it for the
+# one-node serial step; inheriting eight GPUs there makes the step unschedulable.
+# Keep all four GPUs and 128 CPUs per participating node in both tests.
+# Fail promptly if step resources cannot be granted inside our allocation.
 for dimension in ${BENCH_DIMENSIONS:-128}; do
     [[ "${dimension}" =~ ^[0-9]+$ ]] && (( dimension >= 40 && dimension <= 143 ))
     export MPI_BINARY="${SOURCE}/app/hd_phase_bench"
-    timeout --signal=TERM --kill-after=60 5400 srun --mpi=pmix_v2 --nodes=1 --ntasks=1 \
+    echo "Launching serial CSD=${dimension}: node=${FIRST_NODE}, GPUs=4, CPUs=128"
+    timeout --signal=TERM --kill-after=60 5400 srun --mpi=pmix_v2 --immediate=60 \
+        --nodes=1 --ntasks=1 --ntasks-per-node=1 --gpus=4 --gres=gpu:4 \
         --nodelist="${FIRST_NODE}" --cpus-per-task=128 --cpu-bind=none --kill-on-bad-exit=1 \
         "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" "${BASIS}" "${dimension}" "${BENCH}/serial-${dimension}" \
         > "${BENCH}/serial-${dimension}.log" 2>&1
     export MPI_BINARY="${SOURCE}/app/hd_phase_bench_mpi"
-    timeout --signal=TERM --kill-after=60 5400 srun --mpi=pmix_v2 --nodes=2 --ntasks=2 \
+    echo "Launching MPI CSD=${dimension}: nodes=2, GPUs=8, CPUs=256"
+    timeout --signal=TERM --kill-after=60 5400 srun --mpi=pmix_v2 --immediate=60 \
+        --nodes=2 --ntasks=2 --gpus=8 --gres=gpu:4 \
         --ntasks-per-node=1 --cpus-per-task=128 --cpu-bind=none --kill-on-bad-exit=1 \
         "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" "${BASIS}" "${dimension}" "${BENCH}/mpi-${dimension}" \
         > "${BENCH}/mpi-${dimension}.log" 2>&1

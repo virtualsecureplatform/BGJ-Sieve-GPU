@@ -48,6 +48,11 @@ int main(int argc, char **argv) {
         pool.set_num_threads(configured_pool_threads()); pool.set_boost_depth(0);
         const long target = BGJ1_SIZE_RATIO*pow(4./3., dimension*.5)-5;
         const auto begin = std::chrono::steady_clock::now();
+        if (!rank) {
+            printf("[PHASE-BENCH] sampling_start ranks=%d csd=%ld target_vectors=%ld\n",
+                   mpi_sieve_world(), dimension, target);
+            fflush(stdout);
+        }
         if (mpi_sieve_active()) {
             if (pool.sampling(target/2+4096) || mpi_sieve_partition_pool(&pool, target)) result = 2;
         } else if (pool.sampling(target)) result = 2;
@@ -58,6 +63,11 @@ int main(int argc, char **argv) {
             return 2;
         }
         const auto sampled = std::chrono::steady_clock::now();
+        if (!rank) {
+            printf("[PHASE-BENCH] sampling_done seconds=%.6f; sieve_start csd=%ld\n",
+                   std::chrono::duration<double>(sampled-begin).count(), dimension);
+            fflush(stdout);
+        }
         const int sieve_result = result ? -2 : _sieve(&pool);
         const auto finished = std::chrono::steady_clock::now();
         // A stuck/converged return (-1) is part of the sieve stopping criterion.

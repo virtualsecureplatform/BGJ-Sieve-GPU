@@ -1,5 +1,6 @@
 #include "../include/bgj_hd.h"
 #include "../include/mpi_sieve.h"
+#include "../include/sieve_cache_budget.h"
 
 #include <sys/time.h>
 #include <unistd.h>
@@ -22,8 +23,38 @@ static uint64_t __host_mem_available() {
     return available;
 }
 
+static long __swc_phase_pool_chunks(Pool_hd_t *p) {
+    const char *ratio_env = getenv("HD_SIZE_RATIO");
+    const double ratio = ratio_env ? atof(ratio_env) : BGJ1_SIZE_RATIO;
+    // Match buc_iterator_t, including a possibly oversized existing pool.
+    const long vectors = (long)(ratio * pow(4./3., p->CSD * .5)) /
+                         (mpi_sieve_active() ? mpi_sieve_world() : 1);
+    return std::max(p->pwc_manager->num_chunks(),
+                    (vectors + Pool_hd_t::chunk_max_nvecs - 1) /
+                        Pool_hd_t::chunk_max_nvecs);
+}
+
 static long __swc_runtime_max_cached_chunks(Pool_hd_t *p) {
-    const long base = SWC_DEFAULT_MAX_CACHED_CHUNKS;
+    long base = SWC_DEFAULT_MAX_CACHED_CHUNKS;
+    const char *no_spill = getenv("HD_FAIL_ON_SPILL");
+    if (p && no_spill && atoi(no_spill)) {
+        // Reducer_t permits phase_pool_chunks+1000 solutions; reserve room
+        // for racing output workers and prefetch as well. A 16-GiB SWC can
+        // otherwise deadlock before that logical limit on a cold CSD128 pool.
+        const long pool_chunks = __swc_phase_pool_chunks(p);
+        base = no_spill_swc_cache_chunks(p->pwc_manager->max_cached_chunks(),
+            base, pool_chunks, 1000 + RED_MAX_NUM_THREADS +
+            2 * swc_manager_t::swc_auto_prefetch_for_write + 256);
+        if (base > (long)SWC_DEFAULT_MAX_CACHED_CHUNKS) {
+            printf("[SWC-CAPACITY] csd=%ld pool_bound=%ld cache_chunks=%ld "
+                   "borrowed_pool_chunks=%ld combined_budget_chunks=%ld\n",
+                   p->CSD, pool_chunks, base,
+                   base - (long)SWC_DEFAULT_MAX_CACHED_CHUNKS,
+                   p->pwc_manager->max_cached_chunks() +
+                       (long)SWC_DEFAULT_MAX_CACHED_CHUNKS);
+            fflush(stdout);
+        }
+    }
     const char *grow_env = getenv("HD_SWC_GROW_GB");
     // Keep the profiled cache size inside the physical-memory envelope by
     // default.  Runtime growth remains available as an explicit experiment.
@@ -1226,9 +1257,19 @@ template <class logger_t> swc_manager_tmpl<logger_t>::swc_manager_tmpl(Pool_hd_t
                                                      __swc_runtime_max_cached_chunks(p)) {
     const long requested_chunks = _max_cached_chunks;
     const char *eager_env = getenv("HD_EAGER_HOST_ARENA");
-    if (eager_env && atoi(eager_env) != 0)
-        _ensure_regular_chunk_capacity(PWC_DEFAULT_MAX_CACHED_CHUNKS +
-                                       requested_chunks + 256);
+    if (eager_env && atoi(eager_env) != 0) {
+        // Borrowed SWC slots are already inside the combined arena. Do not
+        // count the unused PWC reservation twice and allocate extra host RAM.
+        const long host_pool = std::min(__swc_phase_pool_chunks(p),
+                                       p->pwc_manager->max_cached_chunks());
+        const long required = std::max(
+            (long)(PWC_DEFAULT_MAX_CACHED_CHUNKS + SWC_DEFAULT_MAX_CACHED_CHUNKS + 256),
+            host_pool + requested_chunks + 256);
+        if (_ensure_regular_chunk_capacity(required) < required) {
+            fprintf(stderr, "[Error] SWC shared arena cannot reserve %ld chunks\n", required);
+            abort();
+        }
+    }
     _num_ready = 0;
     _num_writing = 0;
     _num_rp = 0; 
@@ -1250,7 +1291,7 @@ template <class logger_t> swc_manager_tmpl<logger_t>::swc_manager_tmpl(Pool_hd_t
         const double extra_gib = (_max_cached_chunks - swc_default_max_cached_chunks) *
                                  Pool_hd_t::chunk_max_nvecs *
                                  (double)POOL_HOST_VEC_SLOT_NBYTES / (1ULL << 30);
-        lg_warn("guarded SWC growth enabled at CSD %ld: +%.2f GiB (%ld chunks total)",
+        lg_warn("SWC capacity increased at CSD %ld: +%.2f GiB (%ld chunks total)",
                 p->CSD, extra_gib, _max_cached_chunks);
     } else if (requested_chunks > swc_default_max_cached_chunks) {
         lg_warn("guarded SWC growth unavailable at CSD %ld; using base capacity", p->CSD);
