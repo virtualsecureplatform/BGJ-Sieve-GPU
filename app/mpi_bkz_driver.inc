@@ -7,6 +7,7 @@
 #include <map>
 #include <stdexcept>
 #include <thread>
+#include <mutex>
 #include <fcntl.h>
 #include <NTL/mat_ZZ.h>
 
@@ -120,26 +121,77 @@ fs::path generation(uint64_t seq, int rank) {
     return root / ("generation-" + std::to_string(seq)) / ("rank" + std::to_string(rank));
 }
 // Each snapshot is immutable; verify every file before loading a checkpoint.
+template<class Work> void checkpoint_parallel(size_t count, Work work) {
+    const char *setting = getenv("HD_MPI_CHECKPOINT_THREADS");
+    const int requested = setting ? atoi(setting) : 4;
+    require(requested >= 1 && requested <= 8, "checkpoint threads must be in [1,8]");
+    const size_t workers = std::min<size_t>(count, requested);
+    std::atomic<size_t> next{0}; std::atomic<bool> failed{false};
+    std::exception_ptr error; std::mutex error_mutex;
+    std::vector<std::thread> threads;
+    for (size_t tid = 0; tid < workers; ++tid) threads.emplace_back([&] {
+        try {
+            for (;;) {
+                const size_t index = next.fetch_add(1);
+                if (index >= count || failed.load()) break;
+                work(index);
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            if (!error) error = std::current_exception();
+            failed.store(true);
+        }
+    });
+    for (auto &thread : threads) thread.join();
+    if (error) std::rethrow_exception(error);
+}
+void copy_pool_tree(const fs::path &source, const fs::path &destination) {
+    fs::create_directories(destination);
+    std::vector<fs::path> files;
+    for (const auto &entry : fs::recursive_directory_iterator(source)) {
+        const fs::path relative = entry.path().lexically_relative(source);
+        require(!entry.is_symlink(), "snapshot cache contains a symlink");
+        if (entry.is_directory()) fs::create_directories(destination/relative);
+        else if (entry.is_regular_file()) files.push_back(relative);
+        else require(false, "snapshot cache contains a nonregular file");
+    }
+    checkpoint_parallel(files.size(), [&](size_t i) {
+        fs::copy_file(source/files[i], destination/files[i], fs::copy_options::overwrite_existing);
+    });
+}
 void inventory(const fs::path &dir, bool verify) {
     if (verify) {
         std::ifstream in(dir / "FILES"); std::string name; uint64_t size, hash; size_t count = 0;
+        struct item { fs::path path; uint64_t size, hash; };
+        std::vector<item> items;
         while (in >> std::quoted(name) >> size >> hash) {
             fs::path relative(name);
             require(!relative.is_absolute() && name.find("..") == std::string::npos,
                     "unsafe snapshot path");
-            require(fs::is_regular_file(dir/relative) && fs::file_size(dir/relative) == size &&
-                    file_hash(dir/relative) == hash, "snapshot checksum mismatch: " + name);
+            items.push_back({relative, size, hash});
             ++count;
         }
         require(in.eof() && count >= 2, "incomplete snapshot inventory");
+        checkpoint_parallel(items.size(), [&](size_t i) {
+            const auto &entry = items[i];
+            require(fs::is_regular_file(dir/entry.path) && fs::file_size(dir/entry.path) == entry.size &&
+                    file_hash(dir/entry.path) == entry.hash, "snapshot checksum mismatch: " + entry.path.string());
+        });
     } else {
+        std::vector<fs::path> files;
+        for (const auto &e : fs::recursive_directory_iterator(dir))
+            if (e.is_regular_file() && e.path().filename() != "FILES") files.push_back(e.path());
+        std::sort(files.begin(), files.end());
+        std::vector<std::string> lines(files.size());
+        checkpoint_parallel(files.size(), [&](size_t i) {
+            const auto &path = files[i]; durable(path);
+            std::ostringstream line;
+            line << std::quoted(path.lexically_relative(dir).string()) << ' '
+                 << fs::file_size(path) << ' ' << file_hash(path) << '\n';
+            lines[i] = line.str();
+        });
         std::ostringstream out;
-        for (const auto &e : fs::recursive_directory_iterator(dir)) {
-            if (!e.is_regular_file() || e.path().filename() == "FILES") continue;
-            durable(e.path());
-            out << std::quoted(fs::relative(e.path(), dir).string()) << ' '
-                << e.file_size() << ' ' << file_hash(e.path()) << '\n';
-        }
+        for (const auto &line : lines) out << line;
         atomic_text(dir/"FILES", out.str());
         for (const auto &e : fs::recursive_directory_iterator(dir))
             if (e.is_directory()) durable(e.path(), true);
@@ -180,7 +232,7 @@ void commit(state_t &s, Lattice_QP &full, Lattice_QP *local, Pool_hd_t *pool) {
     fs::create_directories(dst);
     save_basis(full, dst/"full.qp");
     if (local) save_basis(*local, dst/"local.qp");
-    if (pool) fs::copy(".pool", dst/"pool", fs::copy_options::recursive);
+    if (pool) copy_pool_tree(".pool", dst/"pool");
     atomic_text(dst/"STATE", encode(s));
     inventory(dst, false);
     const char *fault = getenv("HD_MPI_BKZ_FAULT");
@@ -450,7 +502,7 @@ int mpi_bkz_run(void *opaque) {
         require(top >= 40 && start >= 40, "invalid local sieve dimension");
         // Scratch is mutable and rank-local. Snapshots are never cache backing files.
         fs::remove_all(".pool"); fs::create_directories(".pool/0"); fs::create_directories(".pool/1");
-        if (restored) fs::copy(restored_dir/"pool", ".pool", fs::copy_options::recursive | fs::copy_options::overwrite_existing);
+        if (restored) copy_pool_tree(restored_dir/"pool", ".pool");
         {
             Pool_hd_t pool(local.get());
             require(pool.set_sieving_context(restored ? s.left : local->NumRows()-start,

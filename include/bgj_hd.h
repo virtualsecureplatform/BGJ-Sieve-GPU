@@ -99,6 +99,8 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
                                 int record_size, bool first, bool *done);
     int mpi_append_bucket(long bucket_id, const uint8_t *records, long count,
                           int record_size);
+    int mpi_append_bucket_soa(long bucket_id, const uint8_t *norms,
+                              const uint8_t *vectors, long count);
 
     // Exact ready-bucket cache in device memory.  Configuration happens after
     // the reducer strategy is known; a zero/failed allocation leaves the

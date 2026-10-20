@@ -32,7 +32,7 @@ if [[ "${REUSED}" == 0 ]]; then
         "make -B -C '${SOURCE}/src' -j 16 CPPFLAGS='${FLAGS}'"
 fi
 apptainer exec --nv --bind /opt/system,"${MPI_BASE}" "${MPI_SIF}" bash -lc \
-    "make -B -C '${SOURCE}/app' -j 4 hd_sieve hd_sieve_mpi CPPFLAGS='${FLAGS}' MPI_CPPFLAGS='${MPI_CPPFLAGS}' MPI_LIBDIR='${MPI_LIBDIR}'"
+    "make -B -C '${SOURCE}/app' -j 4 hd_sieve hd_sieve_mpi hd_phase_bench hd_phase_bench_mpi CPPFLAGS='${FLAGS}' MPI_CPPFLAGS='${MPI_CPPFLAGS}' MPI_LIBDIR='${MPI_LIBDIR}'"
 if [[ "${BUILD_ONLY:-0}" == 1 ]]; then
     echo "PASS: MPI and serial binaries compiled; source=${SOURCE_COMMIT} run=${RUN}"
     exit 0

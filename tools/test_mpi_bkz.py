@@ -19,7 +19,7 @@ def main():
     launch = ['srun', '--mpi=pmix_v2', '--nodes=2', '--ntasks=2', '--ntasks-per-node=1',
               '--cpus-per-task=128', '--cpu-bind=none', '--kill-on-bad-exit=1', str(args.wrapper)]
 
-    def run(name, options, overrides=None, expected=0):
+    def run(name, options, overrides=None, expected=0, frame_mib=1):
         root = args.root / name
         root.mkdir(exist_ok=True)
         env = dict(os.environ)
@@ -27,7 +27,7 @@ def main():
         output = [] if '--task' in options and options[options.index('--task')+1] == 'sieve' else [
             '--output', str(root/'out.basis')]
         command = launch + ['--input', str(args.basis)] + output + [
-            '--checkpoint-root', str(root), '--mpi-frame-mib', '1'] + options
+            '--checkpoint-root', str(root), '--mpi-frame-mib', str(frame_mib)] + options
         result = subprocess.run(command, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, timeout=1200)
         with (root/'test.log').open('ab') as log:
@@ -61,6 +61,7 @@ def main():
             assert total == expected, (rank, total, expected)
 
     run('control', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': '1'})
+    run('control-batched', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': '1'}, frame_mib=8)
     run('control-mismatch', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': 'mismatch'}, expected=None)
     pressure = run('candidate-backpressure', pump, {
         'APPTAINERENV_HD_MPI_CANDIDATE_QUEUE_KIB': '1',

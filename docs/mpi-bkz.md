@@ -97,3 +97,28 @@ pool-repair loader. It verifies filenames, chunk lengths and headers, dense live
 slots, UID uniqueness/ownership and the recorded total, then rebuilds UID tables
 and score statistics without re-rounding coordinates or filtering records. The
 snapshot inventory and recovered-pool check remain mandatory.
+
+## Transport and performance validation
+
+Wire protocol v2 packs bucket chunks in columnar norm/vector blocks, batching
+them into at most 64 MiB (or one chunk when the configured frame is smaller).
+It uses hardware-accelerated interleaved CRC32C lanes for transport corruption
+checks; checkpoint inventories retain their existing FNV hashes and format.
+Both ranks must run the same binary. Candidate queues remain bounded at 1 GiB
+with producer backpressure and no dropping/spilling. Bucket waits aggregate
+candidate traffic before routing it, including under the tiny-queue test.
+
+Checkpoint copying, checksumming and fsync use bounded parallel workers,
+default four per rank (`HD_MPI_CHECKPOINT_THREADS=1..8`). Publication still
+waits for all workers, and errors abort instead of publishing a partial image.
+All snapshot files and directories remain explicitly synced.
+
+`mpi_phase_bench.sbatch` compares one real serial sieve phase (four GPUs) with
+one two-rank phase (eight GPUs), sequentially in a two-node allocation. It uses
+the same input basis, global pool-size target and algorithm settings, reports
+sampling separately, and excludes checkpoint/insertion I/O from the sieve
+timer. Randomized pools differ between partitionings; this is a throughput
+comparison, not a bit-identical trajectory. Default CSD is 128. No production
+pilot should be restarted on an assumption of speedup: inspect the measured
+phase times and transfer counts first. Capacity and solution quality are not
+established by this benchmark.

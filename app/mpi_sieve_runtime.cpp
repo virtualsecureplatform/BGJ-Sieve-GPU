@@ -17,6 +17,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <nmmintrin.h>
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -36,6 +37,7 @@ std::atomic<bool> g_stop_requested{false};
 int g_resumed_csd = -1;
 std::atomic<uint64_t> g_sent_bytes{0};
 std::atomic<uint64_t> g_recv_bytes{0};
+std::atomic<uint64_t> g_wire_exchanges{0};
 double g_mpi_seconds = 0.0;
 uint8_t *g_send_frame = nullptr;
 uint8_t *g_recv_frame = nullptr;
@@ -60,12 +62,17 @@ struct wire_header_t {
 constexpr uint32_t wire_magic = 0x42474a4d; // BGJM
 
 uint64_t checksum64(const uint8_t *data, uint64_t size) {
-    uint64_t h = 1469598103934665603ULL;
-    for (uint64_t i = 0; i < size; ++i) {
-        h ^= data[i];
-        h *= 1099511628211ULL;
+    // Two interleaved CRC32C lanes, hardware accelerated on the A100 hosts.
+    // This is a non-cryptographic transport corruption check, like the prior
+    // FNV checksum, not an authentication primitive. Checkpoint hashes stay FNV.
+    uint64_t a = 0xffffffffU, b = 0x9e3779b9U;
+    uint64_t offset = 0;
+    for (; offset+16 <= size; offset += 16) {
+        uint64_t x, y; memcpy(&x, data+offset, 8); memcpy(&y, data+offset+8, 8);
+        a = _mm_crc32_u64(a, x); b = _mm_crc32_u64(b, y);
     }
-    return h;
+    for (; offset < size; ++offset) a = _mm_crc32_u8(a, data[offset]);
+    return ((a ^ 0xffffffffU) << 32) | (b ^ 0xffffffffU);
 }
 
 double now_seconds() { return MPI_Wtime(); }
@@ -73,7 +80,7 @@ double now_seconds() { return MPI_Wtime(); }
 int exchange_bytes(const uint8_t *send_data, uint64_t send_bytes,
                    std::vector<uint8_t> &recv, int count_tag, int data_tag,
                    int csd, uint64_t sequence) {
-    wire_header_t send_header = {wire_magic, 1, (uint16_t)count_tag,
+    wire_header_t send_header = {wire_magic, 2, (uint16_t)count_tag,
                                  (uint32_t)csd, 0, sequence, send_bytes,
                                  checksum64(send_data, send_bytes)};
     wire_header_t recv_header = {};
@@ -82,7 +89,7 @@ int exchange_bytes(const uint8_t *send_data, uint64_t send_bytes,
                      &recv_header, sizeof(recv_header), MPI_BYTE, 1 - g_rank, count_tag,
                      MPI_COMM_WORLD, MPI_STATUS_IGNORE) != MPI_SUCCESS)
         return -1;
-    if (recv_header.magic != wire_magic || recv_header.version != 1 ||
+    if (recv_header.magic != wire_magic || recv_header.version != 2 ||
         recv_header.kind != count_tag || recv_header.csd != (uint32_t)csd ||
         recv_header.sequence != sequence) {
         fprintf(stderr, "[MPI rank %d] invalid wire header kind=%u csd=%u sequence=%llu\n",
@@ -115,6 +122,7 @@ int exchange_bytes(const uint8_t *send_data, uint64_t send_bytes,
     }
     g_sent_bytes += send_bytes;
     g_recv_bytes += recv_bytes;
+    g_wire_exchanges.fetch_add(1, std::memory_order_relaxed);
     g_mpi_seconds += now_seconds() - start;
     if (checksum64(recv.data(), recv_bytes) != recv_header.checksum) {
         fprintf(stderr, "[MPI rank %d] payload checksum mismatch kind=%d sequence=%llu\n",
@@ -255,9 +263,10 @@ int mpi_sieve_runtime_init(const char *checkpoint_root, int frame_mib,
 
 int mpi_sieve_runtime_finalize() {
     if (!g_rank) {
-        printf("[MPI] traffic sent=%.3f GiB received=%.3f GiB mpi_time=%.3f s\n",
+        printf("[MPI] traffic sent=%.3f GiB received=%.3f GiB mpi_time=%.3f s wire_exchanges=%llu\n",
                g_sent_bytes / (double)(1ULL << 30),
-               g_recv_bytes / (double)(1ULL << 30), g_mpi_seconds);
+               g_recv_bytes / (double)(1ULL << 30), g_mpi_seconds,
+               (unsigned long long)g_wire_exchanges.load());
         fflush(stdout);
     }
     if (g_send_frame) cudaFreeHost(g_send_frame);
@@ -290,6 +299,22 @@ mpi_sieve_metrics_t mpi_sieve_metrics() {
 void mpi_sieve_note_progress(uint64_t chunks) { g_processed_chunks.fetch_add(chunks, std::memory_order_relaxed); }
 
 int mpi_sieve_control_test(Lattice_QP *basis, bool mismatch) {
+    {
+        std::vector<uint8_t> sent((2ULL<<20)+31), received;
+        for (size_t i = 0; i < sent.size(); ++i) sent[i] = (i*17+g_rank*19)&255;
+        for (size_t length : {size_t(1), size_t(7), size_t(8), size_t(15), size_t(16), size_t(17), sent.size()}) {
+            const auto original = checksum64(sent.data(), length);
+            sent[length-1] ^= 1;
+            if (checksum64(sent.data(), length) == original) MPI_Abort(MPI_COMM_WORLD, 2);
+            sent[length-1] ^= 1;
+        }
+        if (exchange_bytes(sent.data(), sent.size(), received, tag_pool_count, tag_pool_data, 60, 0))
+            MPI_Abort(MPI_COMM_WORLD, 2);
+        for (size_t i = 0; i < received.size(); ++i)
+            if (received[i] != uint8_t((i*17+(1-g_rank)*19)&255)) MPI_Abort(MPI_COMM_WORLD, 2);
+        if (received.size() != sent.size()) MPI_Abort(MPI_COMM_WORLD, 2);
+        if (!g_rank) { printf("PASS: CRC corruption checks and multi-frame transport\n"); fflush(stdout); }
+    }
     {
         Pool_hd_t pool(basis);
         if (pool.set_sieving_context(basis->NumRows()-60, basis->NumRows()))
@@ -327,6 +352,43 @@ int mpi_sieve_control_test(Lattice_QP *basis, bool mismatch) {
         std::sort(expected.begin(), expected.end()); std::sort(actual.begin(), actual.end());
         if (actual != expected) MPI_Abort(MPI_COMM_WORLD, 2);
         if (!g_rank) { printf("PASS: lossless dense packing of empty and partial chunks\n"); fflush(stdout); }
+        {
+            bwc_manager_t buckets(&pool);
+            const int32_t id = buckets.push_bucket();
+            const long count = 13*Pool_hd_t::chunk_max_nvecs+17;
+            std::vector<int32_t> norms(Pool_hd_t::chunk_max_nvecs);
+            std::vector<uint8_t> vectors(Pool_hd_t::chunk_max_nvecs*pool.CSD);
+            for (long begin = 0; begin < count; begin += Pool_hd_t::chunk_max_nvecs) {
+                const long n = std::min(Pool_hd_t::chunk_max_nvecs, count-begin);
+                for (long j = 0; j < n; ++j) {
+                    const long value = g_rank*count+begin+j;
+                    norms[j] = value+1;
+                    memset(vectors.data()+j*pool.CSD, value%127, pool.CSD);
+                }
+                if (buckets.mpi_append_bucket_soa(id, (const uint8_t *)norms.data(), vectors.data(), n))
+                    MPI_Abort(MPI_COMM_WORLD, 2);
+            }
+            const int owner = g_bucket_sequence.load()%g_world;
+            if (mpi_sieve_exchange_buckets(&buckets, nullptr, nullptr, &id, 1, pool.CSD))
+                MPI_Abort(MPI_COMM_WORLD, 2);
+            std::vector<bool> seen(count*2, false); uint64_t found = 0;
+            if (g_rank == owner && buckets.pop_bucket() != id) MPI_Abort(MPI_COMM_WORLD, 2);
+            while (g_rank == owner) {
+                chunk_t *chunk = buckets.fetch_for_read(id);
+                if (!chunk) break;
+                for (int j = 0; j < chunk->size; ++j) {
+                    const long value = chunk->norm[j]-1;
+                    if (value < 0 || value >= count*2 || seen[value]) MPI_Abort(MPI_COMM_WORLD, 2);
+                    seen[value] = true; ++found;
+                    for (long k = 0; k < pool.CSD; ++k)
+                        if (chunk->vec[j*pool.CSD+k] != int8_t(value%127)) MPI_Abort(MPI_COMM_WORLD, 2);
+                }
+                buckets.read_done(chunk, id);
+            }
+            if (g_rank == owner) buckets.bucket_finalize(id);
+            if (mpi_sieve_global_u64(found) != uint64_t(count*2)) MPI_Abort(MPI_COMM_WORLD, 2);
+            if (!g_rank) { printf("PASS: columnar bucket streaming, batched frames and partial tail\n"); fflush(stdout); }
+        }
     }
     for (int test = 0; test < 5; ++test) {
         mpi_insert_candidate_t c;
@@ -481,10 +543,17 @@ int mpi_sieve_drain_buckets(bwc_manager_t *bwc, swc_manager_t *swc,
                              ut_checker_t *ut, int csd, long limit) {
     const auto started = std::chrono::steady_clock::now();
     for (;;) {
-        if (mpi_sieve_flush_candidates(csd, swc, ut)) return -1;
-        // Both ranks execute the same collectives, including when just one
-        // rank is waiting for a producer blocked by the candidate high-water.
-        if (mpi_sieve_min_int(bwc->num_active() <= limit)) return 0;
+        uint64_t local[2], global[2];
+        {
+            std::lock_guard<std::mutex> lock(g_candidate_mutex);
+            local[0] = g_remote_candidates.size();
+        }
+        local[1] = bwc->num_active() > limit;
+        MPI_Allreduce(local, global, 2, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+        const uint64_t threshold = std::min<uint64_t>(16ULL<<20, g_candidate_limit/2);
+        if (global[0] && (global[0] >= threshold || !global[1]))
+            if (mpi_sieve_flush_candidates(csd, swc, ut)) return -1;
+        if (!global[1]) return 0;
         if (std::chrono::steady_clock::now() - started > std::chrono::hours(1)) {
             fprintf(stderr, "[MPI] bucket/candidate drain timed out\n");
             MPI_Abort(MPI_COMM_WORLD, 2);
@@ -498,22 +567,49 @@ int mpi_sieve_exchange_buckets(bwc_manager_t *bwc, swc_manager_t *swc,
                                int num_buckets, int csd) {
     if (mpi_sieve_flush_candidates(csd, swc, ut_checker)) return -1;
     const int stride = csd + (int)sizeof(int32_t);
+    const size_t chunk_bytes = Pool_hd_t::chunk_max_nvecs*(size_t)stride+4;
+    const size_t batch_bytes = std::max(chunk_bytes,
+        std::min<size_t>(64ULL<<20, g_frame_bytes));
     for (int i = 0; i < num_buckets; ++i) {
         const uint64_t sequence = g_bucket_sequence.fetch_add(1);
         const int owner = sequence % g_world;
+        bool first_export = true;
         for (uint64_t part = 0;; ++part) {
             if (mpi_sieve_flush_candidates(csd, swc, ut_checker)) return -1;
             std::vector<uint8_t> outgoing, incoming;
             bool done = true;
-            if (g_rank != owner && bwc->mpi_export_bucket_chunk(
-                    ids[i], outgoing, stride, part == 0, &done)) MPI_Abort(MPI_COMM_WORLD, 2);
-            if (mpi_sieve_min_int(done ? 1 : 0)) break;
+            if (g_rank != owner) {
+                done = false;
+                outgoing.reserve(batch_bytes);
+                while (!done && outgoing.size()+chunk_bytes <= batch_bytes) {
+                    std::vector<uint8_t> block;
+                    if (bwc->mpi_export_bucket_chunk(ids[i], block, stride, first_export, &done))
+                        MPI_Abort(MPI_COMM_WORLD, 2);
+                    first_export = false;
+                    if (block.empty()) continue;
+                    const uint32_t count = block.size()/stride;
+                    const size_t pos = outgoing.size();
+                    outgoing.resize(pos+4+block.size());
+                    memcpy(outgoing.data()+pos, &count, 4);
+                    memcpy(outgoing.data()+pos+4, block.data(), block.size());
+                }
+            }
             if (exchange_bytes(outgoing.data(), outgoing.size(), incoming,
                                tag_bucket_count, tag_bucket_data, csd,
                                (sequence << 32) | part)) MPI_Abort(MPI_COMM_WORLD, 2);
-            if (g_rank == owner && (incoming.size() % stride ||
-                bwc->mpi_append_bucket(ids[i], incoming.data(), incoming.size() / stride, stride)))
-                MPI_Abort(MPI_COMM_WORLD, 2);
+            if (g_rank == owner) {
+                size_t offset = 0;
+                while (offset < incoming.size()) {
+                    if (incoming.size()-offset < 4) MPI_Abort(MPI_COMM_WORLD, 2);
+                    uint32_t count; memcpy(&count, incoming.data()+offset, 4); offset += 4;
+                    const size_t bytes = count*(size_t)stride;
+                    if (!count || count > Pool_hd_t::chunk_max_nvecs || bytes > incoming.size()-offset ||
+                        bwc->mpi_append_bucket_soa(ids[i], incoming.data()+offset,
+                            incoming.data()+offset+count*sizeof(int32_t), count)) MPI_Abort(MPI_COMM_WORLD, 2);
+                    offset += bytes;
+                }
+            }
+            if (mpi_sieve_min_int(done ? 1 : 0)) break;
         }
         if (g_rank == owner) bwc->bucket_finalize(ids[i]);
     }

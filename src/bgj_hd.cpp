@@ -1112,11 +1112,10 @@ template <class logger_t> int bwc_manager_tmpl<logger_t>::mpi_export_bucket_chun
     *done = !chunk;
     if (!chunk) { bucket_finalize(bucket_id); return 0; }
     records.resize((size_t)chunk->size * record_size);
-    for (int i = 0; i < chunk->size; ++i) {
-        uint8_t *dst = records.data() + (size_t)i * record_size;
-        memcpy(dst, chunk->norm + i, 4);
-        memcpy(dst + 4, chunk->vec + (long)this->_pool->CSD * i, this->_pool->CSD);
-    }
+    // Columnar wire block: two bulk copies rather than two per vector.
+    memcpy(records.data(), chunk->norm, (size_t)chunk->size * sizeof(int32_t));
+    memcpy(records.data() + (size_t)chunk->size * sizeof(int32_t), chunk->vec,
+           (size_t)chunk->size * this->_pool->CSD);
     read_done(chunk, bucket_id);
     return 0;
 }
@@ -1177,6 +1176,23 @@ template <class logger_t> int bwc_manager_tmpl<logger_t>::mpi_export_bucket(
         read_done(chunk, bucket_id);
     }
     bucket_finalize(bucket_id);
+    return 0;
+}
+
+template <class logger_t> int bwc_manager_tmpl<logger_t>::mpi_append_bucket_soa(
+        long bucket_id, const uint8_t *norms, const uint8_t *vectors, long count) {
+    if (count < 0 || count > Pool_hd_t::chunk_max_nvecs || (count && (!norms || !vectors))) return -1;
+    long pos = 0;
+    while (pos < count) {
+        chunk_t *dst = fetch_for_write(bucket_id);
+        if (!dst) return -1;
+        const long n = std::min<long>(count-pos, Pool_hd_t::chunk_max_nvecs-dst->size);
+        memcpy(dst->norm+dst->size, norms+pos*sizeof(int32_t), n*sizeof(int32_t));
+        memcpy(dst->vec+(long)this->_pool->CSD*dst->size,
+               vectors+pos*this->_pool->CSD, n*this->_pool->CSD);
+        dst->size += n; pos += n;
+        write_done(dst, bucket_id);
+    }
     return 0;
 }
 

@@ -6,6 +6,23 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CudaSourceRegressionTests(unittest.TestCase):
+    def test_mpi_bucket_transport_batches_columnar_blocks(self):
+        source = (ROOT / "app" / "mpi_sieve_runtime.cpp").read_text()
+        exchange = source.split("int mpi_sieve_exchange_buckets(", 1)[1].split("int mpi_sieve_global_stuck", 1)[0]
+        self.assertIn("64ULL<<20", exchange)
+        self.assertIn("outgoing.size()+chunk_bytes <= batch_bytes", exchange)
+        self.assertIn("mpi_append_bucket_soa", exchange)
+        self.assertIn("count > Pool_hd_t::chunk_max_nvecs", exchange)
+        self.assertIn("recv_header.version != 2", source)
+
+    def test_checkpoint_parallelism_preserves_durability(self):
+        source = (ROOT / "app" / "mpi_bkz_driver.inc").read_text()
+        self.assertIn('requested >= 1 && requested <= 8', source)
+        self.assertIn('std::rethrow_exception(error)', source)
+        self.assertIn('durable(path);', source)
+        self.assertIn('copy_pool_tree(".pool", dst/"pool")', source)
+        self.assertIn('file_hash(dir/entry.path) == entry.hash', source)
+
     def test_mpi_compaction_uses_exclusive_two_ended_packing(self):
         source = (ROOT / "src" / "pool_hd.cpp").read_text()
         packing = source.split("int Pool_hd_t::mpi_compact_dense()", 1)[1].split("int Pool_hd_t::mpi_retain_owner", 1)[0]
