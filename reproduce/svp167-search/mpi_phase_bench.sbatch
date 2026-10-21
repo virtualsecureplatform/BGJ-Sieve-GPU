@@ -7,6 +7,11 @@
 set -euo pipefail
 ulimit -c 0
 : "${SOURCE_COMMIT:?}" "${VALIDATED_BUILD:?}"
+TEST_TIMEOUT_SECONDS="${BENCH_TIMEOUT_SECONDS:-10800}"
+if ! [[ "${TEST_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] || (( TEST_TIMEOUT_SECONDS <= 0 )); then
+    echo "BENCH_TIMEOUT_SECONDS must be a positive integer" >&2
+    exit 2
+fi
 case "${BENCH_BACKEND:-serial}" in
     serial) BACKEND=serial; NODES=1; GPUS=4; BINARY=hd_phase_bench ;;
     mpi) BACKEND=mpi; NODES=2; GPUS=8; BINARY=hd_phase_bench_mpi ;;
@@ -51,8 +56,8 @@ BASIS="${MPI_BASE}/runs/svp167-search/potlll-simulation-8744618/seed-38/result.b
 for dimension in ${BENCH_DIMENSIONS:-128}; do
     [[ "${dimension}" =~ ^[0-9]+$ ]] && (( dimension >= 40 && dimension <= 143 ))
     export MPI_BINARY="${SOURCE}/app/${BINARY}"
-    echo "Launching ${BACKEND} CSD=${dimension}: nodes=${NODES}, GPUs=${GPUS}"
-    timeout --signal=TERM --kill-after=60 5400 srun --mpi=pmix_v2 --immediate=60 \
+    echo "Launching ${BACKEND} CSD=${dimension}: nodes=${NODES}, GPUs=${GPUS}, timeout=${TEST_TIMEOUT_SECONDS}s"
+    timeout --signal=TERM --kill-after=60 "${TEST_TIMEOUT_SECONDS}" srun --mpi=pmix_v2 --immediate=60 \
         --nodes="${NODES}" --ntasks="${NODES}" --gpus="${GPUS}" --gres=gpu:4 \
         --ntasks-per-node=1 --cpus-per-task=128 --cpu-bind=none --kill-on-bad-exit=1 \
         bash "${RANK_WRAPPER}" "${BASIS}" "${dimension}" "${BENCH}/${BACKEND}-${dimension}" \

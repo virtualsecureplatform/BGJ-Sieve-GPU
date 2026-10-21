@@ -24,19 +24,22 @@ int main(int argc, char **argv) {
     char *end = nullptr; const long dimension = strtol(argv[2], &end, 10);
     if (*end || dimension < 40 || dimension > Pool_hd_t::host_vec_nbytes) return 2;
     fs::create_directories(root);
-#ifdef HD_PHASE_BENCH_MPI
-    if (mpi_sieve_runtime_init(root.c_str(), 256, false, true)) MPI_Abort(MPI_COMM_WORLD, 2);
-#endif
     const fs::path scratch = root/("rank"+std::to_string(rank));
-    // Never reinterpret or remove another benchmark's cache files.
-    if (fs::exists(scratch)) {
-        fprintf(stderr, "benchmark scratch already exists: %s\n", scratch.c_str());
+    // Claim our directory atomically BEFORE runtime initialization creates it
+    // for rank-local logs. Never accept a pre-existing run, even if empty.
+    std::error_code scratch_error;
+    if (!fs::create_directory(scratch, scratch_error)) {
+        fprintf(stderr, "benchmark scratch already exists or cannot be created: %s (%s)\n",
+                scratch.c_str(), scratch_error ? scratch_error.message().c_str() : "existing directory");
 #ifdef HD_PHASE_BENCH_MPI
         MPI_Abort(MPI_COMM_WORLD, 2);
 #endif
         return 2;
     }
-    fs::create_directories(scratch); fs::current_path(scratch);
+#ifdef HD_PHASE_BENCH_MPI
+    if (mpi_sieve_runtime_init(root.c_str(), 256, false, true)) MPI_Abort(MPI_COMM_WORLD, 2);
+#endif
+    fs::current_path(scratch);
     for (const char *kind : {".pool", ".bucket", ".sol", ".uid"})
         for (int i = 0; i < hw::ssd_num; ++i) fs::create_directories(fs::path(kind)/hw::ssd_name_list[i]);
     _start_ck_allocator(); srand(1234+rank);
@@ -81,6 +84,14 @@ int main(int argc, char **argv) {
                    (unsigned long long)vectors, sieve_result);
             fflush(stdout);
         }
+        // Only this disposable, freshly claimed benchmark pool is discarded.
+        // Leaving dirty chunks queued with writeback/spill disabled would make
+        // its destructor wait forever. This is outside the timed sieve; real
+        // BKZ persistence and checkpoint paths are deliberately unchanged.
+        pool.pwc_manager->wait_work();
+        for (long id = 0; id < pool.pwc_manager->num_chunks(); ++id)
+            if (pool.pwc_manager->chunk_size(id) <= Pool_hd_t::chunk_max_nvecs)
+                pool.pwc_manager->release_del(id);
     }
     _destroy_pool_hd_device_buffers();
     _destory_ck_allocator();

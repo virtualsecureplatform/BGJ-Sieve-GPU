@@ -6,6 +6,23 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CudaSourceRegressionTests(unittest.TestCase):
+    def test_phase_scratch_is_claimed_before_mpi_initialization(self):
+        source = (ROOT / "app" / "bin_hd_phase_bench.cu").read_text()
+        self.assertLess(source.index('fs::create_directory(scratch, scratch_error)'),
+                        source.index('mpi_sieve_runtime_init('))
+        self.assertNotIn('fs::exists(scratch)', source)
+        self.assertLess(source.index('const auto finished ='),
+                        source.index('pool.pwc_manager->release_del(id)'))
+        smoke = (ROOT / 'tools' / 'test_phase_bench.py').read_text()
+        self.assertIn("('mpi', 2, 'hd_phase_bench_mpi')", smoke)
+        self.assertIn('assert repeated.returncode != 0', smoke)
+        self.assertIn("marker.read_text()", smoke)
+
+    def test_phase_timeout_defaults_to_three_hours(self):
+        source = (ROOT / "reproduce" / "svp167-search" / "mpi_phase_bench.sbatch").read_text()
+        self.assertIn('BENCH_TIMEOUT_SECONDS:-10800', source)
+        self.assertIn('--kill-after=60 "${TEST_TIMEOUT_SECONDS}" srun', source)
+
     def test_phase_diagnostics_run_inside_each_rank(self):
         source = (ROOT / "reproduce" / "svp167-search" / "mpi_phase_bench.sbatch").read_text()
         self.assertIn('bash "${RANK_WRAPPER}"', source)

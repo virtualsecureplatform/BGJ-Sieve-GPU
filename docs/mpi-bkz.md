@@ -127,6 +127,18 @@ pilot should be restarted on an assumption of speedup: inspect the measured
 phase times and transfer counts first. Capacity and solution quality are not
 established by this benchmark.
 
+Each backend has a three-hour test timeout (`BENCH_TIMEOUT_SECONDS`, default
+10800), including initial sampling, inside a four-hour Slurm allocation.
+`BENCH_VALIDATION_JOB` optionally gates both jobs on successful validation;
+MPI still runs after a serial timeout/failure once that gate has passed.
+Validation executes the actual serial and MPI frontends at CSD60, checking
+normal completion, no-spill cleanup and rejection of previously claimed scratch.
+`PHASE_BENCH_ONLY=1` runs just these frontend tests after the build. Each rank
+atomically claims its scratch directory before MPI runtime initialization
+creates rank-local logs. Only the disposable benchmark pool is discarded after
+timing, preventing dirty-cache destructor waits when disk writes are forbidden;
+production BKZ checkpoint behavior is unchanged.
+
 With `HD_FAIL_ON_SPILL=1`, SWC can borrow the phase's unused PWC chunk
 reservation. The phase pool bound matches the bucket iterator, including the
 local MPI shard and an oversized existing pool. Borrowing is limited by the

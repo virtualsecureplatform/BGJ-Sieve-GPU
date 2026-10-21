@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PhaseBenchSubmissionTests(unittest.TestCase):
-    def submit_with_mock(self, fail_mpi=False):
+    def submit_with_mock(self, fail_mpi=False, validation_job=''):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fake = root / 'sbatch'
@@ -32,7 +32,8 @@ print(str(700000 + len(calls)) + ';test-cluster')
             fake.chmod(0o755)
             env = dict(os.environ, PATH=directory + os.pathsep + os.environ['PATH'],
                        SOURCE_COMMIT='validated-source', VALIDATED_BUILD='/validated/build',
-                       MOCK_CALLS=str(calls), FAIL_MPI='1' if fail_mpi else '0')
+                       MOCK_CALLS=str(calls), FAIL_MPI='1' if fail_mpi else '0',
+                       BENCH_VALIDATION_JOB=validation_job)
             result = subprocess.run(['bash', str(ROOT / 'reproduce' / 'svp167-search' /
                                                 'submit_phase_bench.sh')],
                                     env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -55,6 +56,12 @@ print(str(700000 + len(calls)) + ';test-cluster')
         self.assertEqual(result.returncode, 1)
         self.assertEqual(len(calls), 2)
         self.assertIn('serial job 700001 remains queued', result.stderr)
+
+    def test_validation_gates_both_but_serial_success_does_not_gate_mpi(self):
+        result, calls = self.submit_with_mock(validation_job='600001')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--dependency=afterok:600001', calls[0])
+        self.assertIn('--dependency=afterok:600001,afterany:700001', calls[1])
 
 
 if __name__ == '__main__':
