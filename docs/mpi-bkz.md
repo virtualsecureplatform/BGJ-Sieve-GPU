@@ -168,3 +168,35 @@ I/O counters every minute, plus bounded GDB thread backtraces every 20 minutes
 when available. The launcher is archived from `BENCH_LAUNCH_COMMIT`, separately
 from the already-validated binary source. Attaching GDB slightly perturbs the
 timing; treat these reruns as diagnostic, not clean performance measurements.
+
+## MPI interconnect diagnostics and host-runtime launch
+
+`mpi_transport_probe.sbatch` compares UCX device discovery and bounded 1 GiB
+bidirectional transfers on two allocated nodes. Old container runs silently
+used `tcp/ib0` and `tcp/ib1`: the image lacked Mellanox/netlink dependencies,
+and even after supplying them its unprivileged user namespace could not open
+the host RDMA devices. Seeing `/dev/infiniband` is not sufficient to establish
+that verbs actually works. The probe retains device-access checks and UCX
+endpoint logs instead of assuming that an IB-named network interface is RDMA.
+
+An optional `MPI_HOST_RUNTIME` directory selects a host-namespace launcher in
+`mpi_rank.sh`. `tools/bundle_mpi_runtime.py`, run **inside the existing trusted
+image on a compute node**, copies that executable's image userspace dependencies
+and loader into a fresh directory and records SHA256/source paths in a manifest.
+The original binary is executed by that loader as the ordinary cluster UID;
+host MPI, UCX, GPU drivers and RDMA providers remain host-provided. No system
+libraries, permissions, container image or checkpoint files are modified.
+Algorithm `APPTAINERENV_HD_*`, `UCX_*` and `OMP_*` settings are translated for the
+host launch. The existing container launcher remains the default.
+
+The probe rejects a host-runtime test that still selects TCP, and runs an actual
+small GPU/MPI phase before the launcher is accepted. Full integration validation
+must pass with the selected runtime before a new high-dimensional run. Pin
+`UCX_TLS=rc,sm,self` for a host-runtime production test to fail if RDMA is absent
+instead of silently falling back. This mode does not enable GPU-direct MPI;
+the existing bounded pinned-host wire protocol is unchanged.
+
+MPI phase benchmarks now emit one-minute local heartbeats with bucket/ownership
+exchange counters, pending candidate bytes, transferred bytes and processed pool
+chunks. The heartbeat thread never calls MPI. Counter movement distinguishes
+slow transport from a true progress deadlock; GPU utilization alone cannot.

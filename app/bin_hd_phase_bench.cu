@@ -5,6 +5,9 @@
 #endif
 #include <filesystem>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #define main bgj_serial_benchmark_unused_main
 #include "bin_hd_sieve.cu"
 #undef main
@@ -15,6 +18,37 @@ struct phase_bench_pool_access_t {
         for (long id = 0; id < pool.pwc_manager->num_chunks(); ++id)
             if (pool.pwc_manager->chunk_size(id) <= Pool_hd_t::chunk_max_nvecs)
                 pool.pwc_manager->release_del(id);
+    }
+};
+
+struct phase_bench_heartbeat_t {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool stop = false;
+    std::thread worker;
+    explicit phase_bench_heartbeat_t(long csd) {
+        if (!mpi_sieve_active()) return;
+        worker = std::thread([this, csd] {
+            std::unique_lock<std::mutex> lock(mutex);
+            while (!cv.wait_for(lock, std::chrono::seconds(60), [this] { return stop; })) {
+                // Local atomics/queue telemetry only. Never call MPI here.
+                const auto m = mpi_sieve_metrics();
+                printf("[PHASE-BENCH heartbeat] rank=%d csd=%ld buckets=%llu "
+                       "candidate_exchanges=%llu pending_bytes=%llu sent_bytes=%llu "
+                       "received_bytes=%llu processed_chunks=%llu\n",
+                       mpi_sieve_rank(), csd, (unsigned long long)m.buckets,
+                       (unsigned long long)m.candidate_exchanges,
+                       (unsigned long long)m.pending_candidate_bytes,
+                       (unsigned long long)m.sent_bytes, (unsigned long long)m.received_bytes,
+                       (unsigned long long)m.processed_chunks);
+                fflush(stdout);
+            }
+        });
+    }
+    ~phase_bench_heartbeat_t() {
+        { std::lock_guard<std::mutex> lock(mutex); stop = true; }
+        cv.notify_all();
+        if (worker.joinable()) worker.join();
     }
 };
 
@@ -49,6 +83,7 @@ int main(int argc, char **argv) {
     if (mpi_sieve_runtime_init(root.c_str(), 256, false, true)) MPI_Abort(MPI_COMM_WORLD, 2);
 #endif
     fs::current_path(scratch);
+    phase_bench_heartbeat_t heartbeat(dimension);
     for (const char *kind : {".pool", ".bucket", ".sol", ".uid"})
         for (int i = 0; i < hw::ssd_num; ++i) fs::create_directories(fs::path(kind)/hw::ssd_name_list[i]);
     _start_ck_allocator(); srand(1234+rank);

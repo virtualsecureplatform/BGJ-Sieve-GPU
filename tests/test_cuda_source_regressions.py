@@ -6,6 +6,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CudaSourceRegressionTests(unittest.TestCase):
+    def test_mpi_phase_heartbeat_is_local_only(self):
+        source = (ROOT / 'app' / 'bin_hd_phase_bench.cu').read_text()
+        heartbeat = source.split('struct phase_bench_heartbeat_t {', 1)[1].split('int main(', 1)[0]
+        self.assertIn('mpi_sieve_metrics()', heartbeat)
+        self.assertIn('processed_chunks=%llu', heartbeat)
+        self.assertNotIn('MPI_Allreduce', heartbeat)
+        self.assertNotIn('MPI_Send', heartbeat)
+
     def test_phase_scratch_is_claimed_before_mpi_initialization(self):
         source = (ROOT / "app" / "bin_hd_phase_bench.cu").read_text()
         self.assertLess(source.index('fs::create_directory(scratch, scratch_error)'),

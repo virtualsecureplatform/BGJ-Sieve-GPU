@@ -13,7 +13,9 @@ find_native() {
         next=""
         for pid in ${pending}; do
             executable="$(readlink "/proc/${pid}/exe" 2>/dev/null || true)"
-            if [[ "${executable}" == "${MPI_BINARY}" ]]; then
+            if [[ "${executable}" == "${MPI_BINARY}" ]] ||
+               { [[ -n "${MPI_HOST_RUNTIME:-}" && "${executable}" == "${MPI_HOST_RUNTIME}/ld-linux-x86-64.so.2" ]] &&
+                 grep -zFxq -- "${MPI_BINARY}" "/proc/${pid}/cmdline" 2>/dev/null; }; then
                 echo "${pid}"
                 return 0
             fi
