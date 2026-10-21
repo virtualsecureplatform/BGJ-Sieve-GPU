@@ -4,8 +4,8 @@ hostname
 id
 echo "memlock_kib=$(ulimit -l)"
 ls -ln /dev/infiniband
-rg '^(Cap|NoNewPrivs|Seccomp)' /proc/self/status || true
-rg 'infiniband|/dev ' /proc/self/mountinfo || true
+grep -E '^(Cap|NoNewPrivs|Seccomp)' /proc/self/status || true
+grep -E 'infiniband|/dev ' /proc/self/mountinfo || true
 python3 -c 'import glob,os
 for path in glob.glob("/dev/infiniband/*"):
     try:

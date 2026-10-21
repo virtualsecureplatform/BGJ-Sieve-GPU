@@ -2,7 +2,7 @@
 #SBATCH --job-name=bgj-mpi-transport-probe
 #SBATCH --partition=gr20100g
 #SBATCH --rsc=g=8
-#SBATCH --time=00:10:00
+#SBATCH --time=00:15:00
 #SBATCH --output=/LARGE0/gr20116/%u/BGJ-Sieve-GPU/logs/mpi/slurm-%x-%j.out
 set -euo pipefail
 : "${SOURCE_COMMIT:?}"
@@ -38,4 +38,26 @@ for mode in baseline host-rdma; do
     echo "${mode} returncode=${rc}"
     rg 'TRANSPORT-PROBE|ep_cfg|ERROR|WARN' "${RUN}/${mode}-bandwidth.log" || true
 done
+# The baseline proves user-namespace RDMA access fails even with providers.
+# Exercise the same runtime libraries without entering that namespace.
+REFERENCE="${MPI_BASE}/diagnostics/mpi-bkz-306261/source/app/hd_phase_bench_mpi"
+apptainer exec --nv --bind /opt/system,"${MPI_BASE}" "${MPI_SIF}" \
+    python3 "${SOURCE}/tools/bundle_mpi_runtime.py" "${REFERENCE}" "${RUN}/runtime"
+export MPI_HOST_RUNTIME="${RUN}/runtime" MPI_BINARY="${RUN}/probe"
+timeout --signal=TERM --kill-after=10 90 "${launch[@]}" bash \
+    "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" > "${RUN}/host-runtime-bandwidth.log" 2>&1
+rg 'TRANSPORT-PROBE|ep_cfg|ERROR|WARN' "${RUN}/host-runtime-bandwidth.log"
+# Fail instead of accepting another silent TCP fallback.
+if ! rg -q 'ep_cfg.*(rc_mlx5|rc_verbs|dc_mlx5)' "${RUN}/host-runtime-bandwidth.log"; then
+    echo "FAIL: host runtime did not select an RDMA transport" >&2; exit 2
+fi
+export MPI_BINARY="${REFERENCE}" APPTAINERENV_HD_FAIL_ON_SPILL=1
+export APPTAINERENV_HD_LAZY_SYNC=1 APPTAINERENV_HD_BWC_LAZY_SYNC=1 APPTAINERENV_HD_EAGER_HOST_ARENA=1
+export APPTAINERENV_HD_HBM_PWC_WRITEBACK=0 APPTAINERENV_HD_HBM_PWC_GB=0
+export APPTAINERENV_HD_HBM_BWC_GB=12 APPTAINERENV_HD_BGJ3_MIN_CSD=177
+timeout --signal=TERM --kill-after=10 300 "${launch[@]}" bash \
+    "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" \
+    "${MPI_BASE}/diagnostics/mpi-bkz-306261/tests/input.basis" 60 "${RUN}/host-runtime-smoke" \
+    > "${RUN}/host-runtime-smoke.log" 2>&1
+rg '\[PHASE-BENCH\]' "${RUN}/host-runtime-smoke.log"
 echo "Probe logs: ${RUN}"
