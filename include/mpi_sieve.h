@@ -58,10 +58,13 @@ int mpi_sieve_agree_basis(Lattice_QP *basis, const char *phase);
 int mpi_bkz_run(void *task_config);
 struct mpi_sieve_metrics_t {
     uint64_t buckets, candidate_exchanges, pending_candidate_bytes, sent_bytes, received_bytes, processed_chunks;
+    uint64_t candidate_highwater_bytes, candidate_wait_ns, swc_wait_ns, uid_wait_ns;
 };
 mpi_sieve_metrics_t mpi_sieve_metrics();
 // Worker-safe local telemetry only; never issues an MPI call.
 void mpi_sieve_note_progress(uint64_t chunks);
+void mpi_sieve_note_bucket_ready(long bucket);
+void mpi_sieve_note_bucket_started(long bucket);
 int mpi_sieve_control_test(Lattice_QP *basis, bool mismatch);
 int mpi_sieve_drain_buckets(bwc_manager_t *, swc_manager_t *, ut_checker_t *, int csd, long limit);
 

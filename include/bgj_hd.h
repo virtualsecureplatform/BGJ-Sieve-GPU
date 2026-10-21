@@ -342,6 +342,8 @@ struct swc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
 
     private:
     int32_t _num_ready;
+    // Async-only live SWC permits include pending prefetch and UID-held chunks.
+    long _mpi_live_chunks = 0;
     int32_t _num_writing;
     int32_t _num_rp, _num_rl;
     int32_t _num_wp, _num_wl;

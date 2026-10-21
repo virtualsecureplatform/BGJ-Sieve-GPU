@@ -46,7 +46,7 @@ monitor() {
                 if [[ -r "/proc/${native}/io" ]]; then
                     rg '^(rchar|wchar|read_bytes|write_bytes):' "/proc/${native}/io" || true
                 fi
-                if (( SECONDS >= next_stack )) && command -v gdb >/dev/null; then
+                if [[ "${BENCH_STACK_INSPECTION:-1}" == 1 ]] && (( SECONDS >= next_stack )) && command -v gdb >/dev/null; then
                     # A short attach perturbs timing slightly; these runs are
                     # diagnostic, not a clean performance claim.
                     timeout --signal=INT --kill-after=5 20 gdb -q -n -batch \

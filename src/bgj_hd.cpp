@@ -843,6 +843,7 @@ template <class logger_t> void bwc_manager_tmpl<logger_t>::bucket_finalize(long 
 
         pthread_spin_lock(&_bwc_lock);
         if (_num_ready_buckets < bwc_max_buckets) {
+            mpi_sieve_note_bucket_ready(bucket_id);
             _ready_bucket_id[_num_ready_buckets++] = bucket_id;
         } else {
             lg_err("ready list full(%d), GPU-native bucket %d discarded",
@@ -880,6 +881,7 @@ template <class logger_t> void bwc_manager_tmpl<logger_t>::bucket_finalize(long 
                                     (staged_in_hbm ? l0_bucket_t::_bk_hbm : 0);
         pthread_spin_lock(&_bwc_lock);
         if (_num_ready_buckets < bwc_max_buckets) {
+            mpi_sieve_note_bucket_ready(bucket_id);
             _ready_bucket_id[_num_ready_buckets++] = bucket_id;
         } else {
             lg_err("ready list full(%d), bucket %d discarded", _num_ready_buckets, bucket_id);
@@ -1436,6 +1438,10 @@ template <class logger_t> void swc_manager_tmpl<logger_t>::__prefetch_for_writin
 
     pthread_spin_lock(&_swc_lock);
     int to_prefetch = swc_auto_prefetch_for_write - _num_wl_ptr_vol[0] - _num_wp_ptr_vol[0];
+    if (mpi_sieve_async()) {
+        const long available = _max_cached_chunks - _mpi_live_chunks;
+        if (to_prefetch > available) to_prefetch = available;
+    }
     if (to_prefetch > _max_cached_chunks - _num_writing - _num_wl - _num_wp)
         to_prefetch = _max_cached_chunks - _num_writing - _num_wl - _num_wp;
     if (to_prefetch <= 0) {
@@ -1444,6 +1450,7 @@ template <class logger_t> void swc_manager_tmpl<logger_t>::__prefetch_for_writin
         return;
     }
     _num_wl += to_prefetch;
+    if (mpi_sieve_async()) _mpi_live_chunks += to_prefetch;
     pthread_spin_unlock(&_swc_lock);
 
     int32_t num_fail = 0;
@@ -1470,6 +1477,7 @@ template <class logger_t> void swc_manager_tmpl<logger_t>::__prefetch_for_writin
         lg_err("%d of %d new chunk already in use?", num_fail, to_prefetch);
         pthread_spin_lock(&_swc_lock);
         _num_wl -= num_fail;
+        if (mpi_sieve_async()) _mpi_live_chunks -= num_fail;
         pthread_spin_unlock(&_swc_lock);
     }
     lg_exit();
@@ -1645,6 +1653,7 @@ template <class logger_t> chunk_t *swc_manager_tmpl<logger_t>::fetch_for_write()
         }
 
         __prefetch_for_writing();
+        if (!ret && mpi_sieve_async()) usleep(1000);
     }
 
     #if ENABLE_PROFILING
@@ -1708,6 +1717,11 @@ template <class logger_t> void swc_manager_tmpl<logger_t>::write_done(chunk_t *c
 template <class logger_t> void swc_manager_tmpl<logger_t>::read_done(chunk_t *chunk) {
     lg_init();
     release_del(chunk->id);
+    if (mpi_sieve_async()) {
+        pthread_spin_lock(&_swc_lock);
+        --_mpi_live_chunks;
+        pthread_spin_unlock(&_swc_lock);
+    }
     lg_exit();
 }
 

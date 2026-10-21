@@ -13,6 +13,14 @@ struct candidate_queue_t {
 std::mutex g_producer_mutex;
 std::map<int, std::unique_ptr<candidate_queue_t>> g_producers;
 std::atomic<uint64_t> g_pipeline_pending{0}, g_pipeline_highwater{0};
+std::atomic<uint64_t> g_ready_batches{0};
+std::atomic<uint64_t> g_candidate_wait_ns{0}, g_swc_wait_ns{0}, g_uid_wait_ns{0}, g_crc_ns{0};
+std::atomic<uint64_t> g_bucket_ready_ns[bwc_manager_t::bwc_max_buckets];
+std::atomic<uint64_t> g_bucket_wait_ns{0}, g_bucket_started{0};
+uint64_t pipeline_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 uint64_t normalized_uid(uint64_t uid) {
     return uid > UINT64_MAX / 2 + 1 ? -uid : uid;
@@ -29,6 +37,7 @@ candidate_queue_t *producer_queue(int producer) {
 // the producer queue. This also bounds work held by packing/TX workers.
 void reserve_candidate_bytes(size_t bytes) {
     static std::atomic<bool> reported{false};
+    const auto start = pipeline_now_ns();
     for (;;) {
         uint64_t pending = g_pipeline_pending.load(std::memory_order_relaxed);
         if (pending + bytes <= g_candidate_limit &&
@@ -36,6 +45,7 @@ void reserve_candidate_bytes(size_t bytes) {
             uint64_t high = g_pipeline_highwater.load();
             while (high < pending + bytes &&
                    !g_pipeline_highwater.compare_exchange_weak(high, pending + bytes)) {}
+            g_candidate_wait_ns += pipeline_now_ns()-start;
             return;
         }
         if (!reported.exchange(true)) {
@@ -83,6 +93,7 @@ int pipeline_filter(int csd, int8_t *vec, int32_t *norm, uint16_t *score,
         }
         std::lock_guard<std::mutex> lock(queue->mutex);
         queue->batches.emplace_back(std::move(batch));
+        g_ready_batches.fetch_add(1, std::memory_order_release);
     }
     int local = 0;
     for (int i = 0; i < size; ++i) {
@@ -154,6 +165,8 @@ struct pipeline_t {
     bool published_done = false, received_done = false;
     unsigned test_delay_us = 0;
     std::atomic<bool> test_corrupt{false};
+    uint64_t swc0 = g_swc_wait_ns.load(), uid0 = g_uid_wait_ns.load(), crc0 = g_crc_ns.load();
+    uint64_t bucket_wait0 = g_bucket_wait_ns.load(), bucket_start0 = g_bucket_started.load();
 
     static constexpr int data_tag(int channel, int slot) { return 5100 + channel*8 + slot; }
     static constexpr int ack_tag(int channel, int slot) { return 5104 + channel*8 + slot; }
@@ -229,12 +242,7 @@ struct pipeline_t {
         return true;
     }
     bool candidates_ready() {
-        std::lock_guard<std::mutex> producers(g_producer_mutex);
-        for (auto &entry : g_producers) {
-            std::lock_guard<std::mutex> lock(entry.second->mutex);
-            if (!entry.second->batches.empty()) return true;
-        }
-        return false;
+        return g_ready_batches.load(std::memory_order_acquire) != 0;
     }
     void pack(pipeline_slot_t &slot, int c) {
         const auto start = std::chrono::steady_clock::now();
@@ -253,20 +261,29 @@ struct pipeline_t {
         } else {
             // One worker takes a batch as an indivisible columnar block. Its
             // charge moves to this slot and is returned only on peer ACK.
-            std::lock_guard<std::mutex> producers(g_producer_mutex);
-            for (auto &entry : g_producers) {
-                std::lock_guard<std::mutex> lock(entry.second->mutex);
-                auto &batches = entry.second->batches;
+            h.part = slot.part;
+            std::vector<candidate_queue_t *> queues;
+            {
+                std::lock_guard<std::mutex> producers(g_producer_mutex);
+                for (auto &entry : g_producers) queues.push_back(entry.second.get());
+            }
+            for (auto *queue : queues) {
+                std::lock_guard<std::mutex> lock(queue->mutex);
+                auto &batches = queue->batches;
                 while (!batches.empty() && h.bytes + batches.front().size() <= capacity) {
                     const auto &batch = batches.front();
                     memcpy(payload + h.bytes, batch.data(), batch.size());
                     h.bytes += batch.size();
                     batches.pop_front();
+                    g_ready_batches.fetch_sub(1);
                 }
             }
             slot.charged = h.bytes;
+            if (h.bytes) ++slot.part;
         }
+        const auto crc_start = pipeline_now_ns();
         h.checksum = checksum64(payload, h.bytes);
+        g_crc_ns += pipeline_now_ns()-crc_start;
         if (h.bytes && test_corrupt.exchange(false)) payload[0] ^= 1;
         slot.header = h;
         memcpy(slot.data, &h, sizeof(h));
@@ -278,7 +295,10 @@ struct pipeline_t {
         if (test_delay_us) usleep(test_delay_us);
         const auto &h = slot.header;
         const uint8_t *payload = slot.data + sizeof(h);
-        if (checksum64(payload, h.bytes) != h.checksum)
+        const auto crc_start = pipeline_now_ns();
+        const auto checksum = checksum64(payload, h.bytes);
+        g_crc_ns += pipeline_now_ns()-crc_start;
+        if (checksum != h.checksum)
             throw std::runtime_error("payload checksum mismatch");
         // Validate the entire frame before touching cache state.
         const size_t stride = csd + (c ? 14 : 4);
@@ -304,12 +324,23 @@ struct pipeline_t {
                 if (bwc->mpi_append_bucket_soa(ids[index], block, block+count*4, count))
                     throw std::runtime_error("bucket import");
             } else {
-                if (!swc || !ut) throw std::runtime_error("unexpected candidates");
                 const uint8_t *uids = block, *norms = block+count*8;
                 const uint8_t *scores = norms+count*4, *vectors = scores+count*2;
+                if (g_replay_seen) {
+                    for (uint32_t j = 0; j < count; ++j) {
+                        uint64_t uid; int32_t norm; uint16_t score;
+                        memcpy(&uid,uids+j*8,8); memcpy(&norm,norms+j*4,4); memcpy(&score,scores+j*2,2);
+                        replay_candidate(uid,norm,score,vectors+(long)j*csd);
+                    }
+                    offset += count*stride;
+                    continue;
+                }
+                if (!swc || !ut) throw std::runtime_error("unexpected candidates");
                 for (uint32_t pos = 0; pos < count;) {
                     if (!dst) {
+                        const auto wait = pipeline_now_ns();
                         dst = swc->fetch_for_write();
+                        g_swc_wait_ns += pipeline_now_ns()-wait;
                         if (!dst) throw std::runtime_error("SWC import");
                         _normalize_chunk(dst, csd);
                     }
@@ -321,7 +352,9 @@ struct pipeline_t {
                     memcpy(dst->vec+(long)dst->size*csd, vectors+(long)pos*csd, n*csd);
                     dst->size += n; pos += n;
                     if (dst->size == Pool_hd_t::chunk_max_nvecs) {
+                        const auto wait = pipeline_now_ns();
                         ut->task_commit(dst);
+                        g_uid_wait_ns += pipeline_now_ns()-wait;
                         dst = nullptr;
                     }
                 }
@@ -331,7 +364,9 @@ struct pipeline_t {
         if (dst) {
             memset(dst->score+dst->size, 0, (Pool_hd_t::chunk_max_nvecs-dst->size)*2);
             memset(dst->norm+dst->size, 0, (Pool_hd_t::chunk_max_nvecs-dst->size)*4);
+            const auto wait = pipeline_now_ns();
             ut->task_commit(dst);
+            g_uid_wait_ns += pipeline_now_ns()-wait;
         }
         if (!c && h.final) {
             bwc->bucket_finalize(ids[index]);
@@ -355,7 +390,8 @@ struct pipeline_t {
             const auto &h = slot.header;
             if (h.magic != wire_magic || h.version != 3 || h.kind != c || h.csd != uint32_t(csd) ||
                 h.wave != base || h.final > 1 || h.bytes != bytes-sizeof(h) ||
-                h.bytes > slot.capacity-sizeof(h) || (c && !h.bytes))
+                h.bytes > slot.capacity-sizeof(h) || (c && (!h.bytes || h.final || h.bucket)) ||
+                (!c && !h.bytes && !h.final))
                 throw std::runtime_error("invalid pipeline header");
             if (!c) {
                 const uint64_t index = h.bucket-base;
@@ -366,10 +402,12 @@ struct pipeline_t {
                 bucket_lane[index] = k;
                 bucket_done[index] = h.final;
             }
+            if (c && h.part != slot.part++) throw std::runtime_error("candidate frame sequence mismatch");
             work(slot, c, [this, &slot, c] { apply(slot,c); });
         } else if (slot.state == 1 && slot.worked.load(std::memory_order_acquire)) {
             g_recv_bytes += slot.header.bytes; ++applied[c];
-            slot.ack = applied[c]; // Content irrelevant: one ACK per slot reuse.
+            slot.ack = slot.header.checksum ^ slot.header.part ^ slot.header.bucket ^
+                       slot.header.wave ^ (uint64_t(c)<<63);
             post_receive(c,k);
             check(MPI_Isend(&slot.ack, 1, MPI_UINT64_T, 1-g_rank, ack_tag(c,k),
                             MPI_COMM_WORLD, &slot.ack_request));
@@ -382,6 +420,9 @@ struct pipeline_t {
             const bool data_done = complete(slot.data_request);
             const bool ack_done = complete(slot.ack_request);
             if (!data_done || !ack_done) return;
+            if (slot.ack != (slot.header.checksum ^ slot.header.part ^ slot.header.bucket ^
+                             slot.header.wave ^ (uint64_t(c)<<63)))
+                throw std::runtime_error("frame acknowledgement mismatch");
             if (c) g_pipeline_pending.fetch_sub(slot.charged);
             slot.charged = 0; slot.state = 0;
         }
@@ -433,6 +474,8 @@ struct pipeline_t {
                 received_done = true;
                 if (peer_done.wave != base) throw std::runtime_error("done epoch mismatch");
             }
+            if (received_done && (applied[0] > peer_done.bucket_frames || applied[1] > peer_done.candidate_frames))
+                throw std::runtime_error("done frame count mismatch");
             if (published_done && received_done && complete(done_send) && !insertion_active &&
                 applied[0] == peer_done.bucket_frames && applied[1] == peer_done.candidate_frames) break;
             if (std::chrono::steady_clock::now()-start > std::chrono::hours(1))
@@ -454,5 +497,183 @@ struct pipeline_t {
                (unsigned long long)sent[0], (unsigned long long)sent[1],
                (unsigned long long)g_pipeline_highwater.load());
         fflush(stdout);
+        const auto starts = g_bucket_started.load()-bucket_start0;
+        printf("[MPI-PRESSURE] rank=%d wave=%llu checksum_worker_s=%.6f swc_wait_s=%.6f "
+               "uid_commit_wait_s=%.6f ready_to_dequeue_mean_ms=%.6f dequeued=%llu\n",
+               g_rank,(unsigned long long)base,(g_crc_ns.load()-crc0)*1e-9,
+               (g_swc_wait_ns.load()-swc0)*1e-9,(g_uid_wait_ns.load()-uid0)*1e-9,
+               starts ? (g_bucket_wait_ns.load()-bucket_wait0)*1e-6/starts : 0.0,
+               (unsigned long long)starts);
+        fflush(stdout);
     }
 };
+
+// Representative deterministic ~70--75 MiB peer fragments, bidirectional
+// candidate traffic, and partial tails. Preparation/verification are untimed.
+int pipeline_replay() {
+    const char *dim_env = getenv("HD_MPI_REPLAY_CSD");
+    const int dim = dim_env ? atoi(dim_env) : 128;
+    if ((dim != 128 && dim != 144) || dim > Pool_hd_t::host_vec_nbytes)
+        throw std::runtime_error("replay requires supported CSD128 or CSD144");
+    NTL::Mat<NTL::ZZ> identity; identity.SetDims(167,167);
+    for (int i = 0; i < 167; ++i) identity[i][i] = 1;
+    Lattice_QP basis(identity);
+    Pool_hd_t pool(&basis);
+    if (pool.set_sieving_context(167-dim,167)) throw std::runtime_error("replay context");
+    bwc_manager_t buckets(&pool);
+    constexpr int nb = 32;
+    const long n = 64*Pool_hd_t::chunk_max_nvecs+17;
+    std::vector<int32_t> ids(nb), norms(Pool_hd_t::chunk_max_nvecs);
+    std::vector<int8_t> vectors(Pool_hd_t::chunk_max_nvecs*dim);
+    std::vector<uint64_t> uids(Pool_hd_t::chunk_max_nvecs);
+    std::vector<uint16_t> scores(Pool_hd_t::chunk_max_nvecs);
+    for (int b = 0; b < nb; ++b) {
+        ids[b] = buckets.push_bucket();
+        for (long begin = 0; begin < n; begin += Pool_hd_t::chunk_max_nvecs) {
+            const long count = std::min(Pool_hd_t::chunk_max_nvecs,n-begin);
+            for (long j = 0; j < count; ++j) {
+                const long value = (g_rank*nb+b)*n+begin+j;
+                norms[j] = value+1;
+                memset(vectors.data()+j*dim,int8_t(value%251-125),dim);
+            }
+            if (buckets.mpi_append_bucket_soa(ids[b],(uint8_t *)norms.data(),
+                                             (uint8_t *)vectors.data(),count))
+                throw std::runtime_error("replay fixture append");
+        }
+    }
+    const long candidates = 32*Pool_hd_t::chunk_max_nvecs+31;
+    std::vector<uint8_t> seen(candidates,0);
+    g_replay_csd = dim; g_replay_seen = &seen;
+    for (long begin = 0; begin < candidates; begin += Pool_hd_t::chunk_max_nvecs) {
+        const long count = std::min(Pool_hd_t::chunk_max_nvecs,candidates-begin);
+        for (long j = 0; j < count; ++j) {
+            const long value = begin+j;
+            uids[j] = (value+1)*2+(1-g_rank);
+            norms[j] = value+1; scores[j] = 1+value%65534;
+            memset(vectors.data()+j*dim,int8_t(value%251-125),dim);
+        }
+        if (mpi_sieve_filter_candidates(dim,vectors.data(),norms.data(),scores.data(),uids.data(),count,0))
+            throw std::runtime_error("replay candidate routing");
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    const double start = MPI_Wtime();
+    if (mpi_sieve_exchange_buckets(&buckets,nullptr,nullptr,ids.data(),nb,dim))
+        throw std::runtime_error("replay exchange");
+    const double local_seconds = MPI_Wtime()-start;
+    double seconds = 0;
+    MPI_Allreduce(&local_seconds,&seconds,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+    if (std::count(seen.begin(),seen.end(),uint8_t(1)) != candidates)
+        throw std::runtime_error("replay missing candidates");
+    uint64_t found = 0;
+    for (int id; (id = buckets.pop_bucket()) >= 0;) {
+        const auto it = std::find(ids.begin(),ids.end(),id);
+        if (it == ids.end()) throw std::runtime_error("replay unexpected bucket");
+        const int b = it-ids.begin();
+        std::vector<uint8_t> bucket_seen(n*2,0);
+        while (chunk_t *chunk = buckets.fetch_for_read(id)) {
+            for (int j = 0; j < chunk->size; ++j) {
+                const long value = chunk->norm[j]-1;
+                const long source = value/(nb*n), offset = value%n;
+                if (value < 0 || source > 1 || (value/n)%nb != b || bucket_seen[source*n+offset])
+                    throw std::runtime_error("replay bucket identity mismatch");
+                bucket_seen[source*n+offset] = 1; ++found;
+                for (int k = 0; k < dim; ++k)
+                    if (chunk->vec[(long)j*dim+k] != int8_t(value%251-125))
+                        throw std::runtime_error("replay bucket coordinate mismatch");
+            }
+            buckets.read_done(chunk,id);
+        }
+        buckets.bucket_finalize(id);
+        if (std::count(bucket_seen.begin(),bucket_seen.end(),uint8_t(1)) != 2*n)
+            throw std::runtime_error("replay bucket missing records");
+    }
+    found = mpi_sieve_global_u64(found);
+    if (found != uint64_t(nb*n*2)) throw std::runtime_error("replay missing buckets");
+    g_replay_seen = nullptr;
+    if (!g_rank) {
+        printf("[MPI-REPLAY] csd=%d mode=%s elapsed_seconds=%.9f bucket_records=%llu candidate_records=%ld\n",
+               dim,g_async_mode ? "async" : "legacy",seconds,(unsigned long long)found,candidates*2);
+        fflush(stdout);
+    }
+    return 0;
+}
+
+int pipeline_cache_pressure(Lattice_QP *basis) {
+    if (!g_async_mode) throw std::runtime_error("cache pressure test requires async pipeline");
+    Pool_hd_t pool(basis);
+    if (pool.set_sieving_context(basis->NumRows()-60,basis->NumRows()))
+        throw std::runtime_error("cache test context");
+    bwc_manager_t buckets(&pool);
+    swc_manager_t solutions(&pool);
+    solutions.set_max_cached_chunks(256);
+    pthread_spinlock_t stats_lock;
+    pthread_spin_init(&stats_lock,PTHREAD_PROCESS_PRIVATE);
+    uint64_t checked = 0, fresh = 0;
+    ut_checker_t checker(ut_checker_t::type_sieve,&pool,pool.uid_table,(pwc_manager_t *)&solutions);
+    checker.set_num_threads(8); checker.set_max_holding(8); checker.set_exp_batch(4);
+    checker.set_stuck_stat(&checked,&fresh,stats_lock);
+    const int32_t ids[2] = {int32_t(buckets.push_bucket()),int32_t(buckets.push_bucket())};
+    constexpr long total = 262144;
+    const uint64_t initial_uids = pool.uid_table->size();
+    std::vector<uint8_t> seen(total,0);
+    std::atomic<int> produced{0};
+    std::atomic<bool> stop{false};
+    long highwater = 0;
+    std::thread consumer([&] {
+        bool draining = false;
+        for (;;) {
+            const long live = solutions.num_using();
+            highwater = std::max(highwater,live);
+            if (live >= 240 || stop.load()) draining = true;
+            checker.trigger_batch();
+            if (draining) {
+                if (chunk_t *chunk = solutions.fetch_for_read()) {
+                    for (int j = 0; j < chunk->size; ++j) {
+                        const uint64_t index = (chunk->u[j]-g_rank)/2-1;
+                        if (index >= total || seen[index] || chunk->u[j]%2 != uint64_t(g_rank) ||
+                            chunk->norm[j] != int32_t(index+1) || chunk->score[j] != 1+index%65534)
+                            std::abort();
+                        for (int k = 0; k < 60; ++k)
+                            if (chunk->vec[j*60+k] != int8_t(index%251-125)) std::abort();
+                        seen[index] = 1;
+                    }
+                    solutions.read_done(chunk);
+                    usleep(2000); // Slow independent consumer: force SWC pressure.
+                }
+            }
+            if (produced.load() == 2)
+                for (int id; (id = buckets.pop_bucket()) >= 0;) buckets.bucket_finalize(id);
+            if (stop.load() && !solutions.num_ready()) break;
+            usleep(1000);
+        }
+    });
+    std::thread producers[2];
+    for (int producer = 0; producer < 2; ++producer) producers[producer] = std::thread([&,producer] {
+        std::vector<uint64_t> uid(8192);
+        std::vector<int32_t> norm(8192);
+        std::vector<uint16_t> score(8192);
+        std::vector<int8_t> vec(8192*60);
+        for (long begin = producer*(total/2); begin < (producer+1)*(total/2); begin += 8192) {
+            for (long j = 0; j < 8192; ++j) {
+                const long index = begin+j;
+                uid[j] = (index+1)*2+(1-g_rank); norm[j] = index+1; score[j] = 1+index%65534;
+                memset(vec.data()+j*60,int8_t(index%251-125),60);
+            }
+            if (mpi_sieve_filter_candidates(60,vec.data(),norm.data(),score.data(),uid.data(),8192,producer))
+                std::abort();
+        }
+        produced.fetch_add(1);
+    });
+    if (mpi_sieve_exchange_buckets(&buckets,&solutions,&checker,ids,2,60)) std::abort();
+    for (auto &producer : producers) producer.join();
+    checker.input_done(); checker.wait_work();
+    stop.store(true); consumer.join();
+    if (highwater < 240 || std::count(seen.begin(),seen.end(),uint8_t(1)) != total ||
+        pool.uid_table->size() != initial_uids+total || g_pipeline_pending.load())
+        throw std::runtime_error("cache/UID pressure test lost records or did not reach pressure");
+    printf("PASS: async SWC/UID pressure rank=%d records=%ld SWC_highwater=%ld/256 UID_holding=8\n",
+           g_rank,total,highwater); fflush(stdout);
+    // checker owns no further work; its destructor joins worker task tails.
+    pthread_spin_destroy(&stats_lock);
+    return 0;
+}

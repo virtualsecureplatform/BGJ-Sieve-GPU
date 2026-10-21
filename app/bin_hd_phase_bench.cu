@@ -35,12 +35,15 @@ struct phase_bench_heartbeat_t {
                 const auto m = mpi_sieve_metrics();
                 printf("[PHASE-BENCH heartbeat] rank=%d csd=%ld buckets=%llu "
                        "candidate_exchanges=%llu pending_bytes=%llu sent_bytes=%llu "
-                       "received_bytes=%llu processed_chunks=%llu\n",
+                       "received_bytes=%llu processed_chunks=%llu candidate_highwater=%llu "
+                       "candidate_wait_s=%.3f swc_wait_s=%.3f uid_wait_s=%.3f\n",
                        mpi_sieve_rank(), csd, (unsigned long long)m.buckets,
                        (unsigned long long)m.candidate_exchanges,
                        (unsigned long long)m.pending_candidate_bytes,
                        (unsigned long long)m.sent_bytes, (unsigned long long)m.received_bytes,
-                       (unsigned long long)m.processed_chunks);
+                       (unsigned long long)m.processed_chunks,
+                       (unsigned long long)m.candidate_highwater_bytes,
+                       m.candidate_wait_ns*1e-9,m.swc_wait_ns*1e-9,m.uid_wait_ns*1e-9);
                 fflush(stdout);
             }
         });

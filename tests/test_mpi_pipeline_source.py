@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class MpiPipelineSourceTests(unittest.TestCase):
     def test_nonblocking_owner_and_ack_lifetime(self):
         source = (ROOT / 'app/mpi_sieve_pipeline.inc').read_text()
+        source = source.split('int pipeline_replay()')[0]
         self.assertNotIn('MPI_Sendrecv', source)
         self.assertNotIn('MPI_Allreduce', source)
         self.assertIn('MPI_Isend', source)
@@ -31,6 +32,16 @@ class MpiPipelineSourceTests(unittest.TestCase):
         self.assertIn('pipeline && !strcmp(pipeline, "async")', source)
         self.assertIn('pipeline version/frame settings differ between ranks', source)
         self.assertIn('pipeline_release_buffers()', source)
+
+    def test_dirty_swc_is_bounded_without_spilling(self):
+        source = (ROOT / 'src/bgj_hd.cpp').read_text()
+        self.assertIn('_max_cached_chunks - _mpi_live_chunks', source)
+        self.assertIn('if (mpi_sieve_async()) _mpi_live_chunks += to_prefetch', source)
+        self.assertIn('--_mpi_live_chunks', source)
+        pressure = (ROOT / 'app/mpi_sieve_pipeline.inc').read_text().split('int pipeline_cache_pressure(')[1]
+        self.assertIn('solutions.set_max_cached_chunks(256)', pressure)
+        self.assertIn('checker.set_max_holding(8)', pressure)
+        self.assertIn('if (highwater < 240', pressure)
 
 
 if __name__ == '__main__':

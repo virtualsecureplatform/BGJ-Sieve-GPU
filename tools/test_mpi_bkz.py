@@ -63,6 +63,21 @@ def main():
     run('control', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': '1'})
     run('control-batched', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': '1'}, frame_mib=8)
     if os.environ.get('APPTAINERENV_HD_MPI_PIPELINE') == 'async':
+        mismatch_wrapper = args.root/'mode-mismatch.sh'
+        mismatch_wrapper.write_text('#!/bin/bash\nset -euo pipefail\n'
+            'if [[ "${SLURM_PROCID}" == 1 ]]; then export APPTAINERENV_HD_MPI_PIPELINE=legacy; fi\n'
+            'exec "${MPI_TEST_WRAPPER:?}" "$@"\n')
+        mismatch_wrapper.chmod(0o755)
+        original_wrapper = launch[-1]
+        launch[-1] = str(mismatch_wrapper)
+        try:
+            mismatch = run('pipeline-mode-mismatch', pump, {'MPI_TEST_WRAPPER': str(args.wrapper)}, expected=None)
+            assert 'pipeline version/frame settings differ' in (mismatch/'test.log').read_text()
+        finally:
+            launch[-1] = original_wrapper
+        cache = run('pipeline-cache-pressure', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': '1',
+                    'APPTAINERENV_HD_MPI_PIPELINE_CACHE_TEST': '1'})
+        assert 'PASS: async SWC/UID pressure' in (cache/'test.log').read_text()
         run('control-delayed', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': '1',
                                      'APPTAINERENV_HD_MPI_PIPELINE_TEST_DELAY_US': '2000'})
         corrupted = run('control-corrupt-frame', pump, {

@@ -29,6 +29,11 @@ SOURCE="${VALIDATED_BUILD}/source"
 # Reuse only binaries from the exact source that passed validation.
 git -C "${SLURM_SUBMIT_DIR}" show "${SOURCE_COMMIT}:app/bin_hd_phase_bench.cu" | cmp - "${SOURCE}/app/bin_hd_phase_bench.cu"
 git -C "${SLURM_SUBMIT_DIR}" show "${SOURCE_COMMIT}:app/mpi_sieve_runtime.cpp" | cmp - "${SOURCE}/app/mpi_sieve_runtime.cpp"
+if git -C "${SLURM_SUBMIT_DIR}" cat-file -e "${SOURCE_COMMIT}:app/mpi_sieve_pipeline.inc" 2>/dev/null; then
+    git -C "${SLURM_SUBMIT_DIR}" show "${SOURCE_COMMIT}:app/mpi_sieve_pipeline.inc" | cmp - "${SOURCE}/app/mpi_sieve_pipeline.inc"
+else
+    test ! -e "${SOURCE}/app/mpi_sieve_pipeline.inc"
+fi
 test -x "${SOURCE}/app/${BINARY}"
 export MPI_LIBDIR="$(mpicxx --showme:link | tr ' ' '\n' | sed -n 's/^-L//p' | head -1)"
 export OMPI_MCA_pml=ucx OMPI_MCA_osc=ucx OMPI_MCA_pml_ucx_tls=any OMPI_MCA_pml_ucx_devices=any PMIX_MCA_gds=hash

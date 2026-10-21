@@ -12,6 +12,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <filesystem>
@@ -48,6 +49,20 @@ std::atomic<uint64_t> g_wire_exchanges{0};
 double g_mpi_seconds = 0.0;
 uint8_t *g_send_frame = nullptr;
 uint8_t *g_recv_frame = nullptr;
+// Frozen replay uses the same wire/packing paths, but an exact-record oracle
+// instead of the UID/SWC consumer. Never enabled in normal sieve phases.
+std::vector<uint8_t> *g_replay_seen = nullptr;
+int g_replay_csd = 0;
+void replay_candidate(uint64_t uid, int32_t norm, uint16_t score, const uint8_t *vec) {
+    const uint64_t index = (uid-g_rank)/2-1;
+    if (uid%2 != uint64_t(g_rank) || index >= g_replay_seen->size() || (*g_replay_seen)[index] ||
+        norm != int32_t(index+1) || score != 1+index%65534)
+        throw std::runtime_error("replay candidate identity/metadata mismatch");
+    for (int j = 0; j < g_replay_csd; ++j)
+        if (int8_t(vec[j]) != int8_t(index%251-125))
+            throw std::runtime_error("replay candidate coordinate mismatch");
+    (*g_replay_seen)[index] = 1;
+}
 
 constexpr int tag_bucket_count = 4100;
 constexpr int tag_bucket_data = 4101;
@@ -144,6 +159,15 @@ int commit_candidates(const std::vector<uint8_t> &records, int csd,
     const int stride = csd + 14;
     if (records.size() % stride) return -1;
     const long count = records.size() / stride;
+    if (g_replay_seen) {
+        for (long i = 0; i < count; ++i) {
+            const uint8_t *p = records.data()+i*stride;
+            uint64_t uid; int32_t norm; uint16_t score;
+            memcpy(&uid,p,8); memcpy(&norm,p+8,4); memcpy(&score,p+12,2);
+            replay_candidate(uid,norm,score,p+14);
+        }
+        return 0;
+    }
     chunk_t *dst = nullptr;
     for (long i = 0; i < count; ++i) {
         if (!dst) {
@@ -318,15 +342,30 @@ mpi_sieve_metrics_t mpi_sieve_metrics() {
     std::lock_guard<std::mutex> lock(g_candidate_mutex);
     return {g_bucket_sequence.load(), g_candidate_sequence.load(),
             g_async_mode ? g_pipeline_pending.load() : g_remote_candidates.size(),
-            g_sent_bytes.load(), g_recv_bytes.load(), g_processed_chunks.load()};
+            g_sent_bytes.load(), g_recv_bytes.load(), g_processed_chunks.load(),
+            g_pipeline_highwater.load(), g_candidate_wait_ns.load(), g_swc_wait_ns.load(), g_uid_wait_ns.load()};
 }
 void mpi_sieve_note_progress(uint64_t chunks) { g_processed_chunks.fetch_add(chunks, std::memory_order_relaxed); }
+void mpi_sieve_note_bucket_ready(long bucket) {
+    if (g_async_mode && bucket >= 0 && bucket < bwc_manager_t::bwc_max_buckets)
+        g_bucket_ready_ns[bucket].store(pipeline_now_ns(), std::memory_order_release);
+}
+void mpi_sieve_note_bucket_started(long bucket) {
+    if (!g_async_mode || bucket < 0 || bucket >= bwc_manager_t::bwc_max_buckets) return;
+    const auto ready = g_bucket_ready_ns[bucket].exchange(0, std::memory_order_acq_rel);
+    if (ready) {
+        g_bucket_wait_ns += pipeline_now_ns()-ready;
+        g_bucket_started.fetch_add(1);
+    }
+}
 bool mpi_sieve_async() { return g_async_mode; }
 void mpi_sieve_set_pipeline_callbacks(void *context, void (*ready)(void *), bool (*service)(void *, bool)) {
     g_pipeline_callbacks = {context, ready, service};
 }
 
 int mpi_sieve_control_test(Lattice_QP *basis, bool mismatch) {
+    if (getenv("HD_MPI_PIPELINE_CACHE_TEST")) return pipeline_cache_pressure(basis);
+    if (getenv("HD_MPI_PIPELINE_REPLAY")) return pipeline_replay();
     {
         // Regression for the cold CSD128 failure: 38,712 pool chunks, but
         // only 13,273 SWC slots despite ample unused PWC reservation.

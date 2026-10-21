@@ -32,16 +32,38 @@ remain the recovery point. Checkpoint source-identity checks are not relaxed.
 `[MPI-PIPELINE]` reports per-wave elapsed time, packing/bucket-application/
 candidate-application worker times, frame counts and candidate high-water
 bytes. Worker times overlap and must not be added to infer elapsed time.
+`[MPI-PRESSURE]` separates checksum work, SWC acquisition waits, UID commit
+waits and ready-to-dequeue latency; benchmark heartbeats expose pressure
+counters even before a wave completes.
 
 Validation uses `VALIDATE_PIPELINES="legacy async"` with the existing
 `mpi_bkz_validate.sbatch` allocation and the validated `MPI_HOST_RUNTIME`.
 It runs serial/MPI CSD60 frontend tests and the full MPI/BKZ suite for each
 mode; async additionally tests delayed application and corrupted frames.
+An additional async test limits the real SWC to 256 chunks and the real UID
+checker to eight held chunks, with two concurrent producers and a delayed
+independent consumer. It must reach cache pressure and deliver every record
+without spilling. Async SWC prefetch reserves live-chunk permits, including
+UID-held and pending-prefetch chunks, and waits instead of growing past its
+cache capacity.
+After validation, `mpi_pipeline_replay.sbatch` uses that exact build for one
+warmup pair and three alternating measured pairs per dimension. Its
+`summary.json` records the medians and fails the job if either dimension
+misses the performance threshold. The replay verifies every coordinate,
+norm, candidate score and UID, plus missing/duplicate records, without disk
+spill; actual UID/SWC behavior remains covered by the GPU integration suite.
 Larger runs must remain disabled until frozen-data CSD128/CSD144 replay shows
 at least 20% lower median elapsed time over three alternating pairs, and the
 same cold seed-38 CSD128 phase completes within three hours without spill or
 integrity errors. A completed benchmark alone does not establish a speedup
 over the single-node implementation.
+
+`submit_mpi_pipeline_validation.sh` submits the complete sequential chain
+with `SOURCE_COMMIT` and `MPI_HOST_RUNTIME` supplied: one-GPU compile, two-node
+async/legacy integration, two-node replay, then cold CSD128 only if replay
+passes. Dependencies prevent overlapping node allocations; failed gates
+cancel later jobs. Timing runs disable debugger attachment. No BKZ144 job is
+submitted by this helper.
 
 ## Existing topology and checkpoint behavior
 

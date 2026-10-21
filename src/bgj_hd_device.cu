@@ -5267,6 +5267,7 @@ int Reducer_t::_reduce(int tid) {
         red_lock.unlock();
 
         if ((flag & (flag_stop | flag_stop_now)) && bucket_id == -1) break;
+        mpi_sieve_note_bucket_started(bucket_id);
 
         _signal_bucket_done();
 
