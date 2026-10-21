@@ -19,9 +19,13 @@ export OMPI_MCA_pml=ucx OMPI_MCA_osc=ucx OMPI_MCA_pml_ucx_tls=any OMPI_MCA_pml_u
 launch=(srun --mpi=pmix_v2 --immediate=60 --nodes=2 --ntasks=2 --ntasks-per-node=1
         --gpus=8 --gres=gpu:4 --cpus-per-task=128 --cpu-bind=none --kill-on-bad-exit=1)
 "${launch[@]}" "${MPI_PREFIX}/bin/ucx_info" -d > "${RUN}/host-devices.log" 2>&1
+"${launch[@]}" bash "${SOURCE}/tools/mpi_device_probe.sh" > "${RUN}/host-access.log" 2>&1
 for mode in baseline host-rdma; do
     export HD_MPI_HOST_RDMA=0
     if [[ "${mode}" == host-rdma ]]; then export HD_MPI_HOST_RDMA=1; fi
+    export MPI_BINARY=/bin/bash
+    "${launch[@]}" bash "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" \
+        "${SOURCE}/tools/mpi_device_probe.sh" > "${RUN}/${mode}-access.log" 2>&1
     export MPI_BINARY="${MPI_PREFIX}/bin/ucx_info"
     "${launch[@]}" bash "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" -d > "${RUN}/${mode}-devices.log" 2>&1
     export MPI_BINARY=/usr/bin/ldd
