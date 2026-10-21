@@ -632,7 +632,12 @@ struct Bucketer_t {
     long      _int4_buckets = 0;
 
     /// runtime functions
-    int _batch(int tid, int replace_th, int batch0);
+    int _batch(int tid, int replace_th, int batch0, bool final_cleanup = true,
+               int task_limit = 0);
+    bool _mpi_service_solutions(bool allow_start);
+    std::atomic<int> _mpi_insert_workers{0};
+    int _mpi_replace_th = 0;
+    unsigned _mpi_service_ticks = 0;
     int _update_goal();
     int _sieve_is_over();
     int _signal_buc_done();

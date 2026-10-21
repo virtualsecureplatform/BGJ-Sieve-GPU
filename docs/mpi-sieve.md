@@ -1,5 +1,50 @@
 # Two-node MPI sieve
 
+## Experimental asynchronous pipeline
+
+`HD_MPI_PIPELINE=async` enables the opt-in two-node pipeline; the default is
+`legacy`. Both ranks must agree on the mode and `--mpi-frame-mib`. The host
+runtime/RDMA launcher is unchanged. Do not promote this mode to production
+until the replay and cold CSD128 validation gates below have passed.
+
+The Bucketer coordinator owns all phase MPI calls with
+`MPI_THREAD_SERIALIZED`. Two CPU workers pack/check/apply bucket frames while
+a separate worker applies remote candidates. Each completed owner bucket
+wakes GPU reducers immediately. Bucket and candidate channels each have two
+send and two receive slots; receiver acknowledgements are returned only after
+application, preventing unlimited MPI buffering behind a slow cache.
+
+At the default 256 MiB frame setting, bucket slots are 64 MiB and candidate
+slots are 16 MiB, for 320 MiB reusable pinned storage plus two 1 MiB buffers
+for synchronous traffic outside waves. Smaller frame settings scale the slots
+down. Buckets may span frames without rounding coordinates or changing norms.
+The existing `HD_MPI_CANDIDATE_QUEUE_KIB` cap includes queued and in-flight
+remote records until peer application. Partial candidate batches are sent.
+
+While copied buckets are being reduced, bounded insertion passes can relieve
+SWC pressure without new GPU pool readers or the final-cleanup discard pass.
+The current replacement threshold remains fixed for that wave. No new lossy
+filter, pool-size reduction, or dimension-limit change is enabled. Final
+candidate routing and acknowledgements complete before wave termination.
+Fatal protocol/cache errors abort both ranks; previously completed checkpoints
+remain the recovery point. Checkpoint source-identity checks are not relaxed.
+
+`[MPI-PIPELINE]` reports per-wave elapsed time, packing/bucket-application/
+candidate-application worker times, frame counts and candidate high-water
+bytes. Worker times overlap and must not be added to infer elapsed time.
+
+Validation uses `VALIDATE_PIPELINES="legacy async"` with the existing
+`mpi_bkz_validate.sbatch` allocation and the validated `MPI_HOST_RUNTIME`.
+It runs serial/MPI CSD60 frontend tests and the full MPI/BKZ suite for each
+mode; async additionally tests delayed application and corrupted frames.
+Larger runs must remain disabled until frozen-data CSD128/CSD144 replay shows
+at least 20% lower median elapsed time over three alternating pairs, and the
+same cold seed-38 CSD128 phase completes within three hours without spill or
+integrity errors. A completed benchmark alone does not establish a speedup
+over the single-node implementation.
+
+## Existing topology and checkpoint behavior
+
 `app/hd_sieve_mpi` distributes only the final GPU sieve. Preprocessing remains
 the existing PotLLL/BKZ job. The supported production topology is two Slurm
 nodes, one MPI rank and four visible A100 GPUs per node.

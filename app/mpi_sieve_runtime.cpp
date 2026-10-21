@@ -16,6 +16,10 @@
 #include <fstream>
 #include <filesystem>
 #include <mutex>
+#include <deque>
+#include <map>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <nmmintrin.h>
@@ -27,6 +31,8 @@ namespace {
 int g_rank = 0;
 int g_world = 1;
 std::size_t g_frame_bytes = 256ULL << 20;
+std::size_t g_sync_frame_bytes = 256ULL << 20;
+bool g_async_mode = false;
 std::string g_checkpoint_root;
 std::mutex g_candidate_mutex;
 std::size_t g_candidate_limit = 1ULL << 30;
@@ -108,8 +114,8 @@ int exchange_bytes(const uint8_t *send_data, uint64_t send_bytes,
     recv.resize(recv_bytes);
     uint64_t so = 0, ro = 0;
     while (so < send_bytes || ro < recv_bytes) {
-        const int sn = (int)std::min<uint64_t>(g_frame_bytes, send_bytes - so);
-        const int rn = (int)std::min<uint64_t>(g_frame_bytes, recv_bytes - ro);
+        const int sn = (int)std::min<uint64_t>(g_sync_frame_bytes, send_bytes - so);
+        const int rn = (int)std::min<uint64_t>(g_sync_frame_bytes, recv_bytes - ro);
         if (sn) memcpy(g_send_frame, send_data + so, sn);
         const void *sp = sn ? g_send_frame : nullptr;
         void *rp = rn ? g_recv_frame : nullptr;
@@ -170,6 +176,8 @@ int commit_candidates(const std::vector<uint8_t> &records, int csd,
     return 0;
 }
 
+#include "mpi_sieve_pipeline.inc"
+
 int make_dir(const std::string &path) {
     if (path.empty()) return -1;
     std::string current;
@@ -201,6 +209,16 @@ int mpi_sieve_runtime_init(const char *checkpoint_root, int frame_mib,
         return -1;
     }
     if (frame_mib < 1 || frame_mib > 1024) return -1;
+    const char *pipeline = getenv("HD_MPI_PIPELINE");
+    if (pipeline && strcmp(pipeline, "legacy") && strcmp(pipeline, "async")) return -1;
+    g_async_mode = pipeline && !strcmp(pipeline, "async");
+    const int settings[2] = {g_async_mode ? 3 : 2, frame_mib};
+    int peer_settings[2][2];
+    MPI_Allgather(settings, 2, MPI_INT, peer_settings, 2, MPI_INT, MPI_COMM_WORLD);
+    if (memcmp(peer_settings[0], peer_settings[1], sizeof(settings))) {
+        fprintf(stderr, "[MPI] pipeline version/frame settings differ between ranks\n");
+        return -1;
+    }
     if (const char *limit = getenv("HD_MPI_CANDIDATE_QUEUE_KIB")) {
         char *end = nullptr;
         const long kib = strtol(limit, &end, 10);
@@ -208,8 +226,10 @@ int mpi_sieve_runtime_init(const char *checkpoint_root, int frame_mib,
         g_candidate_limit = (std::size_t)kib << 10;
     }
     g_frame_bytes = (std::size_t)frame_mib << 20;
-    if (cudaHostAlloc((void **)&g_send_frame, g_frame_bytes, cudaHostAllocPortable) != cudaSuccess ||
-        cudaHostAlloc((void **)&g_recv_frame, g_frame_bytes, cudaHostAllocPortable) != cudaSuccess) {
+    // Synchronous pool/checkpoint traffic occurs outside pipeline waves.
+    g_sync_frame_bytes = g_async_mode ? std::min<size_t>(1ULL<<20, g_frame_bytes/4) : g_frame_bytes;
+    if (cudaHostAlloc((void **)&g_send_frame, g_sync_frame_bytes, cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostAlloc((void **)&g_recv_frame, g_sync_frame_bytes, cudaHostAllocPortable) != cudaSuccess) {
         if (g_send_frame) cudaFreeHost(g_send_frame);
         if (g_recv_frame) cudaFreeHost(g_recv_frame);
         g_send_frame = g_recv_frame = nullptr;
@@ -255,14 +275,16 @@ int mpi_sieve_runtime_init(const char *checkpoint_root, int frame_mib,
         }
     }
     if (!g_rank) {
-        printf("[MPI] world=2 nodes=%s,%s transport=pinned-host frame=%d MiB resume=%s\n",
-               hosts[0], hosts[1], frame_mib, resume ? "auto" : "none");
+        printf("[MPI] world=2 nodes=%s,%s transport=pinned-host frame=%d MiB resume=%s pipeline=%s\n",
+               hosts[0], hosts[1], frame_mib, resume ? "auto" : "none", g_async_mode ? "async" : "legacy");
         fflush(stdout);
     }
     return 0;
 }
 
 int mpi_sieve_runtime_finalize() {
+    if (g_pipeline_pending.load()) MPI_Abort(MPI_COMM_WORLD, 2);
+    pipeline_release_buffers();
     if (!g_rank) {
         printf("[MPI] traffic sent=%.3f GiB received=%.3f GiB mpi_time=%.3f s wire_exchanges=%llu\n",
                g_sent_bytes / (double)(1ULL << 30),
@@ -294,10 +316,15 @@ int mpi_sieve_select_insert(mpi_insert_candidate_t *candidate) {
 
 mpi_sieve_metrics_t mpi_sieve_metrics() {
     std::lock_guard<std::mutex> lock(g_candidate_mutex);
-    return {g_bucket_sequence.load(), g_candidate_sequence.load(), g_remote_candidates.size(),
+    return {g_bucket_sequence.load(), g_candidate_sequence.load(),
+            g_async_mode ? g_pipeline_pending.load() : g_remote_candidates.size(),
             g_sent_bytes.load(), g_recv_bytes.load(), g_processed_chunks.load()};
 }
 void mpi_sieve_note_progress(uint64_t chunks) { g_processed_chunks.fetch_add(chunks, std::memory_order_relaxed); }
+bool mpi_sieve_async() { return g_async_mode; }
+void mpi_sieve_set_pipeline_callbacks(void *context, void (*ready)(void *), bool (*service)(void *, bool)) {
+    g_pipeline_callbacks = {context, ready, service};
+}
 
 int mpi_sieve_control_test(Lattice_QP *basis, bool mismatch) {
     {
@@ -527,8 +554,9 @@ int mpi_sieve_global_score_stat(const uint32_t *local, uint64_t *global,
 }
 
 int mpi_sieve_filter_candidates(int csd, int8_t *vec, int32_t *norm,
-                                uint16_t *score, uint64_t *uid, int size) {
+                                uint16_t *score, uint64_t *uid, int size, int producer) {
     if (size <= 0) return size;
+    if (g_async_mode) return pipeline_filter(csd, vec, norm, score, uid, size, producer);
     const int stride = csd + 14;
     std::unique_lock<std::mutex> lock(g_candidate_mutex);
     int local = 0;
@@ -574,6 +602,10 @@ int mpi_sieve_filter_candidates(int csd, int8_t *vec, int32_t *norm,
 
 int mpi_sieve_flush_candidates(int csd, swc_manager_t *swc,
                                ut_checker_t *ut_checker) {
+    if (g_async_mode) {
+        if (g_pipeline_pending.load()) MPI_Abort(MPI_COMM_WORLD, 2);
+        return 0; // Async exchange owns the complete wave, including its tail.
+    }
     std::vector<uint8_t> outgoing;
     {
         std::lock_guard<std::mutex> lock(g_candidate_mutex);
@@ -599,6 +631,10 @@ int mpi_sieve_flush_candidates(int csd, swc_manager_t *swc,
 
 int mpi_sieve_drain_buckets(bwc_manager_t *bwc, swc_manager_t *swc,
                              ut_checker_t *ut, int csd, long limit) {
+    if (g_async_mode) {
+        if (g_pipeline_pending.load() || bwc->num_active() > limit) MPI_Abort(MPI_COMM_WORLD, 2);
+        return 0;
+    }
     const auto started = std::chrono::steady_clock::now();
     for (;;) {
         uint64_t local[2], global[2];
@@ -623,6 +659,19 @@ int mpi_sieve_drain_buckets(bwc_manager_t *bwc, swc_manager_t *swc,
 int mpi_sieve_exchange_buckets(bwc_manager_t *bwc, swc_manager_t *swc,
                                ut_checker_t *ut_checker, const int32_t *ids,
                                int num_buckets, int csd) {
+    if (g_async_mode) {
+        // Keep ownership outside the try block: on a worker/cache failure,
+        // abort the ranks before a destructor tries joining a blocked worker.
+        std::unique_ptr<pipeline_t> pipeline;
+        try {
+            pipeline.reset(new pipeline_t(bwc, swc, ut_checker, ids, num_buckets, csd));
+            pipeline->run();
+        } catch (const std::exception &e) {
+            fprintf(stderr, "[MPI-PIPELINE] rank=%d fatal: %s\n", g_rank, e.what());
+            MPI_Abort(MPI_COMM_WORLD, 2);
+        }
+        return 0;
+    }
     if (mpi_sieve_flush_candidates(csd, swc, ut_checker)) return -1;
     const int stride = csd + (int)sizeof(int32_t);
     const size_t chunk_bytes = Pool_hd_t::chunk_max_nvecs*(size_t)stride+4;

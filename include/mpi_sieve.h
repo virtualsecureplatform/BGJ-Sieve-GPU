@@ -16,6 +16,12 @@ bool mpi_sieve_should_stop();
 // hd_sieve_mpi executable supplies the strong MPI implementation, keeping the
 // normal hd_sieve binary and its ABI unchanged.
 bool mpi_sieve_active();
+bool mpi_sieve_async();
+// Installed for one bucketer lifetime. service must be nonblocking and returns
+// true while insertion workers are active; its second argument permits new
+// insertion work (false during final quiescence). Workers must never call MPI.
+void mpi_sieve_set_pipeline_callbacks(void *context, void (*ready)(void *),
+                                     bool (*service)(void *, bool));
 int mpi_sieve_rank();
 int mpi_sieve_world();
 // Returns the completed checkpoint dimension restored by --resume auto, or -1.
@@ -30,7 +36,8 @@ int mpi_sieve_exchange_buckets(bwc_manager_t *bwc, swc_manager_t *swc,
                                ut_checker_t *ut_checker, const int32_t *bucket_ids,
                                int num_buckets, int csd);
 int mpi_sieve_filter_candidates(int csd, int8_t *vec, int32_t *norm,
-                                uint16_t *score, uint64_t *uid, int size);
+                                uint16_t *score, uint64_t *uid, int size,
+                                int producer = 0);
 int mpi_sieve_flush_candidates(int csd, swc_manager_t *swc,
                                ut_checker_t *ut_checker);
 int mpi_sieve_global_stuck(uint64_t checked, uint64_t not_inserted, int csd);

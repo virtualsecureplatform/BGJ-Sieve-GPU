@@ -3,6 +3,8 @@
 #define BGJ_WEAK __attribute__((weak))
 
 BGJ_WEAK bool mpi_sieve_active() { return false; }
+BGJ_WEAK bool mpi_sieve_async() { return false; }
+BGJ_WEAK void mpi_sieve_set_pipeline_callbacks(void *, void (*)(void *), bool (*)(void *, bool)) {}
 BGJ_WEAK void mpi_sieve_request_stop() {}
 BGJ_WEAK bool mpi_sieve_should_stop() { return false; }
 BGJ_WEAK int mpi_sieve_rank() { return 0; }
@@ -22,7 +24,7 @@ BGJ_WEAK int mpi_sieve_exchange_buckets(bwc_manager_t *, swc_manager_t *,
     return 0;
 }
 BGJ_WEAK int mpi_sieve_filter_candidates(int, int8_t *, int32_t *, uint16_t *,
-                                         uint64_t *, int size) { return size; }
+                                         uint64_t *, int size, int) { return size; }
 BGJ_WEAK int mpi_sieve_flush_candidates(int, swc_manager_t *, ut_checker_t *) { return 0; }
 BGJ_WEAK int mpi_sieve_global_stuck(uint64_t checked, uint64_t not_inserted, int csd) {
     (void)csd;

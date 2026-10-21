@@ -62,6 +62,16 @@ def main():
 
     run('control', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': '1'})
     run('control-batched', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': '1'}, frame_mib=8)
+    if os.environ.get('APPTAINERENV_HD_MPI_PIPELINE') == 'async':
+        run('control-delayed', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': '1',
+                                     'APPTAINERENV_HD_MPI_PIPELINE_TEST_DELAY_US': '2000'})
+        corrupted = run('control-corrupt-frame', pump, {
+            'APPTAINERENV_HD_MPI_CONTROL_TEST': '1',
+            'APPTAINERENV_HD_MPI_PIPELINE_TEST_CORRUPT': '1'}, expected=None)
+        logs = (corrupted/'test.log').read_text()
+        for diagnostic in corrupted.glob('rank*/rank.err'):
+            logs += diagnostic.read_text()
+        assert 'checksum mismatch' in logs, logs[-4000:]
     run('control-mismatch', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': 'mismatch'}, expected=None)
     pressure = run('candidate-backpressure', pump, {
         'APPTAINERENV_HD_MPI_CANDIDATE_QUEUE_KIB': '1',

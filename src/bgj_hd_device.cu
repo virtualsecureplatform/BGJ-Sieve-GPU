@@ -2244,6 +2244,9 @@ int Bucketer_t::run() {
     #endif
 
     int first_batch = 1;
+    mpi_sieve_set_pipeline_callbacks(this,
+        [](void *p) { static_cast<Bucketer_t *>(p)->_signal_new_buc_ready(); },
+        [](void *p, bool start) { return static_cast<Bucketer_t *>(p)->_mpi_service_solutions(start); });
 
     for (;;) {
         if (mpi_sieve_active()) {
@@ -2281,6 +2284,7 @@ int Bucketer_t::run() {
 
         long swc_rne = _swc->ready_nvecs_estimate();
         int replace_th = traits::l0_replace_threshold(_pool, swc_rne, _improve_ratio);
+        _mpi_replace_th = replace_th;
         #if ENABLE_PROFILING
         long old_oss = logger->ev_old_score_sum;
         long old_nss = logger->ev_new_score_sum;
@@ -2354,7 +2358,8 @@ int Bucketer_t::run() {
                                        _reducer->total_notin, _pool->CSD))
                 flag |= flag_stuck;
             if (mpi_sieve_should_stop()) flag |= flag_stuck;
-            for (int i = 0; i < batch0; ++i) _signal_new_buc_ready();
+            if (!mpi_sieve_async())
+                for (int i = 0; i < batch0; ++i) _signal_new_buc_ready();
         }
 
         const char *finalize_env = getenv("HD_BWC_FINALIZE_THREADS");
@@ -2415,6 +2420,7 @@ int Bucketer_t::run() {
     _ut_checker->wait_work();
 
     /// destroy runtime data
+    mpi_sieve_set_pipeline_callbacks(nullptr, nullptr, nullptr);
     free(buc_id);
     free(ctr_record);
     delete buc_iter;
@@ -2440,7 +2446,27 @@ int Bucketer_t::run() {
     return (flag & flag_stuck) ? -1 : 0;
 }
 
-int Bucketer_t::_batch(int tid, int replace_th, int batch0) {
+bool Bucketer_t::_mpi_service_solutions(bool allow_start) {
+    if (_mpi_insert_workers.load(std::memory_order_acquire)) return true;
+    if (!allow_start || (++_mpi_service_ticks & 1023)) return false;
+    if (_swc->num_using() < _swc->max_cached_chunks() / 2) return false;
+    _ut_checker->trigger_batch();
+    if (!_swc->num_ready() && !buc_iter->num_reading_sol) return false;
+    // Called only after materialization, while reducers read copied buckets.
+    // Reset only with all previous insertion workers joined by the counter.
+    buc_iter->reset();
+    const int threshold = _mpi_replace_th;
+    _mpi_insert_workers.store(_num_threads, std::memory_order_release);
+    for (int tid = 0; tid < _num_threads; ++tid)
+        _buc_pool[tid]->push([this, tid, threshold] {
+            _batch(tid, threshold, 0, false, 8);
+            _mpi_insert_workers.fetch_sub(1, std::memory_order_release);
+        });
+    return true;
+}
+
+int Bucketer_t::_batch(int tid, int replace_th, int batch0, bool final_cleanup,
+                       int task_limit) {
     constexpr long chunk_max_nvecs = Pool_hd_t::chunk_max_nvecs;
     constexpr unsigned int taskChunks = traits::taskChunks;
 
@@ -2462,7 +2488,7 @@ int Bucketer_t::_batch(int tid, int replace_th, int batch0) {
     uint64_t new_score_sum = 0;
     #endif
     
-    for (int batch_done = 0;;) {
+    for (int batch_done = 0, tasks_done = 0;;) {
         int task_chunks = 0, task_vecs = 0, no_more_sol = 0;
         chunk_t *working_chunk[taskChunks] = {};
         int32_t chunk_modified[taskChunks] = {};
@@ -2686,7 +2712,8 @@ int Bucketer_t::_batch(int tid, int replace_th, int batch0) {
             }
         }
 
-        if (batch_done || (batch0 == 0 && no_more_sol)) break;
+        if (batch_done || (batch0 == 0 && no_more_sol) ||
+            (task_limit && ++tasks_done >= task_limit)) break;
     }
 
     #if ENABLE_PROFILING
@@ -2697,7 +2724,7 @@ int Bucketer_t::_batch(int tid, int replace_th, int batch0) {
     logger->ev_new_score_sum += new_score_sum;
     #endif
 
-    if (!batch0) {
+    if (!batch0 && final_cleanup) {
         int no_more_sol = 0;
         chunk_t *src = NULL;
         for (;;) {
@@ -5085,7 +5112,7 @@ int Reducer_t::run() {
 
     // All local buckets have completed, so no producer can add to the remote
     // candidate queue while the two ranks perform the final ownership route.
-    if (mpi_sieve_flush_candidates(_pool->CSD, _swc, _ut_checker))
+    if (!mpi_sieve_async() && mpi_sieve_flush_candidates(_pool->CSD, _swc, _ut_checker))
         ret = -1;
 
     _ut_checker->input_done();
@@ -5404,7 +5431,8 @@ int Reducer_t::_red_out_2_swc(int tid, int sid) {
     }
 
     size = mpi_sieve_filter_candidates(_pool->CSD, h_vec, h_norm, h_score,
-                                       h_u, size);
+                                       h_u, size, tid * _threads_per_buc + sid);
+    if (size < 0) { lg_err("MPI candidate routing failed"); abort(); }
     
 
     chunk_t *dst = NULL;

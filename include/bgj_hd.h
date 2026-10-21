@@ -97,6 +97,14 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
                           int record_size);
     int mpi_export_bucket_chunk(long bucket_id, std::vector<uint8_t> &records,
                                 int record_size, bool first, bool *done);
+    struct mpi_export_cursor_t {
+        chunk_t *chunk = nullptr;
+        long offset = 0;
+        bool started = false, done = false;
+    };
+    // Direct bounded columnar export; a cache chunk may span several frames.
+    int mpi_export_bucket_frame(long bucket_id, uint8_t *data, size_t capacity,
+                                size_t *used, mpi_export_cursor_t *cursor);
     int mpi_append_bucket(long bucket_id, const uint8_t *records, long count,
                           int record_size);
     int mpi_append_bucket_soa(long bucket_id, const uint8_t *norms,

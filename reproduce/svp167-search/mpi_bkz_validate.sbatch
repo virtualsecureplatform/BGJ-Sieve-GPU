@@ -53,12 +53,14 @@ apptainer exec --bind "${MPI_BASE}" "${MPI_SIF}" "${GENERATOR}" 80 0 > "${RUN}/t
 FPLLL="${MPI_BASE}/deps/fplll-b0e38e31085e"
 apptainer exec --bind "${MPI_BASE}" "${MPI_SIF}" env OMP_NUM_THREADS=1 LD_LIBRARY_PATH="${FPLLL}/lib" \
     "${FPLLL}/bin/fplll" -a potlll -m heuristic -f mpfr -p 256 "${RUN}/tests/input.raw" > "${RUN}/tests/input.basis"
-python3 "${SOURCE}/tools/test_phase_bench.py" --wrapper "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" \
-    --basis "${RUN}/tests/input.basis" --root "${RUN}/tests/phase-bench"
-if [[ "${PHASE_BENCH_ONLY:-0}" == 1 ]]; then
-    echo "PASS: phase benchmark frontend validation source=${SOURCE_COMMIT} run=${RUN}"
-    exit 0
-fi
-python3 "${SOURCE}/tools/test_mpi_bkz.py" --wrapper "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" \
-    --basis "${RUN}/tests/input.basis" --root "${RUN}/tests"
+for pipeline in ${VALIDATE_PIPELINES:-legacy}; do
+    case "${pipeline}" in legacy|async) ;; *) echo "Invalid pipeline: ${pipeline}" >&2; exit 2 ;; esac
+    export APPTAINERENV_HD_MPI_PIPELINE="${pipeline}"
+    python3 "${SOURCE}/tools/test_phase_bench.py" --wrapper "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" \
+        --basis "${RUN}/tests/input.basis" --root "${RUN}/tests/${pipeline}/phase-bench"
+    if [[ "${PHASE_BENCH_ONLY:-0}" != 1 ]]; then
+        python3 "${SOURCE}/tools/test_mpi_bkz.py" --wrapper "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" \
+            --basis "${RUN}/tests/input.basis" --root "${RUN}/tests/${pipeline}"
+    fi
+done
 echo "PASS: distributed BKZ validation source=${SOURCE_COMMIT} run=${RUN}"

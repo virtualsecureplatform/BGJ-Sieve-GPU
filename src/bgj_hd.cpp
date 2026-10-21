@@ -1106,6 +1106,74 @@ template <class logger_t> long bwc_manager_tmpl<logger_t>::bucket_num_chunks(lon
     return ret;
 }
 
+template <class logger_t> int bwc_manager_tmpl<logger_t>::mpi_export_bucket_frame(
+        long bucket_id, uint8_t *data, size_t capacity, size_t *used,
+        mpi_export_cursor_t *cursor) {
+    const size_t stride = sizeof(int32_t) + this->_pool->CSD;
+    if (!data || !used || !cursor || capacity < 4 + stride ||
+        bucket_id < 0 || bucket_id >= _num_buckets || cursor->done) return -1;
+    l0_bucket_t &bucket = _bucket[bucket_id];
+    if (bucket.status & l0_bucket_t::_bk_gpu_write) return -1;
+    if (!cursor->started) {
+        // Seal without making a non-owner bucket visible to reducers.
+        for (;;) {
+            pthread_spin_lock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+            chunk_t *last = bucket.writing_chunk;
+            if (last == (chunk_t *)-1) {
+                pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+                std::this_thread::yield();
+                continue;
+            }
+            bucket.writing_chunk = (chunk_t *)-1;
+            pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+            if (last) {
+                if (last->size) release_sync(last->id);
+                else {
+                    pthread_spin_lock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+                    if (bucket.num_chunks && bucket.chunk_ids[bucket.num_chunks-1] == last->id)
+                        --bucket.num_chunks;
+                    pthread_spin_unlock(&_bucket_lock[bucket_id % bwc_bucket_locks]);
+                    release_del(last->id);
+                }
+            }
+            bucket.status = l0_bucket_t::_bk_reading;
+            __prefetch_for_reading(bucket_id);
+            cursor->started = true;
+            break;
+        }
+    }
+    *used = 0;
+    while (capacity - *used >= 4 + stride) {
+        if (!cursor->chunk) {
+            cursor->chunk = fetch_for_read(bucket_id);
+            cursor->offset = 0;
+            if (!cursor->chunk) {
+                bucket_finalize(bucket_id);
+                cursor->done = true;
+                break;
+            }
+        }
+        chunk_t *chunk = cursor->chunk;
+        const uint32_t n = std::min<size_t>(chunk->size - cursor->offset,
+                                           (capacity - *used - 4) / stride);
+        if (n) {
+            uint8_t *out = data + *used;
+            memcpy(out, &n, 4);
+            memcpy(out + 4, chunk->norm + cursor->offset, n * sizeof(int32_t));
+            memcpy(out + 4 + n * sizeof(int32_t),
+                   chunk->vec + cursor->offset * this->_pool->CSD,
+                   n * this->_pool->CSD);
+            *used += 4 + n * stride;
+            cursor->offset += n;
+        }
+        if (cursor->offset == chunk->size) {
+            read_done(chunk, bucket_id);
+            cursor->chunk = nullptr;
+        }
+    }
+    return 0;
+}
+
 template <class logger_t> int bwc_manager_tmpl<logger_t>::mpi_export_bucket_chunk(
         long bucket_id, std::vector<uint8_t> &records, int record_size,
         bool first, bool *done) {
