@@ -12,7 +12,11 @@ class CudaSourceRegressionTests(unittest.TestCase):
                         source.index('mpi_sieve_runtime_init('))
         self.assertNotIn('fs::exists(scratch)', source)
         self.assertLess(source.index('const auto finished ='),
-                        source.index('pool.pwc_manager->release_del(id)'))
+                        source.index('phase_bench_pool_access_t::discard(pool)'))
+        manager = (ROOT / 'include' / 'pool_hd.h').read_text()
+        self.assertIn('friend struct phase_bench_pool_access_t;', manager)
+        access = source.split('struct phase_bench_pool_access_t {', 1)[1].split('int main(', 1)[0]
+        self.assertIn('pool.pwc_manager->release_del(id)', access)
         smoke = (ROOT / 'tools' / 'test_phase_bench.py').read_text()
         self.assertIn("('mpi', 2, 'hd_phase_bench_mpi')", smoke)
         self.assertIn('assert repeated.returncode != 0', smoke)

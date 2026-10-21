@@ -797,6 +797,9 @@ struct pwc_manager_tmpl {
     private:
     friend int Pool_hd_t::shrink(long N);
     friend int Pool_hd_t::mpi_compact_dense();
+    // Only the disposable phase-benchmark frontend uses this access shim.
+    // Keep chunk deletion protected for every normal manager caller.
+    friend struct phase_bench_pool_access_t;
     friend struct shrink_iterator_t;
 };
 

@@ -9,6 +9,15 @@
 #include "bin_hd_sieve.cu"
 #undef main
 
+struct phase_bench_pool_access_t {
+    static void discard(Pool_hd_t &pool) {
+        pool.pwc_manager->wait_work();
+        for (long id = 0; id < pool.pwc_manager->num_chunks(); ++id)
+            if (pool.pwc_manager->chunk_size(id) <= Pool_hd_t::chunk_max_nvecs)
+                pool.pwc_manager->release_del(id);
+    }
+};
+
 int main(int argc, char **argv) {
     if (argc != 4) { fprintf(stderr, "usage: %s BASIS CSD SCRATCH\n", argv[0]); return 2; }
     int rank = 0;
@@ -88,10 +97,7 @@ int main(int argc, char **argv) {
         // Leaving dirty chunks queued with writeback/spill disabled would make
         // its destructor wait forever. This is outside the timed sieve; real
         // BKZ persistence and checkpoint paths are deliberately unchanged.
-        pool.pwc_manager->wait_work();
-        for (long id = 0; id < pool.pwc_manager->num_chunks(); ++id)
-            if (pool.pwc_manager->chunk_size(id) <= Pool_hd_t::chunk_max_nvecs)
-                pool.pwc_manager->release_del(id);
+        phase_bench_pool_access_t::discard(pool);
     }
     _destroy_pool_hd_device_buffers();
     _destory_ck_allocator();
