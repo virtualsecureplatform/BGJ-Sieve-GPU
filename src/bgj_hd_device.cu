@@ -5,6 +5,7 @@
 #include "../include/pool_hd_device.h"
 #include "../include/bgj_hd_device.h"
 #include "../include/mpi_sieve.h"
+#include "../include/bounded_task_queue.h"
 #include <strings.h>
 
 #if ENABLE_PROFILING
@@ -1459,6 +1460,12 @@ int buc_buffer_holder_t::center_prep(int batch0, int &first_batch) {
 
 
 int buc_buffer_holder_t::h2d(int tid, chunk_t *chunk) {
+    if (tid < 0 || tid >= num_threads || !chunk || chunk->size < 0 ||
+        chunk->size > Pool_hd_t::chunk_max_nvecs || task_vecs[tid] < 0 ||
+        (uint64_t)task_vecs[tid] + chunk->size > traits::taskVecs) {
+        fprintf(stderr, "[BUCKET-BOUNDS] invalid H2D task tid=%d CSD=%ld\n", tid, (long)CSD);
+        abort();
+    }
     #if ENABLE_PROFILING
     CHECK_CUDA_ERR(cudaEventRecord(logger->h2d_start[tid][logger->h2d_count[tid]], streams[tid]));
     #endif
@@ -1474,6 +1481,12 @@ int buc_buffer_holder_t::h2d(int tid, chunk_t *chunk) {
 }
 
 int buc_buffer_holder_t::run(int tid) {
+    if (tid < 0 || tid >= num_threads || task_vecs[tid] < 0 ||
+        (uint64_t)task_vecs[tid] > traits::taskVecs || !kernel ||
+        curr_batch0 < 16 || curr_batch0 > max_batch0) {
+        fprintf(stderr, "[BUCKET-BOUNDS] invalid kernel task tid=%d\n", tid);
+        abort();
+    }
     int device_ptr = hw::gpu_ptr(tid, num_threads);
     #if ENABLE_PROFILING
     CHECK_CUDA_ERR(cudaEventRecord(logger->h2d_norm_start[tid], streams[tid]));
@@ -5672,12 +5685,12 @@ int Reducer_t::_ld_lbuc(int tid, int bucket_id, int &num_chunks, chunk_t **&work
 
     working_chunks = (chunk_t **) malloc(bucket_num_chunks * sizeof(chunk_t *));
 
-    pthread_spinlock_t task_lock, buc_lock;
-    pthread_spin_init(&task_lock, PTHREAD_PROCESS_SHARED);
+    pthread_spinlock_t buc_lock;
     pthread_spin_init(&buc_lock, PTHREAD_PROCESS_SHARED);
     
-    int num_task = 0, no_more_task = 0;
-    uint64_t *task_list = (uint64_t *) malloc(bucket_num_chunks + 8);
+    bounded_task_queue<uint64_t> tasks((bucket_num_chunks + traits::taskChunks - 1) /
+                                      traits::taskChunks + 1);
+    int published_chunks = 0;
 
     for (int sid = 0; sid < _threads_per_buc; sid++) {
         _sub_threads[tid * _threads_per_buc + sid]->push([&, tid, sid] {
@@ -5689,21 +5702,7 @@ int Reducer_t::_ld_lbuc(int tid, int bucket_id, int &num_chunks, chunk_t **&work
             int *num = (int *) malloc(sizeof(int) * _batch1);
             for (;;) {
                 uint64_t task = 0;
-                for (int64_t poll_iters = 0;; poll_iters++) {
-                    if (num_task || no_more_task) {
-                        volatile int *num_task_vol = reinterpret_cast<volatile int *>(&num_task);
-                        pthread_spin_lock(&task_lock);
-                        if (num_task_vol[0]) {
-                            task = task_list[--num_task_vol[0]];
-                            pthread_spin_unlock(&task_lock);
-                            break;
-                        }
-                        pthread_spin_unlock(&task_lock);
-                        if (no_more_task) break;
-                    }
-                }
-
-                if (task == 0 && no_more_task) break;
+                if (!tasks.pop(task)) break;
                 int task_chunks = task >> 32;
                 int task_start  = task & 0xffffffff;
                 for (int i = 0; i < task_chunks; i++) {
@@ -5786,11 +5785,10 @@ int Reducer_t::_ld_lbuc(int tid, int bucket_id, int &num_chunks, chunk_t **&work
             }
         } else working_chunks[num_chunks++] = src;
 
-        if (num_chunks % traits::taskChunks == 0 && num_chunks) {
+        if (num_chunks % traits::taskChunks == 0 && num_chunks > published_chunks) {
             uint64_t task = (((uint64_t) traits::taskChunks) << 32) | (num_chunks - traits::taskChunks);
-            pthread_spin_lock(&task_lock);
-            task_list[num_task++] = task;
-            pthread_spin_unlock(&task_lock);
+            tasks.push(task);
+            published_chunks = num_chunks;
         }
     }
 
@@ -5803,17 +5801,13 @@ int Reducer_t::_ld_lbuc(int tid, int bucket_id, int &num_chunks, chunk_t **&work
         } else _bwc->read_done(unfull_chunk, bucket_id);
     }
 
-    pthread_spin_lock(&task_lock);
-    if (not_added >> 32) task_list[num_task++] = not_added;
-    no_more_task = 1;
-    pthread_spin_unlock(&task_lock);
+    if (not_added >> 32) tasks.push(not_added);
+    tasks.close();
 
     for (int sid = 0; sid < _threads_per_buc; sid++) {
         _sub_threads[tid * _threads_per_buc + sid]->wait_sleep();
     }
 
-    free(task_list);
-    pthread_spin_destroy(&task_lock);
     pthread_spin_destroy(&buc_lock);
 
     #if ENABLE_PROFILING

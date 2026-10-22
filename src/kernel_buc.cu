@@ -6,7 +6,6 @@
 
 using namespace nvcuda;
 
-#define RECORD_CLK 1
 #define UNPACK_INCLUDED 1
 
 typedef wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> wma_t;
@@ -37,9 +36,16 @@ static __device__ __forceinline__ void _tail_mask(int32_t *vnorm, int n, uint32_
 template <int32_t layer>
 static __device__ __forceinline__ void _center_load(wma_t center_frag[][traits::vec_nbytes / 16], const int8_t *warp_center, 
                                                     uint32_t wid, uint32_t lid, uint32_t batchsize, uint32_t CSD16) {
+    // WMMA loads are warp collective. Inactive warps must not issue a load:
+    // clearing the fragment afterwards does not make an out-of-bounds read safe.
+    const bool active = wid * C_batch * 16 < blockCenters;
     for (int b = 0; b < C_batch * 16; b += 16) {
-        for (int i = 0; i < CSD16; i += 16) 
-            wmma::load_matrix_sync(center_frag[b / 16][i / 16], warp_center + b * CSD16 + i, CSD16);
+        for (int i = 0; i < CSD16; i += 16) {
+            if (active)
+                wmma::load_matrix_sync(center_frag[b / 16][i / 16], warp_center + b * CSD16 + i, CSD16);
+            else
+                wmma::fill_fragment(center_frag[b / 16][i / 16], 0);
+        }
     }
     if (blockCenters < blockThreads / 2) {
         if (wid * 16 >= blockCenters) 
@@ -356,9 +362,6 @@ __global__ void _bucket_kernel(uint32_t *__restrict__ out, int out_max_size, int
     uint32_t n = *n_ptr;
     if (n > in_max_size && layer == 2) n = in_max_size;
 
-    #if RECORD_CLK
-    uint32_t start_clk = utils_t::_clock() >> 32;
-    #endif
 
     /// constants
     constexpr unsigned int vec_nbytes   = traits::vec_nbytes;
@@ -556,13 +559,6 @@ __global__ void _bucket_kernel(uint32_t *__restrict__ out, int out_max_size, int
         gnidld_src     += 2 * stride;
     }
 
-    #if RECORD_CLK
-    uint32_t end_clk = utils_t::_clock() >> 32;
-    if (end_clk - start_clk == 0xffffffff) {
-        ((uint64_t *)&out[batchsize * (2 * out_max_size + 1)])[blockIdx.x * blockDim.x + threadIdx.x] = start_clk;
-        ((uint64_t *)&out[batchsize * (2 * out_max_size + 1)])[blockIdx.x * blockDim.x + threadIdx.x + traits::blockThreads * traits::kernelBlocks] = end_clk;
-    }
-    #endif
 
     #undef curr_vec_bias
     #undef curr_norm_bias

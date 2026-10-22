@@ -6,7 +6,6 @@
 
 using namespace nvcuda;
 
-#define RECORD_CLK 1
 
 typedef wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> wma_t;
 typedef wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::col_major> wmb_t;
@@ -307,9 +306,6 @@ __global__ void _reduce_kernel(int *out, int *num_out, int out_max_size,
 
     uint32_t n = *n_ptr;
 
-    #if RECORD_CLK
-    uint32_t start_clk = utils_t::_clock() >> 32;
-    #endif
 
     /// constants
     constexpr unsigned int vec_nbytes   = traits::vec_nbytes;
@@ -452,13 +448,6 @@ __global__ void _reduce_kernel(int *out, int *num_out, int out_max_size,
 
     _sbuc_2_gbuc(out, num_out, out_max_size, sbuc, sbuc_num, wid, lid);
     
-    #if RECORD_CLK
-    uint32_t end_clk = utils_t::_clock() >> 32;
-    if (end_clk - start_clk == 0xffffffff) {
-        ((uint64_t *)&num_out[2])[blockIdx.x * blockDim.x + threadIdx.x] = start_clk;
-        ((uint64_t *)&num_out[2])[blockIdx.x * blockDim.x + threadIdx.x + blockDim.x * gridDim.x] = end_clk;
-    }
-    #endif
 }
 
 #define INSTANTIATE(layer, CSD16, sbuc_freq, gbuc_freq) \
