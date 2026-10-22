@@ -2,6 +2,7 @@
 """Produce a fail-closed, source-bound release report from Slurm test artifacts."""
 import argparse
 import json
+import math
 from pathlib import Path
 import re
 
@@ -11,8 +12,8 @@ from summarize_checkpoint_bench import summarize as checkpoint_summary
 def cold_metrics(root):
     text = (root/'mpi-128.log').read_text()
     matches = re.findall(r'\[PHASE-BENCH\] ranks=2 csd=128 sampling_seconds=([0-9.]+) '
-                         r'sieve_seconds=([0-9.]+) vectors=(\d+) sieve_rc=(\d+)',text)
-    if len(matches) != 1 or int(matches[0][3]) != 0:
+                         r'sieve_seconds=([0-9.]+) vectors=(\d+) sieve_rc=(-?\d+)',text)
+    if len(matches) != 1 or int(matches[0][3]) not in (0,-1):
         raise ValueError('cold CSD128 did not finish successfully')
     if '[CACHE-SPILL-FORBIDDEN]' in text or 'CUDA error' in text:
         raise ValueError('cold CSD128 has a cache/GPU failure')
@@ -23,8 +24,13 @@ def cold_metrics(root):
         if not samples: raise ValueError('missing per-rank peak memory samples')
         peaks.append(max(map(int,samples))/(1024*1024))
     sampling,sieving,vectors,_ = matches[0]
+    target = re.findall(r'sampling_start ranks=2 csd=128 target_vectors=(\d+)',text)
+    if len(target) != 1 or int(target[0]) != int(3.2*(4./3.)**64-5):
+        raise ValueError('cold CSD128 pool size ratio/workload changed')
+    if not int(target[0]) <= int(vectors) < int(target[0])+65536:
+        raise ValueError('cold CSD128 pool lost records or exceeded its size bound')
     return {'sampling_seconds':float(sampling),'sieve_seconds':float(sieving),
-            'vectors':int(vectors),'peak_host_gib':peaks}
+            'vectors':int(vectors),'peak_host_gib':peaks,'sieve_rc':int(matches[0][3])}
 
 
 def choose_profile(replay,baseline,optimized):
@@ -61,6 +67,12 @@ def main():
         if int(seconds) <= 0: raise ValueError('invalid cold elapsed time')
         (baseline if profile == 'baseline' else optimized)['elapsed_seconds'] = int(seconds)
     replay = json.loads(args.replay_summary.read_text())
+    if set(replay) != {'128','144'} or any(
+        not isinstance(replay[d].get('passed'),bool) or any(
+            not math.isfinite(replay[d].get(field,0)) or replay[d].get(field,0) <= 0
+            for field in ('baseline_median_seconds','optimized_median_seconds'))
+        for d in ('128','144')):
+        raise ValueError('incomplete async replay evidence')
     profile,time_ok,memory_ok = choose_profile(replay,baseline,optimized)
     checkpoints = checkpoint_summary(args.checkpoint_log.read_text())
     result = {'source_commit':args.source_commit,'passed':True,
