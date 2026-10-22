@@ -213,7 +213,7 @@ bool direct_checkpoint_writer() {
 // Quiescent pool-cache export. The existing V2 reader expects a 12-byte header,
 // full-width SoA columns and, for ONE_TIME_IO, 4084 trailing alignment bytes.
 // Read through fetch() so authoritative HBM/dirty host contents win over disk.
-snapshot_hashes_t snapshot_pool(Pool_hd_t &pool, const fs::path &destination) {
+snapshot_hashes_t snapshot_pool(Pool_hd_t &pool, const fs::path &destination, bool inject_io_fault = false) {
     auto *manager = pool.pwc_manager;
     require(manager->wait_work() == 0, "snapshot pool I/O not quiescent");
     const long count = manager->num_chunks();
@@ -237,6 +237,8 @@ snapshot_hashes_t snapshot_pool(Pool_hd_t &pool, const fs::path &destination) {
             require(bool(out), "open direct snapshot chunk");
             uint64_t size = 0, hash = 1469598103934665603ULL;
             auto append = [&](const void *data, size_t bytes) {
+                if (inject_io_fault && id == 0 && !strcmp(getenv("HD_MPI_CHECKPOINT_IO_FAULT"),"write"))
+                    throw std::runtime_error("[MPI-BKZ] injected snapshot write failure: ENOSPC");
                 out.write(static_cast<const char *>(data), bytes);
                 require(bool(out), "write direct snapshot chunk");
                 hash = hash_bytes(hash, data, bytes); size += bytes;
@@ -252,6 +254,8 @@ snapshot_hashes_t snapshot_pool(Pool_hd_t &pool, const fs::path &destination) {
             append(chunk->vec, Pool_hd_t::chunk_max_nvecs*pool.CSD);
             if (ONE_TIME_IO) { uint8_t padding[4084] = {}; append(padding, sizeof(padding)); }
             out.close(); require(bool(out), "close direct snapshot chunk");
+            if (inject_io_fault && id == 0 && !strcmp(getenv("HD_MPI_CHECKPOINT_IO_FAULT"),"fsync"))
+                throw std::runtime_error("[MPI-BKZ] injected snapshot fsync failure");
             durable(path);
             hashes[id] = {size, hash}; vectors += chunk->size;
         } catch (...) { manager->release(id); throw; }
@@ -277,6 +281,8 @@ void commit(state_t &s, Lattice_QP &full, Lattice_QP *local, Pool_hd_t *pool) {
     const auto start = std::chrono::steady_clock::now();
     const auto io_before = process_io();
     const bool direct = direct_checkpoint_writer();
+    const char *io_fault = getenv("HD_MPI_CHECKPOINT_IO_FAULT");
+    require(!io_fault || !strcmp(io_fault,"write") || !strcmp(io_fault,"fsync"), "invalid snapshot I/O fault");
     const int rank = mpi_sieve_rank();
     live_phase.store(100); // Explicit checkpoint I/O, not a stalled GPU sieve.
     mpi_sieve_agree_basis(&full, "checkpoint-full");
@@ -314,7 +320,7 @@ void commit(state_t &s, Lattice_QP &full, Lattice_QP *local, Pool_hd_t *pool) {
     if (local) save_basis(*local, dst/"local.qp");
     snapshot_hashes_t known;
     if (pool) {
-        if (direct) known = snapshot_pool(*pool, dst);
+        if (direct) known = snapshot_pool(*pool, dst, io_fault && rank == 1 && s.sequence > 1);
         else copy_pool_tree(".pool", dst/"pool");
     }
     atomic_text(dst/"STATE", encode(s));

@@ -151,6 +151,22 @@ def main():
         '--import-generation',str(seq),'--import-source-commit',source_commit],expected=None)
     run('verified-import',pump+['--import-checkpoint',str(root),
         '--import-generation',str(seq),'--import-source-commit',source_commit],expected=None)
+    for corruption in ('missing','corrupt'):
+        bad = args.root/('import-source-'+corruption)
+        shutil.copytree(root,bad)
+        path = bad/('generation-%d/rank1/full.qp' % seq)
+        if corruption == 'missing': path.unlink()
+        else:
+            with path.open('ab') as stream: stream.write(b'corrupt')
+        run('import-reject-'+corruption,pump+['--import-checkpoint',str(bad),
+            '--import-generation',str(seq),'--import-source-commit',source_commit],expected=None)
+    if os.environ.get('APPTAINERENV_HD_MPI_CHECKPOINT_WRITER') == 'direct':
+        for fault in ('write','fsync'):
+            bad = run('snapshot-io-'+fault,pump,{'APPTAINERENV_HD_MPI_CHECKPOINT_IO_FAULT':fault},expected=None)
+            prior = int((bad/'LATEST-BKZ').read_text())
+            assert prior == 1
+            check_snapshot_pool(bad,prior)
+            run('snapshot-io-'+fault,pump)
     run('phase-resume', pump, {'APPTAINERENV_HD_MPI_BKZ_MAX_PHASES': '1'}, 75)
     seq2 = int((root/'LATEST-BKZ').read_text())
     check_snapshot_pool(root, seq2)
