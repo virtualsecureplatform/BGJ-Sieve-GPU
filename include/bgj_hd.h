@@ -104,7 +104,9 @@ struct bwc_manager_tmpl : private pwc_manager_tmpl<logger_t> {
     };
     // Direct bounded columnar export; a cache chunk may span several frames.
     int mpi_export_bucket_frame(long bucket_id, uint8_t *data, size_t capacity,
-                                size_t *used, mpi_export_cursor_t *cursor);
+                                size_t *used, mpi_export_cursor_t *cursor,
+                                void (*copy)(void *, void *, const void *, size_t) = nullptr,
+                                void *copy_context = nullptr);
     int mpi_append_bucket(long bucket_id, const uint8_t *records, long count,
                           int record_size);
     int mpi_append_bucket_soa(long bucket_id, const uint8_t *norms,

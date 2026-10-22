@@ -27,11 +27,28 @@ def summarize(results):
     return summary
 
 
+def summarize_profiles(results):
+    summary = {}
+    for dimension in (128, 144):
+        times = {profile: [r['seconds'] for r in results if r['csd'] == dimension and
+                          r['profile'] == profile and not r['warmup']]
+                 for profile in ('baseline', 'optimized')}
+        if any(len(values) != 3 for values in times.values()):
+            raise ValueError('three measured profile pairs per dimension are required')
+        baseline, optimized = (statistics.median(times[p]) for p in ('baseline', 'optimized'))
+        summary[str(dimension)] = {'baseline_median_seconds': baseline,
+                                  'optimized_median_seconds': optimized,
+                                  'improvement': 1-optimized/baseline,
+                                  'passed': optimized <= .9*baseline}
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--wrapper', type=Path, required=True)
     parser.add_argument('--basis', type=Path, required=True)
     parser.add_argument('--root', type=Path, required=True)
+    parser.add_argument('--compare-async-profiles', action='store_true')
     args = parser.parse_args()
     if not os.environ.get('SLURM_JOB_ID'):
         parser.error('run only inside a two-node Slurm allocation')
@@ -43,10 +60,14 @@ def main():
     for dimension in (128, 144):
         # One warmup pair, then three measured pairs with alternating order.
         for pair in range(4):
-            order = ('legacy', 'async') if pair % 2 == 0 else ('async', 'legacy')
-            for mode in order:
-                root = args.root / ('csd%d-pair%d-%s' % (dimension, pair, mode))
+            choices = ('baseline','optimized') if args.compare_async_profiles else ('legacy','async')
+            order = choices if pair % 2 == 0 else choices[::-1]
+            for choice in order:
+                mode = 'async' if args.compare_async_profiles else choice
+                profile = choice if args.compare_async_profiles else 'baseline'
+                root = args.root / ('csd%d-pair%d-%s' % (dimension, pair, choice))
                 env = dict(os.environ, APPTAINERENV_HD_MPI_PIPELINE=mode,
+                           APPTAINERENV_HD_MPI_ASYNC_PROFILE=profile,
                            APPTAINERENV_HD_MPI_CONTROL_TEST='1',
                            APPTAINERENV_HD_MPI_PIPELINE_REPLAY='1',
                            APPTAINERENV_HD_MPI_REPLAY_CSD=str(dimension),
@@ -69,7 +90,8 @@ def main():
                 match = matches[0]
                 if int(match[1]) != dimension or match[2] != mode:
                     raise RuntimeError('replay identity mismatch')
-                results.append({'csd': dimension, 'mode': mode, 'pair': pair, 'warmup': pair == 0,
+                results.append({'csd': dimension, 'mode': mode, 'profile': profile,
+                                'pair': pair, 'warmup': pair == 0,
                                 'seconds': float(match[3]), 'bucket_records': int(match[4]),
                                 'candidate_records': int(match[5])})
                 (args.root/'results.json').write_text(json.dumps(results, indent=2)+'\n')
@@ -77,11 +99,11 @@ def main():
     counts = {(r['bucket_records'], r['candidate_records']) for r in results}
     if len(counts) != 1:
         raise RuntimeError('replay workloads differ')
-    summary = summarize(results)
+    summary = summarize_profiles(results) if args.compare_async_profiles else summarize(results)
     (args.root/'summary.json').write_text(json.dumps(summary, indent=2)+'\n')
     print(json.dumps(summary, indent=2), flush=True)
     if not all(item['passed'] for item in summary.values()):
-        raise SystemExit('Replay correctness passed, but the 20% performance gate did not pass.')
+        raise SystemExit('Replay correctness passed, but the performance gate did not pass.')
 
 
 if __name__ == '__main__':

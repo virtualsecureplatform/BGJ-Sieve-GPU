@@ -1110,7 +1110,8 @@ template <class logger_t> long bwc_manager_tmpl<logger_t>::bucket_num_chunks(lon
 
 template <class logger_t> int bwc_manager_tmpl<logger_t>::mpi_export_bucket_frame(
         long bucket_id, uint8_t *data, size_t capacity, size_t *used,
-        mpi_export_cursor_t *cursor) {
+        mpi_export_cursor_t *cursor,
+        void (*copy)(void *, void *, const void *, size_t), void *copy_context) {
     const size_t stride = sizeof(int32_t) + this->_pool->CSD;
     if (!data || !used || !cursor || capacity < 4 + stride ||
         bucket_id < 0 || bucket_id >= _num_buckets || cursor->done) return -1;
@@ -1145,6 +1146,10 @@ template <class logger_t> int bwc_manager_tmpl<logger_t>::mpi_export_bucket_fram
         }
     }
     *used = 0;
+    const auto copy_bytes = [&](void *dst, const void *src, size_t size) {
+        if (copy) copy(copy_context, dst, src, size);
+        else memcpy(dst, src, size);
+    };
     while (capacity - *used >= 4 + stride) {
         if (!cursor->chunk) {
             cursor->chunk = fetch_for_read(bucket_id);
@@ -1160,9 +1165,9 @@ template <class logger_t> int bwc_manager_tmpl<logger_t>::mpi_export_bucket_fram
                                            (capacity - *used - 4) / stride);
         if (n) {
             uint8_t *out = data + *used;
-            memcpy(out, &n, 4);
-            memcpy(out + 4, chunk->norm + cursor->offset, n * sizeof(int32_t));
-            memcpy(out + 4 + n * sizeof(int32_t),
+            copy_bytes(out, &n, 4);
+            copy_bytes(out + 4, chunk->norm + cursor->offset, n * sizeof(int32_t));
+            copy_bytes(out + 4 + n * sizeof(int32_t),
                    chunk->vec + cursor->offset * this->_pool->CSD,
                    n * this->_pool->CSD);
             *used += 4 + n * stride;

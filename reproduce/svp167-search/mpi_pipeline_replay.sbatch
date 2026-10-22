@@ -22,7 +22,9 @@ export APPTAINERENV_HD_FAIL_ON_SPILL=1 APPTAINERENV_HD_LAZY_SYNC=1 APPTAINERENV_
 export APPTAINERENV_HD_HOST_ARENA_INITIAL_GB=4 APPTAINERENV_HD_PWC_NO_GROW=1
 export APPTAINERENV_HD_CACHE_WAIT_TIMEOUT_S=120 APPTAINERENV_HD_POOL_BUFFER_CACHE=0
 export APPTAINERENV_HD_SOURCE_COMMIT="${SOURCE_COMMIT}"
-python3 "${SOURCE}/tools/test_mpi_pipeline_replay.py" \
+replay_options=()
+if [[ "${REPLAY_ASYNC_PROFILES:-0}" == 1 ]]; then replay_options+=(--compare-async-profiles); fi
+python3 "${SOURCE}/tools/test_mpi_pipeline_replay.py" "${replay_options[@]}" \
     --wrapper "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" \
     --basis "${VALIDATED_BUILD}/tests/input.basis" \
     --root "${MPI_BASE}/diagnostics/mpi-pipeline-replay-${SLURM_JOB_ID}"

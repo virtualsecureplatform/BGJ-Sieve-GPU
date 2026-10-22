@@ -14,6 +14,10 @@ std::mutex g_producer_mutex;
 std::map<int, std::unique_ptr<candidate_queue_t>> g_producers;
 std::atomic<uint64_t> g_pipeline_pending{0}, g_pipeline_highwater{0};
 std::atomic<uint64_t> g_ready_batches{0};
+std::atomic<uint64_t> g_candidate_queued_bytes{0}, g_candidate_allocations{0}, g_candidate_reuses{0};
+std::mutex g_candidate_pool_mutex;
+std::vector<std::vector<uint8_t>> g_candidate_free;
+size_t g_candidate_retained = 0;
 std::atomic<uint64_t> g_candidate_wait_ns{0}, g_swc_wait_ns{0}, g_uid_wait_ns{0}, g_crc_ns{0};
 std::atomic<uint64_t> g_bucket_ready_ns[bwc_manager_t::bwc_max_buckets];
 std::atomic<uint64_t> g_bucket_wait_ns{0}, g_bucket_started{0};
@@ -39,9 +43,17 @@ void reserve_candidate_bytes(size_t bytes) {
     static std::atomic<bool> reported{false};
     const auto start = pipeline_now_ns();
     for (;;) {
+        std::unique_lock<std::mutex> pool_lock(g_candidate_pool_mutex, std::defer_lock);
+        if (g_async_optimized) pool_lock.lock();
         uint64_t pending = g_pipeline_pending.load(std::memory_order_relaxed);
         if (pending + bytes <= g_candidate_limit &&
             g_pipeline_pending.compare_exchange_weak(pending, pending + bytes)) {
+            // Retained free slabs and charged queue/TX slabs share one budget.
+            while (g_async_optimized && !g_candidate_free.empty() &&
+                   g_candidate_retained + pending + bytes > g_candidate_limit) {
+                g_candidate_retained -= g_candidate_free.back().capacity();
+                g_candidate_free.pop_back();
+            }
             uint64_t high = g_pipeline_highwater.load();
             while (high < pending + bytes &&
                    !g_pipeline_highwater.compare_exchange_weak(high, pending + bytes)) {}
@@ -52,7 +64,36 @@ void reserve_candidate_bytes(size_t bytes) {
             fprintf(stderr, "[MPI-CANDIDATE-BACKPRESSURE] rank=%d limit_bytes=%zu; async credit wait\n",
                     g_rank, g_candidate_limit);
         }
+        if (pool_lock.owns_lock()) pool_lock.unlock();
         usleep(1000);
+    }
+}
+
+std::vector<uint8_t> candidate_buffer(size_t capacity, size_t bytes) {
+    if (g_async_optimized) {
+        std::lock_guard<std::mutex> lock(g_candidate_pool_mutex);
+        for (size_t i = 0; i < g_candidate_free.size(); ++i) {
+            if (g_candidate_free[i].capacity() != capacity) continue;
+            auto buffer = std::move(g_candidate_free[i]);
+            g_candidate_free.erase(g_candidate_free.begin()+i);
+            g_candidate_retained -= capacity;
+            buffer.resize(bytes); ++g_candidate_reuses;
+            return buffer;
+        }
+    }
+    std::vector<uint8_t> buffer;
+    buffer.reserve(capacity); buffer.resize(bytes);
+    if (buffer.capacity() != capacity) throw std::runtime_error("unexpected candidate slab capacity");
+    ++g_candidate_allocations;
+    return buffer;
+}
+void recycle_candidate(std::vector<uint8_t> buffer) {
+    if (!g_async_optimized) return;
+    std::lock_guard<std::mutex> lock(g_candidate_pool_mutex);
+    if (g_candidate_retained + buffer.capacity() <= std::min<size_t>(8ULL<<20, g_candidate_limit) &&
+        g_candidate_retained + buffer.capacity() + g_pipeline_pending.load() <= g_candidate_limit) {
+        g_candidate_retained += buffer.capacity();
+        g_candidate_free.push_back(std::move(buffer));
     }
 }
 
@@ -77,8 +118,9 @@ int pipeline_filter(int csd, int8_t *vec, int32_t *norm, uint16_t *score,
         if (indices.empty()) continue;
         const uint32_t count = indices.size();
         const size_t bytes = 4 + count * stride;
-        reserve_candidate_bytes(bytes);
-        std::vector<uint8_t> batch(bytes);
+        const size_t charged = g_async_optimized ? capacity : bytes;
+        reserve_candidate_bytes(charged);
+        auto batch = candidate_buffer(charged, bytes);
         memcpy(batch.data(), &count, 4);
         uint8_t *uids = batch.data() + 4;
         uint8_t *norms = uids + count * 8;
@@ -93,6 +135,7 @@ int pipeline_filter(int csd, int8_t *vec, int32_t *norm, uint16_t *score,
         }
         std::lock_guard<std::mutex> lock(queue->mutex);
         queue->batches.emplace_back(std::move(batch));
+        g_candidate_queued_bytes.fetch_add(bytes, std::memory_order_release);
         g_ready_batches.fetch_add(1, std::memory_order_release);
     }
     int local = 0;
@@ -160,6 +203,7 @@ struct pipeline_t {
     std::vector<uint8_t> bucket_done;
     std::vector<int> bucket_lane;
     uint64_t sent[2] = {}, applied[2] = {};
+    uint64_t payload_sent[2] = {}, candidate_ready_since = 0;
     pipeline_done_t local_done, peer_done;
     MPI_Request done_send = MPI_REQUEST_NULL, done_recv = MPI_REQUEST_NULL;
     bool published_done = false, received_done = false;
@@ -242,7 +286,14 @@ struct pipeline_t {
         return true;
     }
     bool candidates_ready() {
-        return g_ready_batches.load(std::memory_order_acquire) != 0;
+        if (!g_ready_batches.load(std::memory_order_acquire)) { candidate_ready_since = 0; return false; }
+        if (!g_async_optimized) return true;
+        const uint64_t now = pipeline_now_ns();
+        if (!candidate_ready_since) candidate_ready_since = now;
+        return g_candidate_queued_bytes.load() >= std::min<size_t>(256ULL<<10, g_candidate_limit) ||
+               g_pipeline_pending.load() >= g_candidate_limit ||
+               now-candidate_ready_since >= 100000 ||
+               (next_export == int(ids.size()) && finalized.load() == owned && bwc->num_active() == 0);
     }
     void pack(pipeline_slot_t &slot, int c) {
         const auto start = std::chrono::steady_clock::now();
@@ -250,10 +301,14 @@ struct pipeline_t {
         h.kind = c; h.csd = csd; h.wave = base;
         uint8_t *payload = slot.data + sizeof(h);
         const size_t capacity = slot.capacity - sizeof(h);
+        wire_crc32c crc;
+        slot.charged = 0;
         if (!c) {
             size_t used = 0;
             if (bwc->mpi_export_bucket_frame(ids[slot.bucket_index], payload, capacity,
-                                             &used, &slot.cursor)) throw std::runtime_error("bucket export");
+                                             &used, &slot.cursor,
+                                             g_async_optimized ? wire_crc32c::copy_callback : nullptr,
+                                             g_async_optimized ? &crc : nullptr)) throw std::runtime_error("bucket export");
             h.bucket = base + slot.bucket_index;
             h.part = slot.part++;
             h.final = slot.cursor.done;
@@ -272,17 +327,21 @@ struct pipeline_t {
                 auto &batches = queue->batches;
                 while (!batches.empty() && h.bytes + batches.front().size() <= capacity) {
                     const auto &batch = batches.front();
-                    memcpy(payload + h.bytes, batch.data(), batch.size());
+                    if (g_async_optimized) crc.copy(payload + h.bytes, batch.data(), batch.size());
+                    else memcpy(payload + h.bytes, batch.data(), batch.size());
+                    slot.charged += g_async_optimized ? batch.capacity() : batch.size();
                     h.bytes += batch.size();
+                    g_candidate_queued_bytes.fetch_sub(batch.size());
+                    auto retired = std::move(batches.front());
                     batches.pop_front();
+                    recycle_candidate(std::move(retired));
                     g_ready_batches.fetch_sub(1);
                 }
             }
-            slot.charged = h.bytes;
             if (h.bytes) ++slot.part;
         }
         const auto crc_start = pipeline_now_ns();
-        h.checksum = checksum64(payload, h.bytes);
+        h.checksum = g_async_optimized ? crc.finish() : checksum64(payload, h.bytes);
         g_crc_ns += pipeline_now_ns()-crc_start;
         if (h.bytes && test_corrupt.exchange(false)) payload[0] ^= 1;
         slot.header = h;
@@ -436,6 +495,7 @@ struct pipeline_t {
             check(MPI_Isend(slot.data, sizeof(pipeline_header_t)+slot.header.bytes, MPI_BYTE,
                             1-g_rank, data_tag(c,k), MPI_COMM_WORLD, &slot.data_request));
             g_sent_bytes += slot.header.bytes; ++sent[c];
+            payload_sent[c] += slot.header.bytes;
             g_wire_exchanges.fetch_add(1);
             if (c) g_candidate_sequence.fetch_add(1);
             slot.state = 2;
@@ -497,6 +557,13 @@ struct pipeline_t {
                (unsigned long long)sent[0], (unsigned long long)sent[1],
                (unsigned long long)g_pipeline_highwater.load());
         fflush(stdout);
+        printf("[MPI-ASYNC-PROFILE] profile=%s bucket_bytes=%llu candidate_bytes=%llu "
+               "candidate_frame_mean_bytes=%.1f allocations=%llu reuses=%llu\n",
+               g_async_optimized ? "optimized" : "baseline",
+               (unsigned long long)payload_sent[0], (unsigned long long)payload_sent[1],
+               sent[1] ? double(payload_sent[1])/sent[1] : 0.0,
+               (unsigned long long)g_candidate_allocations.load(),
+               (unsigned long long)g_candidate_reuses.load());
         const auto starts = g_bucket_started.load()-bucket_start0;
         printf("[MPI-PRESSURE] rank=%d wave=%llu checksum_worker_s=%.6f swc_wait_s=%.6f "
                "uid_commit_wait_s=%.6f ready_to_dequeue_mean_ms=%.6f dequeued=%llu\n",

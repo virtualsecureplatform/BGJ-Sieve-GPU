@@ -32,6 +32,16 @@ class ReplaySummaryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             REPLAY.summarize(self.measurements()[:-1])
 
+    def test_profile_gate_compares_async_to_async(self):
+        results = [{'csd': dimension, 'profile': profile, 'warmup': pair == 0,
+                    'seconds': seconds}
+                   for dimension in (128,144) for pair in range(4)
+                   for profile,seconds in (('baseline',10),('optimized',9))]
+        self.assertTrue(all(item['passed'] for item in REPLAY.summarize_profiles(results).values()))
+        for row in results:
+            if row['profile'] == 'optimized': row['seconds'] = 9.1
+        self.assertFalse(any(item['passed'] for item in REPLAY.summarize_profiles(results).values()))
+
     def test_exact_result_parser(self):
         match = REPLAY.RESULT.fullmatch('[MPI-REPLAY] csd=144 mode=async elapsed_seconds=1.2 '
                                        'bucket_records=33555520 candidate_records=524350')

@@ -1,6 +1,7 @@
 #include "../include/mpi_sieve.h"
 #include "../include/bgj_hd.h"
 #include "../include/sieve_cache_budget.h"
+#include "../include/wire_crc32c.h"
 
 #include <mpi.h>
 #include <cuda_runtime.h>
@@ -34,6 +35,7 @@ int g_world = 1;
 std::size_t g_frame_bytes = 256ULL << 20;
 std::size_t g_sync_frame_bytes = 256ULL << 20;
 bool g_async_mode = false;
+bool g_async_optimized = false;
 std::string g_checkpoint_root;
 std::mutex g_candidate_mutex;
 std::size_t g_candidate_limit = 1ULL << 30;
@@ -236,6 +238,9 @@ int mpi_sieve_runtime_init(const char *checkpoint_root, int frame_mib,
     const char *pipeline = getenv("HD_MPI_PIPELINE");
     if (pipeline && strcmp(pipeline, "legacy") && strcmp(pipeline, "async")) return -1;
     g_async_mode = pipeline && !strcmp(pipeline, "async");
+    const char *profile = getenv("HD_MPI_ASYNC_PROFILE");
+    if (profile && strcmp(profile, "baseline") && strcmp(profile, "optimized")) return -1;
+    g_async_optimized = profile && !strcmp(profile, "optimized");
     const int settings[2] = {g_async_mode ? 3 : 2, frame_mib};
     int peer_settings[2][2];
     MPI_Allgather(settings, 2, MPI_INT, peer_settings, 2, MPI_INT, MPI_COMM_WORLD);
