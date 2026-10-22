@@ -35,7 +35,7 @@ apptainer exec --nv --bind /opt/system,"${MPI_BASE}" "${MPI_SIF}" bash -lc \
     "make -B -C '${SOURCE}/app' -j 4 hd_sieve hd_sieve_mpi hd_phase_bench hd_phase_bench_mpi ut_checker_resize_test CPPFLAGS='${FLAGS}' MPI_CPPFLAGS='${MPI_CPPFLAGS}' MPI_LIBDIR='${MPI_LIBDIR}'"
 mkdir -p "${RUN}/tests/ut-checker-resize"
 apptainer exec --nv --bind /opt/system,"${MPI_BASE}" "${MPI_SIF}" bash -lc \
-    "cd '${RUN}/tests/ut-checker-resize' && env ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 HD_HBM_PWC_GB=0 HD_HBM_PWC_WRITEBACK=0 HD_EAGER_HOST_ARENA=0 HD_FAIL_ON_SPILL=1 '${SOURCE}/app/ut_checker_resize_test'"
+    "cd '${RUN}/tests/ut-checker-resize' && timeout --signal=TERM --kill-after=10 180 env ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 HD_HBM_PWC_GB=0 HD_HBM_PWC_WRITEBACK=0 HD_EAGER_HOST_ARENA=0 HD_FAIL_ON_SPILL=1 '${SOURCE}/app/ut_checker_resize_test'"
 if [[ "${BUILD_ONLY:-0}" == 1 ]]; then
     echo "PASS: MPI and serial binaries compiled; source=${SOURCE_COMMIT} run=${RUN}"
     exit 0

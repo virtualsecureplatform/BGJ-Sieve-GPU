@@ -34,7 +34,7 @@ ut_checker_resize_test: ../tests/test_ut_checker_resize.cpp ../src/pool_hd.cpp .
 		-c ../src/pool_hd.cpp -o ut_checker_resize_pool.o
 	$(CXX) $(CFLAGS) $(CPPFLAGS) -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
 		-c ../tests/test_ut_checker_resize.cpp -o ut_checker_resize_test.o
-	$(NVCC) -ccbin $(CXX) -Xcompiler "$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
+	$(NVCC) -ccbin $(CXX) -Xcompiler "$(CFLAGS) -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer" \
 		ut_checker_resize_test.o ut_checker_resize_pool.o $(LIBS) $(SURP) -lcudart -lnuma \
 		-Xlinker --wrap=calloc -Xlinker --wrap=_Z19_start_ck_allocatorv -o $@
 
