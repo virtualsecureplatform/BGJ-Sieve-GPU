@@ -1275,6 +1275,12 @@ int buc_buffer_holder_t::device_init(int tid) {
         CHECK_CUDA_ERR(cudaMalloc(&d_center16[device_ptr], max_batch0 * CSD16 * sizeof(int8_t)));
     CHECK_CUDA_ERR(cudaMalloc(&d_norm[tid], traits::taskVecs * sizeof(int32_t)));
     CHECK_CUDA_ERR(cudaMalloc(&d_vec[tid], traits::taskVecs * CSD16 * sizeof(int8_t)));
+    // Kernels prefetch whole tiles even for empty/partial tasks. Initialize the
+    // allocation once; per-task tail norms are masked by the existing kernel.
+    CHECK_CUDA_ERR(cudaMemsetAsync(d_norm[tid], 0x3f,
+                                  traits::taskVecs * sizeof(int32_t), streams[tid]));
+    CHECK_CUDA_ERR(cudaMemsetAsync(d_vec[tid], 0,
+                                  traits::taskVecs * CSD16, streams[tid]));
     CHECK_CUDA_ERR(cudaMalloc(&d_n[tid], sizeof(int32_t)));
     CHECK_CUDA_ERR(cudaMalloc(&d_out[tid], max_batch0 * (out_max_size + 1L) * sizeof(uint32_t)));
     if (gpu_native) {
@@ -1410,6 +1416,10 @@ int buc_buffer_holder_t::device_done(int tid) {
 }
 
 int buc_buffer_holder_t::center_prep(int batch0, int &first_batch) {
+    if (batch0 < 16 || batch0 > max_batch0 || (batch0 & (batch0-1))) {
+        fprintf(stderr, "[BUCKET-BOUNDS] invalid center batch=%d capacity=%ld\n",batch0,(long)max_batch0);
+        abort();
+    }
     /// sample centers
     int center_norm = 0;
 
