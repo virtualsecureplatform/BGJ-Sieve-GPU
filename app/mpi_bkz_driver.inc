@@ -159,7 +159,8 @@ void copy_pool_tree(const fs::path &source, const fs::path &destination) {
         fs::copy_file(source/files[i], destination/files[i], fs::copy_options::overwrite_existing);
     });
 }
-void inventory(const fs::path &dir, bool verify) {
+using snapshot_hashes_t = std::map<std::string, std::pair<uint64_t, uint64_t>>;
+void inventory(const fs::path &dir, bool verify, const snapshot_hashes_t *known = nullptr) {
     if (verify) {
         std::ifstream in(dir / "FILES"); std::string name; uint64_t size, hash; size_t count = 0;
         struct item { fs::path path; uint64_t size, hash; };
@@ -186,8 +187,12 @@ void inventory(const fs::path &dir, bool verify) {
         checkpoint_parallel(files.size(), [&](size_t i) {
             const auto &path = files[i]; durable(path);
             std::ostringstream line;
-            line << std::quoted(path.lexically_relative(dir).string()) << ' '
-                 << fs::file_size(path) << ' ' << file_hash(path) << '\n';
+            const std::string relative = path.lexically_relative(dir).string();
+            const auto cached = known ? known->find(relative) : snapshot_hashes_t::const_iterator{};
+            const uint64_t size = fs::file_size(path);
+            if (known && cached != known->end()) require(size == cached->second.first, "snapshot length changed");
+            const uint64_t hash = known && cached != known->end() ? cached->second.second : file_hash(path);
+            line << std::quoted(relative) << ' ' << size << ' ' << hash << '\n';
             lines[i] = line.str();
         });
         std::ostringstream out;
@@ -198,7 +203,80 @@ void inventory(const fs::path &dir, bool verify) {
         durable(dir, true);
     }
 }
+
+bool direct_checkpoint_writer() {
+    const char *mode = getenv("HD_MPI_CHECKPOINT_WRITER");
+    require(!mode || !strcmp(mode, "legacy") || !strcmp(mode, "direct"), "invalid checkpoint writer");
+    return mode && !strcmp(mode, "direct");
+}
+
+// Quiescent pool-cache export. The existing V2 reader expects a 12-byte header,
+// full-width SoA columns and, for ONE_TIME_IO, 4084 trailing alignment bytes.
+// Read through fetch() so authoritative HBM/dirty host contents win over disk.
+snapshot_hashes_t snapshot_pool(Pool_hd_t &pool, const fs::path &destination) {
+    auto *manager = pool.pwc_manager;
+    require(manager->wait_work() == 0, "snapshot pool I/O not quiescent");
+    const long count = manager->num_chunks();
+    std::vector<std::string> names(count);
+    std::vector<std::pair<uint64_t,uint64_t>> hashes(count);
+    for (long id = 0; id < count; ++id) {
+        char name[128];
+        snprintf(name, sizeof(name), "pool/%s/%s%06lx", hw::ssd_name(id), manager->pfx(), id);
+        names[id] = name;
+        fs::create_directories((destination/names[id]).parent_path());
+    }
+    std::atomic<uint64_t> vectors{0};
+    checkpoint_parallel(count, [&](size_t id) {
+        chunk_t *chunk = manager->fetch(id);
+        require(chunk != nullptr,"direct snapshot cache fetch");
+        try {
+            require(chunk->size > 0 && chunk->size <= Pool_hd_t::chunk_max_nvecs,
+                    "direct snapshot requires dense live chunks");
+            const fs::path path = destination/names[id];
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            require(bool(out), "open direct snapshot chunk");
+            uint64_t size = 0, hash = 1469598103934665603ULL;
+            auto append = [&](const void *data, size_t bytes) {
+                out.write(static_cast<const char *>(data), bytes);
+                require(bool(out), "write direct snapshot chunk");
+                hash = hash_bytes(hash, data, bytes); size += bytes;
+            };
+            uint8_t header[12] = {};
+            const uint16_t n = chunk->size;
+            memcpy(header, &n, 2); memcpy(header+2, &pool.basis_hash, 8);
+            header[10] = pool.index_l; header[11] = pool.index_r;
+            append(header, sizeof(header));
+            append(chunk->score, Pool_hd_t::chunk_max_nvecs*sizeof(uint16_t));
+            append(chunk->norm, Pool_hd_t::chunk_max_nvecs*sizeof(int32_t));
+            append(chunk->u, Pool_hd_t::chunk_max_nvecs*sizeof(uint64_t));
+            append(chunk->vec, Pool_hd_t::chunk_max_nvecs*pool.CSD);
+            if (ONE_TIME_IO) { uint8_t padding[4084] = {}; append(padding, sizeof(padding)); }
+            out.close(); require(bool(out), "close direct snapshot chunk");
+            durable(path);
+            hashes[id] = {size, hash}; vectors += chunk->size;
+        } catch (...) { manager->release(id); throw; }
+        // Snapshot publication must not mark mutable cache backing files clean.
+        manager->release(id);
+    });
+    require(vectors == uint64_t(manager->num_vec()), "direct snapshot vector count changed");
+    snapshot_hashes_t result;
+    for (long id = 0; id < count; ++id) result.emplace(names[id], hashes[id]);
+    return result;
+}
+
+std::pair<uint64_t,uint64_t> process_io() {
+    std::ifstream in("/proc/self/io"); std::string key; uint64_t value;
+    std::pair<uint64_t,uint64_t> result{};
+    while (in >> key >> value) {
+        if (key == "read_bytes:") result.first = value;
+        if (key == "write_bytes:") result.second = value;
+    }
+    return result;
+}
 void commit(state_t &s, Lattice_QP &full, Lattice_QP *local, Pool_hd_t *pool) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto io_before = process_io();
+    const bool direct = direct_checkpoint_writer();
     const int rank = mpi_sieve_rank();
     live_phase.store(100); // Explicit checkpoint I/O, not a stalled GPU sieve.
     mpi_sieve_agree_basis(&full, "checkpoint-full");
@@ -210,12 +288,14 @@ void commit(state_t &s, Lattice_QP &full, Lattice_QP *local, Pool_hd_t *pool) {
             fflush(stdout); fflush(stderr);
             require(check_rc == 0, "pre-checkpoint pool check");
         }
-        require(pool->store(true) == 0, "pool flush");
+        if (!direct) require(pool->store(true) == 0, "pool flush");
         s.left = pool->index_l; s.right = pool->index_r; s.csd = pool->CSD;
         s.basis_hash = pool->basis_hash; s.local_vectors = pool->pwc_manager->num_vec();
         for (long i = 0; i < pool->CSD; ++i) s.coeff[i] = pool->uid_table->coeff(i);
         uint64_t bytes = 0;
-        for (const auto &file : fs::recursive_directory_iterator(".pool"))
+        if (direct) bytes = pool->pwc_manager->num_chunks() *
+            uint64_t((ONE_TIME_IO ? 4096 : 12) + Pool_hd_t::chunk_max_nvecs * (14+pool->CSD));
+        else for (const auto &file : fs::recursive_directory_iterator(".pool"))
             if (file.is_regular_file()) bytes += file.file_size();
         const uint64_t needed = mpi_sieve_global_u64(bytes);
         uint64_t available = fs::space(root).available, minimum = 0;
@@ -232,9 +312,13 @@ void commit(state_t &s, Lattice_QP &full, Lattice_QP *local, Pool_hd_t *pool) {
     fs::create_directories(dst);
     save_basis(full, dst/"full.qp");
     if (local) save_basis(*local, dst/"local.qp");
-    if (pool) copy_pool_tree(".pool", dst/"pool");
+    snapshot_hashes_t known;
+    if (pool) {
+        if (direct) known = snapshot_pool(*pool, dst);
+        else copy_pool_tree(".pool", dst/"pool");
+    }
     atomic_text(dst/"STATE", encode(s));
-    inventory(dst, false);
+    inventory(dst, false, direct ? &known : nullptr);
     const char *fault = getenv("HD_MPI_BKZ_FAULT");
     if (fault && s.sequence > 1 && rank == 1 && !strcmp(fault, "after-rank-snapshot"))
         MPI_Abort(MPI_COMM_WORLD, 86);
@@ -270,8 +354,19 @@ void commit(state_t &s, Lattice_QP &full, Lattice_QP *local, Pool_hd_t *pool) {
         }
     }
     MPI_Barrier(MPI_COMM_WORLD);
+    const auto io_after = process_io();
+    uint64_t serialized = 0;
+    for (const auto &entry : fs::recursive_directory_iterator(dst))
+        if (entry.is_regular_file()) serialized += entry.file_size();
+    printf("[MPI-CHECKPOINT] rank=%d writer=%s sequence=%llu seconds=%.6f serialized_bytes=%llu "
+           "read_bytes=%llu write_bytes=%llu\n", rank, direct ? "direct" : "legacy",
+           (unsigned long long)s.sequence,
+           std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count(),
+           (unsigned long long)serialized, (unsigned long long)(io_after.first-io_before.first),
+           (unsigned long long)(io_after.second-io_before.second));
+    fflush(stdout);
 }
-uint64_t identity(task_config_t &t) {
+uint64_t identity(task_config_t &t, const char *source_commit = nullptr) {
     std::ostringstream out;
     out << file_hash(t.basis_file) << ' ' << t.task << ' ' << t.bkz_sieving_dim << ' '
         << t.bkz_dim_for_free << ' ' << t.bkz_jump_step << ' ' << t.bkz_start_index << ' '
@@ -282,7 +377,9 @@ uint64_t identity(task_config_t &t) {
     for (const char *key : {"HD_SOURCE_COMMIT", "HD_SIZE_RATIO", "HD_BGJ2_MIN_CSD",
             "HD_BGJ3_MIN_CSD", "HD_USE_BGJ3L", "HD_FAIL_ON_SPILL", "HD_POOL_THREADS",
             "HD_BGJ2_REDUCER_THREADS", "HD_BUCKET_THREADS"})
-        out << ' ' << key << '=' << (getenv(key) ? getenv(key) : "");
+        out << ' ' << key << '=' <<
+            (source_commit && !strcmp(key, "HD_SOURCE_COMMIT") ? source_commit :
+             (getenv(key) ? getenv(key) : ""));
     auto text = out.str(); return hash_bytes(1469598103934665603ULL, text.data(), text.size());
 }
 NTL::mat_ZZ integers(Lattice_QP &basis) {
@@ -430,6 +527,111 @@ void restore_pool_exact(Pool_hd_t &pool, const state_t &s) {
     fprintf(stderr, "[MPI-BKZ] exact pool restore rank=%d vectors=%llu chunks=%zu\n",
             mpi_sieve_rank(), (unsigned long long)total, chunks.size());
 }
+
+// Explicit, narrowly reviewed record-preserving import. Normal resume never
+// substitutes a source revision or accepts a mismatched identity.
+int import_checkpoint(task_config_t &task, const fs::path &source_root,
+                      uint64_t sequence, const std::string &source_commit) {
+    const char *target_commit = getenv("HD_SOURCE_COMMIT");
+    require(target_commit && strlen(target_commit) == 40, "import requires target source revision");
+    require(source_commit == "c970044a5bb715bc6ac69c76e47d49fa75a27c25" || source_commit == target_commit,
+            "unreviewed checkpoint source revision");
+    const fs::path source = fs::canonical(source_root), target = fs::weakly_canonical(root);
+    auto nested = [](const fs::path &a, const fs::path &b) {
+        const auto relative = a.lexically_relative(b);
+        return relative.empty() || (relative.begin() != relative.end() && *relative.begin() != "..");
+    };
+    require(!nested(source,target) && !nested(target,source), "import roots overlap");
+    const int lock = open((source/"RUN.lock").c_str(), O_RDONLY);
+    require(lock >= 0 && flock(lock, LOCK_SH | LOCK_NB) == 0, "source checkpoint is in use");
+    struct close_t { int fd; ~close_t() { close(fd); } } source_lock{lock};
+    require(sequence > 0, "invalid import generation");
+    const int rank = mpi_sieve_rank();
+    const fs::path src = source/("generation-"+std::to_string(sequence))/("rank"+std::to_string(rank));
+    printf("[MPI-IMPORT] rank=%d stage=inventory source_generation=%llu\n",rank,(unsigned long long)sequence);
+    fflush(stdout);
+    inventory(src, true);
+    state_t saved = decode(src/"STATE");
+    uint64_t original_identity = 0;
+    { std::ifstream in(source/"IDENTITY-BKZ"); in >> original_identity; require(bool(in), "missing source identity"); }
+    require(saved.sequence == sequence && saved.identity == original_identity &&
+            saved.identity == identity(task, source_commit.c_str()), "source configuration/identity mismatch");
+    require(saved.next != 4, "import requires an in-pump pool snapshot");
+    const auto peer = decode(source/("generation-"+std::to_string(sequence))/
+                             ("rank"+std::to_string(1-rank))/"STATE");
+    require(peer.sequence == sequence && peer.identity == saved.identity && peer.pump == saved.pump &&
+            peer.left == saved.left && peer.right == saved.right && peer.csd == saved.csd &&
+            peer.cursor == saved.cursor && peer.next == saved.next && peer.basis_hash == saved.basis_hash &&
+            std::equal(saved.coeff,saved.coeff+176,peer.coeff), "source rank phase mismatch");
+    auto full = load_basis(src/"full.qp"), local = load_basis(src/"local.qp");
+    require(local->NumRows() >= saved.right && saved.right-saved.left == saved.csd,
+            "source projected basis shape mismatch");
+    require(mpi_sieve_agree_basis(full.get(), "import-full") == 0 &&
+            mpi_sieve_agree_basis(local.get(), "import-local") == 0, "source basis rank mismatch");
+    Lattice_QP input(task.basis_file);
+    exact_equivalent(integers(input), *full);
+    printf("[MPI-IMPORT] rank=%d stage=copy-and-restore vectors=%llu csd=%ld\n",rank,
+           (unsigned long long)saved.local_vectors,saved.csd); fflush(stdout);
+    copy_pool_tree(src/"pool", ".pool");
+    {
+        Pool_hd_t pool(local.get());
+        require(pool.set_sieving_context(saved.left,saved.right) == 0, "import context");
+        pool.set_num_threads(configured_pool_threads()); pool.set_boost_depth(0);
+        pool.basis_hash = saved.basis_hash; pool.pwc_manager->set_pool(&pool);
+        require(pool.uid_table->reset_hash_function(pool.CSD,saved.coeff) == 0, "import UID coefficients");
+        restore_pool_exact(pool,saved);
+        printf("[MPI-IMPORT] rank=%d stage=pool-check\n",rank); fflush(stdout);
+        require(pool.check(3) == 0, "import vector/UID/norm/score validation");
+        MPI_Barrier(MPI_COMM_WORLD);
+        const uint64_t new_identity = identity(task);
+        uint64_t identities[2];
+        MPI_Allgather(&new_identity,1,MPI_UINT64_T,identities,1,MPI_UINT64_T,MPI_COMM_WORLD);
+        require(identities[0] == identities[1], "target import configuration disagreement");
+        if (!rank) {
+            std::ostringstream provenance;
+            provenance << "BGJ_MPI_IMPORT_V1\nsource_root " << std::quoted(source.string())
+                       << "\nsource_commit " << source_commit << "\nsource_generation " << sequence
+                       << "\nsource_identity " << saved.identity << "\ntarget_commit " << target_commit
+                       << "\ntarget_identity " << new_identity << '\n';
+            atomic_text(root/"IMPORT-BKZ",provenance.str());
+            atomic_text(root/"IDENTITY-BKZ",std::to_string(new_identity)+"\n");
+        }
+        saved.identity = new_identity; saved.sequence = 0;
+        printf("[MPI-IMPORT] rank=%d stage=publish\n",rank); fflush(stdout);
+        // Import is a single immutable export, never a rewrite of the source.
+        setenv("HD_MPI_CHECKPOINT_WRITER","direct",1);
+        commit(saved,*full,local.get(),&pool);
+    }
+    if (!rank) printf("PASS: verified checkpoint import; resume generation 1 in %s\n",root.c_str());
+    return 0;
+}
+
+int benchmark_checkpoints(state_t &state, Lattice_QP &full, Lattice_QP &local, Pool_hd_t &pool) {
+    require(getenv("HD_LAZY_SYNC") && !strcmp(getenv("HD_LAZY_SYNC"),"1"),
+            "checkpoint benchmark requires lazy sync");
+    const uint64_t bytes = pool.pwc_manager->num_chunks() *
+        uint64_t((ONE_TIME_IO ? 4096 : 12)+Pool_hd_t::chunk_max_nvecs*(14+pool.CSD));
+    for (int pair = 0; pair < 4; ++pair) for (int position = 0; position < 2; ++position) {
+        const bool direct = (position + pair) % 2;
+        // Equal dirty state for each trial. Otherwise the first legacy flush
+        // unfairly pays writes that later legacy trials would skip.
+        for (long id = 0; id < pool.pwc_manager->num_chunks(); ++id) {
+            require(pool.pwc_manager->fetch(id) != nullptr, "benchmark fetch");
+            pool.pwc_manager->release_sync(id);
+        }
+        setenv("HD_MPI_CHECKPOINT_WRITER",direct ? "direct" : "legacy",1);
+        const double start = MPI_Wtime();
+        commit(state,full,&local,&pool);
+        const double local_seconds = MPI_Wtime()-start;
+        double seconds = 0;
+        MPI_Allreduce(&local_seconds,&seconds,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+        if (!mpi_sieve_rank()) printf("[MPI-CHECKPOINT-BENCH] pair=%d writer=%s seconds=%.6f "
+            "pool_write_bytes_per_rank=%llu\n",pair,direct ? "direct" : "legacy",seconds,
+            (unsigned long long)(bytes*(direct ? 1 : 2)));
+        fflush(stdout);
+    }
+    return 75; // Benchmark root is diagnostic, never continue a sieve here.
+}
 } // namespace mpi_bkz
 
 int mpi_bkz_run(void *opaque) {
@@ -519,6 +721,8 @@ int mpi_bkz_run(void *opaque) {
                 const int check_rc = pool.check(3);
                 fflush(stdout); fflush(stderr);
                 require(check_rc == 0, "recovered pool check");
+                if (getenv("HD_MPI_CHECKPOINT_BENCHMARK"))
+                    return benchmark_checkpoints(s,*full,*local,pool);
             } else {
                 s.cursor = 0; s.next = 0;
                 const long target = BGJ1_SIZE_RATIO * pow(4./3., pool.CSD*.5) - 5;

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Small two-node GPU integration tests. Run only inside a Slurm allocation."""
 import argparse
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -23,7 +24,8 @@ def main():
 
     def run(name, options, overrides=None, expected=0, frame_mib=1):
         root = args.root / name
-        root.mkdir(exist_ok=True)
+        if '--import-checkpoint' not in options:
+            root.mkdir(exist_ok=True)
         env = dict(os.environ)
         env.update(overrides or {})
         output = [] if '--task' in options and options[options.index('--task')+1] == 'sieve' else [
@@ -32,6 +34,7 @@ def main():
             '--checkpoint-root', str(root), '--mpi-frame-mib', str(frame_mib)] + options
         result = subprocess.run(command, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, timeout=1200)
+        root.mkdir(exist_ok=True)
         with (root/'test.log').open('ab') as log:
             log.write(result.stdout)
         if expected is None:
@@ -120,6 +123,34 @@ def main():
     check_snapshot_pool(root, seq)
     state = (root/('generation-%d/rank0/STATE' % seq)).read_text().split()
     assert int(state[9]) == 60 and int(state[11]) == 2
+    # Import must preserve record bytes, full/projected bases, and the source.
+    source_commit = os.environ['APPTAINERENV_HD_SOURCE_COMMIT']
+    snapshot = root/('generation-%d' % seq)
+    def digest_tree(directory):
+        return {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in directory.rglob('*') if p.is_file()}
+    original = digest_tree(snapshot)
+    imported = run('verified-import', pump + ['--import-checkpoint',str(root),
+        '--import-generation',str(seq),'--import-source-commit',source_commit])
+    assert digest_tree(snapshot) == original
+    check_snapshot_pool(imported,1)
+    for rank in (0,1):
+        before = snapshot/('rank%d' % rank)
+        after = imported/('generation-1/rank%d' % rank)
+        for name in ('full.qp','local.qp'):
+            assert (before/name).read_bytes() == (after/name).read_bytes()
+        for path in (before/'pool').rglob('*'):
+            if path.is_file():
+                size = 12+8192*(14+60)
+                assert path.read_bytes()[:size] == (after/path.relative_to(before)).read_bytes()[:size]
+    run('verified-import',pump,{'APPTAINERENV_HD_MPI_CHECKPOINT_WRITER':'legacy'})
+    run('import-reused-root',pump+['--import-checkpoint',str(root),
+        '--import-generation',str(seq),'--import-source-commit','0'*40],expected=None)
+    changed_import = list(pump); changed_import[changed_import.index('--MSD')+1] = '61'
+    run('import-wrong-config',changed_import+['--import-checkpoint',str(root),
+        '--import-generation',str(seq),'--import-source-commit',source_commit],expected=None)
+    run('verified-import',pump+['--import-checkpoint',str(root),
+        '--import-generation',str(seq),'--import-source-commit',source_commit],expected=None)
     run('phase-resume', pump, {'APPTAINERENV_HD_MPI_BKZ_MAX_PHASES': '1'}, 75)
     seq2 = int((root/'LATEST-BKZ').read_text())
     check_snapshot_pool(root, seq2)

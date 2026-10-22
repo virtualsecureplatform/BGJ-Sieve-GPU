@@ -75,10 +75,23 @@ int main(int argc, char **argv) {
     std::string checkpoint_root;
     int frame_mib = 256;
     bool resume = true;
+    std::string import_root, import_commit;
+    uint64_t import_generation = 0;
     std::vector<std::string> kept;
     kept.emplace_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--checkpoint-root")) {
+        if (!strcmp(argv[i], "--import-checkpoint")) {
+            if (++i >= argc) MPI_Abort(MPI_COMM_WORLD,2);
+            import_root = argv[i];
+        } else if (!strcmp(argv[i], "--import-source-commit")) {
+            if (++i >= argc) MPI_Abort(MPI_COMM_WORLD,2);
+            import_commit = argv[i];
+        } else if (!strcmp(argv[i], "--import-generation")) {
+            if (++i >= argc) MPI_Abort(MPI_COMM_WORLD,2);
+            char *end = nullptr;
+            import_generation = strtoull(argv[i], &end, 10);
+            if (!*argv[i] || *end || argv[i][0] == '-') MPI_Abort(MPI_COMM_WORLD,2);
+        } else if (!strcmp(argv[i], "--checkpoint-root")) {
             if (++i >= argc) { MPI_Abort(MPI_COMM_WORLD, 2); }
             checkpoint_root = argv[i];
         } else if (!strcmp(argv[i], "--mpi-frame-mib")) {
@@ -109,6 +122,15 @@ int main(int argc, char **argv) {
     checkpoint_root = std::filesystem::absolute(checkpoint_root).lexically_normal().string();
     mpi_bkz::root = checkpoint_root;
     mpi_bkz::resume_enabled = resume;
+    if (!import_root.empty() || !import_commit.empty() || import_generation) {
+        if (!bkz_mode || import_root.empty() || import_commit.empty() || !import_generation ||
+            std::filesystem::exists(checkpoint_root)) {
+            fprintf(stderr,"[MPI] import requires all three import options and an unused destination root\n");
+            MPI_Abort(MPI_COMM_WORLD,2);
+        }
+        // Resolve before entering the rank-local working directory.
+        import_root = std::filesystem::absolute(import_root).lexically_normal().string();
+    }
 
     // Make input/output paths independent of the rank-local working directory.
     for (std::size_t i = 1; i < kept.size(); ++i) {
@@ -126,6 +148,8 @@ int main(int argc, char **argv) {
         }
     }
 
+    // Every rank must check destination freshness before any rank creates it.
+    MPI_Barrier(MPI_COMM_WORLD);
     if (mpi_sieve_runtime_init(checkpoint_root.c_str(), frame_mib, resume, bkz_mode))
         MPI_Abort(MPI_COMM_WORLD, 2);
     int run_lock = -1;
@@ -180,7 +204,9 @@ int main(int argc, char **argv) {
             task_config_t task;
             if (task.parse_args((int)serial_argv.size(), serial_argv.data()))
                 throw std::runtime_error("invalid MPI BKZ arguments");
-            if (const char *spill = getenv("HD_MPI_SPILL_TEST")) {
+            if (!import_root.empty()) {
+                rc = mpi_bkz::import_checkpoint(task,import_root,import_generation,import_commit);
+            } else if (const char *spill = getenv("HD_MPI_SPILL_TEST")) {
                 Lattice_QP basis(task.basis_file);
                 Pool_hd_t pool(&basis);
                 if (pool.set_sieving_context(16, 80)) MPI_Abort(MPI_COMM_WORLD, 2);
