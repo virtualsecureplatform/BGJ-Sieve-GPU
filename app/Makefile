@@ -26,6 +26,18 @@ hd_phase_bench_mpi: bin_hd_phase_bench.cu bin_hd_sieve.cu mpi_sieve_runtime.cpp 
 	$(NVCC) -ccbin $(CXX) -Xcompiler "$(CFLAGS)" -O3 -DHD_PHASE_BENCH_MPI=1 \
 		bin_hd_phase_bench.cu mpi_sieve_runtime.cpp $(CPPFLAGS) $(MPI_CPPFLAGS) $(LIBS) $(MPI_LDFLAGS) $(SURP) -lcudart -lnuma -o $@
 
+# Instrument the real host checker implementation, not the CUDA kernels.
+# The arena-start wrapper avoids allocating a production 150+ GiB GPU cache
+# for a descriptor/UID-only test; calloc wrapping injects allocation failures.
+ut_checker_resize_test: ../tests/test_ut_checker_resize.cpp ../src/pool_hd.cpp ../include/pool_hd.h ../src/libllib.a
+	$(CXX) $(CFLAGS) $(CPPFLAGS) -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
+		-c ../src/pool_hd.cpp -o ut_checker_resize_pool.o
+	$(CXX) $(CFLAGS) $(CPPFLAGS) -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
+		-c ../tests/test_ut_checker_resize.cpp -o ut_checker_resize_test.o
+	$(NVCC) -ccbin $(CXX) -Xcompiler "$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
+		ut_checker_resize_test.o ut_checker_resize_pool.o $(LIBS) $(SURP) -lcudart -lnuma \
+		-Xlinker --wrap=calloc -Xlinker --wrap=_Z19_start_ck_allocatorv -o $@
+
 .PHONY: clean
 
 clean:

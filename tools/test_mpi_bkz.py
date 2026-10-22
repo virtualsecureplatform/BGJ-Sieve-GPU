@@ -13,9 +13,11 @@ def main():
     parser.add_argument('--wrapper', type=Path, required=True)
     parser.add_argument('--basis', type=Path, required=True)
     parser.add_argument('--root', type=Path, required=True)
+    parser.add_argument('--cache-pressure-only', action='store_true')
     args = parser.parse_args()
     if not os.environ.get('SLURM_JOB_ID'):
         parser.error('requires a two-node Slurm allocation')
+    args.root.mkdir(parents=True, exist_ok=True)
     launch = ['srun', '--mpi=pmix_v2', '--nodes=2', '--ntasks=2', '--ntasks-per-node=1',
               '--cpus-per-task=128', '--cpu-bind=none', '--kill-on-bad-exit=1', str(args.wrapper)]
 
@@ -40,6 +42,17 @@ def main():
         return root
 
     pump = ['--task', 'pump', '--ind_l', '0', '--ind_r', '80', '--SSD', '58', '--MSD', '60', '--DS']
+
+    def cache_pressure():
+        cache = run('pipeline-cache-pressure', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': '1',
+                    'APPTAINERENV_HD_MPI_PIPELINE_CACHE_TEST': '1'})
+        assert 'PASS: async SWC/UID pressure' in (cache/'test.log').read_text()
+
+    if args.cache_pressure_only:
+        if os.environ.get('APPTAINERENV_HD_MPI_PIPELINE') != 'async':
+            parser.error('--cache-pressure-only requires the async pipeline')
+        cache_pressure()
+        return
 
     def check_snapshot_pool(root, sequence):
         # The cache serializer places scores immediately after the 12-byte
@@ -75,9 +88,7 @@ def main():
             assert 'pipeline version/frame settings differ' in (mismatch/'test.log').read_text()
         finally:
             launch[-1] = original_wrapper
-        cache = run('pipeline-cache-pressure', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': '1',
-                    'APPTAINERENV_HD_MPI_PIPELINE_CACHE_TEST': '1'})
-        assert 'PASS: async SWC/UID pressure' in (cache/'test.log').read_text()
+        cache_pressure()
         run('control-delayed', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': '1',
                                      'APPTAINERENV_HD_MPI_PIPELINE_TEST_DELAY_US': '2000'})
         corrupted = run('control-corrupt-frame', pump, {

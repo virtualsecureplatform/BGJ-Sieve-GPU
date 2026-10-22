@@ -610,7 +610,9 @@ int pipeline_cache_pressure(Lattice_QP *basis) {
     pthread_spin_init(&stats_lock,PTHREAD_PROCESS_PRIVATE);
     uint64_t checked = 0, fresh = 0;
     ut_checker_t checker(ut_checker_t::type_sieve,&pool,pool.uid_table,(pwc_manager_t *)&solutions);
-    checker.set_num_threads(8); checker.set_max_holding(8); checker.set_exp_batch(4);
+    checker.set_num_threads(8);
+    if (checker.set_max_holding(8)) throw std::runtime_error("cache test UID-checker resize failed");
+    checker.set_exp_batch(4);
     checker.set_stuck_stat(&checked,&fresh,stats_lock);
     const int32_t ids[2] = {int32_t(buckets.push_bucket()),int32_t(buckets.push_bucket())};
     constexpr long total = 262144;

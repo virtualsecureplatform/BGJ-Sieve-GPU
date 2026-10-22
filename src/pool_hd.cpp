@@ -9,6 +9,10 @@
 #include <omp.h>
 #include <time.h>
 #include <chrono>
+#include <cstdlib>
+#include <limits>
+#include <new>
+#include <stdexcept>
 
 
 void report_host_memory(const char *phase, long csd) {
@@ -1036,6 +1040,28 @@ int Pool_hd_t::mpi_append_records(const uint8_t *records, long count,
     return 0;
 }
 
+namespace {
+// The public work views point one element beyond these allocation bases;
+// view[-1] is the full sentinel used by UID-only task_commit overloads.
+struct checker_buffer_t {
+    chunk_t *base = nullptr;
+    ~checker_buffer_t() { std::free(base); }
+    chunk_t *release_view() {
+        chunk_t *view = base + 1;
+        base = nullptr;
+        return view;
+    }
+};
+
+void release_checker_view(chunk_t *&view, long capacity, bool owns_uids) {
+    if (!view) return;
+    if (owns_uids)
+        for (long i = 0; i < capacity; ++i) std::free(view[i].u);
+    std::free(view - 1);
+    view = nullptr;
+}
+} // namespace
+
 ut_checker_t::ut_checker_t(long type, Pool_hd_t *p, UidTable *uid_table, pwc_manager_t *pwc_manager) {
     #if ENABLE_PROFILING
     this->logger = p->logger;
@@ -1070,7 +1096,16 @@ ut_checker_t::ut_checker_t(long type, Pool_hd_t *p, UidTable *uid_table, pwc_man
             long pwc_limit = _pwc_manager->max_cached_chunks() * 0.9;
             if (exp_max_holding > pwc_limit) exp_max_holding = pwc_limit;
         }
-        this->set_max_holding(exp_max_holding);
+        const int rc = exp_max_holding > std::numeric_limits<int>::max() ? -1 :
+                       this->set_max_holding((int)exp_max_holding);
+        if (rc) {
+            // The object's destructor is not called if construction throws.
+            // Member destructors still stop/join the idle worker pool.
+            pthread_barrier_destroy(&_ut_barrier);
+            pthread_spin_destroy(&_ut_lock);
+            if (rc == -2) throw std::bad_alloc();
+            throw std::invalid_argument("invalid initial UID-checker capacity");
+        }
     }
     {
         long uid_num = uid_table->size();
@@ -1102,24 +1137,17 @@ ut_checker_t::~ut_checker_t() {
     // _running_threads becomes zero before the final worker returns. Join
     // queued callbacks before freeing arrays or destroying their locks.
     _ut_pool.wait_sleep();
-    if (_type == type_shrink || _type == type_check) {
-        for (long i = 0; i < _max_holding; i++) {
-            if (_to_check[i].u) free(_to_check[i].u);
-            if (_in_check[i].u) free(_in_check[i].u);
-        }
-    }
-    if (_type == type_sieve) {
-        for (long i = 0; i < _max_holding; i++) {
-            if (_red_to_rm[i].u) free(_red_to_rm[i].u);
-            if (_red_in_rm[i].u) free(_red_in_rm[i].u);
-        }
-        if (_red_to_rm) free(_red_to_rm - 1);
-        if (_red_in_rm) free(_red_in_rm - 1);
-    }
-    if (_to_check) free(_to_check - 1);
-    if (_in_check) free(_in_check - 1);
+    _release_buffers();
     pthread_spin_destroy(&_ut_lock);
     pthread_barrier_destroy(&_ut_barrier);
+}
+
+void ut_checker_t::_release_buffers() {
+    const bool owns_inputs = _type == type_shrink || _type == type_check;
+    release_checker_view(_to_check, _max_holding, owns_inputs);
+    release_checker_view(_in_check, _max_holding, owns_inputs);
+    release_checker_view(_red_to_rm, _max_holding, _type == type_sieve);
+    release_checker_view(_red_in_rm, _max_holding, _type == type_sieve);
 }
 
 int ut_checker_t::set_num_threads(long num_threads) { 
@@ -1131,25 +1159,56 @@ int ut_checker_t::set_num_threads(long num_threads) {
 }
 
 int ut_checker_t::set_max_holding(int max_holding) {
-    this->_max_holding = max_holding;
-    _to_check = (chunk_t *) realloc(_to_check, sizeof(chunk_t) * (max_holding + 1));
-    _in_check = (chunk_t *) realloc(_in_check, sizeof(chunk_t) * (max_holding + 1));
-    _to_check[0].size = Pool_hd_t::chunk_max_nvecs;
-    _in_check[0].size = Pool_hd_t::chunk_max_nvecs;
-    _to_check++;
-    _in_check++; 
-    memset(_to_check, 0, sizeof(chunk_t) * max_holding);
-    memset(_in_check, 0, sizeof(chunk_t) * max_holding);
-    if (_type == type_sieve) {
-        _red_to_rm = (chunk_t *) realloc(_red_to_rm, sizeof(chunk_t) * (max_holding + 1));
-        _red_in_rm = (chunk_t *) realloc(_red_in_rm, sizeof(chunk_t) * (max_holding + 1));
-        _red_to_rm[0].size = Pool_hd_t::chunk_max_nvecs;
-        _red_in_rm[0].size = Pool_hd_t::chunk_max_nvecs;
-        _red_to_rm++;
-        _red_in_rm++;
-        memset(_red_to_rm, 0, sizeof(chunk_t) * max_holding);
-        memset(_red_in_rm, 0, sizeof(chunk_t) * max_holding);
+    if (max_holding <= 0 || (size_t)max_holding + 1 >
+            std::numeric_limits<size_t>::max() / sizeof(chunk_t)) return -1;
+    // Called with _ut_mutex held, following trigger_batch's lock order.
+    const auto idle_locked = [this] {
+        return !_running_threads.load() && !_num_to_check && !_num_in_check &&
+               !_num_red_to_rm && !_num_red_in_rm;
+    };
+    {
+        std::unique_lock<std::mutex> control(_ut_mutex);
+        pthread_spin_lock(&_ut_lock);
+        const bool idle = idle_locked();
+        pthread_spin_unlock(&_ut_lock);
+        if (!idle) return -1;
     }
+    // A final callback can set _running_threads=0 before returning. Never
+    // join while holding _ut_mutex: that tail may still trigger another batch.
+    _ut_pool.wait_sleep();
+    std::unique_lock<std::mutex> control(_ut_mutex);
+    pthread_spin_lock(&_ut_lock);
+    const bool idle = idle_locked();
+    pthread_spin_unlock(&_ut_lock);
+    if (!idle) return -1;
+    if (_max_holding == max_holding) return 0;
+
+    checker_buffer_t staged[4];
+    const int count = _type == type_sieve ? 4 : 2;
+    for (int i = 0; i < count; ++i) {
+        staged[i].base = (chunk_t *)std::calloc((size_t)max_holding + 1, sizeof(chunk_t));
+        if (!staged[i].base) return -2;
+        staged[i].base[0].size = Pool_hd_t::chunk_max_nvecs;
+    }
+    // A producer which violated the phase-owner precondition may have queued
+    // work during allocation. Refuse the resize rather than discarding it.
+    pthread_spin_lock(&_ut_lock);
+    if (!idle_locked()) {
+        pthread_spin_unlock(&_ut_lock);
+        return -1;
+    }
+    _release_buffers();
+    _to_check = staged[0].release_view();
+    _in_check = staged[1].release_view();
+    if (_type == type_sieve) {
+        _red_to_rm = staged[2].release_view();
+        _red_in_rm = staged[3].release_view();
+    }
+    _max_holding = max_holding;
+    _exp_batch = std::min<long>(_exp_batch, max_holding);
+    _need_batch.store(0);
+    _input_done.store(0);
+    pthread_spin_unlock(&_ut_lock);
     return 0;
 }
 

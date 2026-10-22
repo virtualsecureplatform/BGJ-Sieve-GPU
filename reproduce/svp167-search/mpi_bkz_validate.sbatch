@@ -32,7 +32,10 @@ if [[ "${REUSED}" == 0 ]]; then
         "make -B -C '${SOURCE}/src' -j 16 CPPFLAGS='${FLAGS}'"
 fi
 apptainer exec --nv --bind /opt/system,"${MPI_BASE}" "${MPI_SIF}" bash -lc \
-    "make -B -C '${SOURCE}/app' -j 4 hd_sieve hd_sieve_mpi hd_phase_bench hd_phase_bench_mpi CPPFLAGS='${FLAGS}' MPI_CPPFLAGS='${MPI_CPPFLAGS}' MPI_LIBDIR='${MPI_LIBDIR}'"
+    "make -B -C '${SOURCE}/app' -j 4 hd_sieve hd_sieve_mpi hd_phase_bench hd_phase_bench_mpi ut_checker_resize_test CPPFLAGS='${FLAGS}' MPI_CPPFLAGS='${MPI_CPPFLAGS}' MPI_LIBDIR='${MPI_LIBDIR}'"
+mkdir -p "${RUN}/tests/ut-checker-resize"
+apptainer exec --nv --bind /opt/system,"${MPI_BASE}" "${MPI_SIF}" bash -lc \
+    "cd '${RUN}/tests/ut-checker-resize' && env ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 HD_HBM_PWC_GB=0 HD_HBM_PWC_WRITEBACK=0 HD_EAGER_HOST_ARENA=0 HD_FAIL_ON_SPILL=1 '${SOURCE}/app/ut_checker_resize_test'"
 if [[ "${BUILD_ONLY:-0}" == 1 ]]; then
     echo "PASS: MPI and serial binaries compiled; source=${SOURCE_COMMIT} run=${RUN}"
     exit 0
@@ -53,6 +56,13 @@ apptainer exec --bind "${MPI_BASE}" "${MPI_SIF}" "${GENERATOR}" 80 0 > "${RUN}/t
 FPLLL="${MPI_BASE}/deps/fplll-b0e38e31085e"
 apptainer exec --bind "${MPI_BASE}" "${MPI_SIF}" env OMP_NUM_THREADS=1 LD_LIBRARY_PATH="${FPLLL}/lib" \
     "${FPLLL}/bin/fplll" -a potlll -m heuristic -f mpfr -p 256 "${RUN}/tests/input.raw" > "${RUN}/tests/input.basis"
+case " ${VALIDATE_PIPELINES:-legacy} " in
+    *" async "*)
+        export APPTAINERENV_HD_MPI_PIPELINE=async
+        python3 "${SOURCE}/tools/test_mpi_bkz.py" --wrapper "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" \
+            --basis "${RUN}/tests/input.basis" --root "${RUN}/tests/targeted-async-cache" --cache-pressure-only
+        ;;
+esac
 for pipeline in ${VALIDATE_PIPELINES:-legacy}; do
     case "${pipeline}" in legacy|async) ;; *) echo "Invalid pipeline: ${pipeline}" >&2; exit 2 ;; esac
     export APPTAINERENV_HD_MPI_PIPELINE="${pipeline}"

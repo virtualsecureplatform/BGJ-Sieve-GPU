@@ -2,6 +2,14 @@
 
 ## Experimental asynchronous pipeline
 
+UID-checker capacity changes are permitted only with producers stopped and
+queues/workers drained. Resizing preserves the sentinel layout, atomically
+replaces descriptor storage, frees only owned UID buffers, and rejects busy or
+invalid requests without losing queued work. Allocation failure preserves the
+previous capacity. The one-GPU validation build runs executable ASan/UBSan
+resize tests before releasing any dependent two-node tests; targeted async
+cache/UID pressure runs before the full integration suites.
+
 `HD_MPI_PIPELINE=async` enables the opt-in two-node pipeline; the default is
 `legacy`. Both ranks must agree on the mode and `--mpi-frame-mib`. The host
 runtime/RDMA launcher is unchanged. Do not promote this mode to production

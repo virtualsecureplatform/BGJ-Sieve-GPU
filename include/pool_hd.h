@@ -561,6 +561,9 @@ struct ut_checker_t {
     ~ut_checker_t();
 
     int set_num_threads(long num_threads);
+    // Phase-owner only: producers must be stopped and all work drained.
+    // 0 success, -1 invalid capacity/busy, -2 allocation failure. Failure
+    // leaves both storage and configuration unchanged.
     int set_max_holding(int max_holding);
     int set_exp_batch(long exp_batch);
     inline void set_max_available_id(int *max_available_id) { _max_available_id = max_available_id; }
@@ -621,8 +624,9 @@ struct ut_checker_t {
     long _num_red_to_rm = 0;
     long _num_red_in_rm = 0;
 
-    long _exp_batch;
-    long _max_holding;
+    long _exp_batch = 0;
+    long _max_holding = 0;
+    void _release_buffers();
     int CSD;
 
     std::atomic<long> _check_fail{0};
