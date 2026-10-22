@@ -24,7 +24,15 @@ export APPTAINERENV_HD_CACHE_WAIT_TIMEOUT_S=120 APPTAINERENV_HD_POOL_BUFFER_CACH
 export APPTAINERENV_HD_SOURCE_COMMIT="${SOURCE_COMMIT}"
 replay_options=()
 if [[ "${REPLAY_ASYNC_PROFILES:-0}" == 1 ]]; then replay_options+=(--compare-async-profiles); fi
+rc=0
 python3 "${SOURCE}/tools/test_mpi_pipeline_replay.py" "${replay_options[@]}" \
     --wrapper "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" \
     --basis "${VALIDATED_BUILD}/tests/input.basis" \
-    --root "${MPI_BASE}/diagnostics/mpi-pipeline-replay-${SLURM_JOB_ID}"
+    --root "${MPI_BASE}/diagnostics/mpi-pipeline-replay-${SLURM_JOB_ID}" || rc=$?
+if [[ "${rc}" != 0 ]]; then
+    # A missed speed threshold may select baseline later; correctness failures
+    # never produce a summary and must stop the dependency chain.
+    [[ "${REPLAY_PERF_SOFT_GATE:-0}" == 1 && \
+       -s "${MPI_BASE}/diagnostics/mpi-pipeline-replay-${SLURM_JOB_ID}/summary.json" ]] || exit "${rc}"
+    echo "Replay correctness passed; optimized profile did not meet promotion threshold."
+fi

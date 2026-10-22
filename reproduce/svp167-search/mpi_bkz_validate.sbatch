@@ -13,6 +13,14 @@ RUN="${MPI_BASE}/diagnostics/mpi-bkz-${SLURM_JOB_ID}"
 mkdir -p "${RUN}/source" "${RUN}/tests"
 git -C "${SLURM_SUBMIT_DIR}" archive "${SOURCE_COMMIT}" | tar -x -C "${RUN}/source"
 SOURCE="${RUN}/source"
+apptainer exec --bind "${MPI_BASE}" "${MPI_SIF}" bash -s -- "${SOURCE}" "${RUN}" <<'SH'
+set -euo pipefail
+for name in bounded_task_queue wire_crc32c; do
+    g++ -std=c++17 -O1 -g -pthread -msse4.2 -fsanitize=address,undefined \
+        "$1/tests/test_${name}.cpp" -o "$2/test-${name}"
+    timeout 240 "$2/test-${name}"
+done
+SH
 MPI_CPPFLAGS="$(mpicxx --showme:compile)"
 export MPI_LIBDIR="$(mpicxx --showme:link | tr ' ' '\n' | sed -n 's/^-L//p' | head -1)"
 FLAGS="-DHD_A100X4_500G_CACHE_PROFILE=1 -DHD_A100X4_PWC_GB=260 -DHD_A100X4_BWC_GB=128 -DHD_A100X4_SWC_GB=16 -DPOOL_HOST_VEC_MAX_DIM=144 -DENABLE_PROFILING=0"
@@ -66,11 +74,20 @@ esac
 for pipeline in ${VALIDATE_PIPELINES:-legacy}; do
     case "${pipeline}" in legacy|async) ;; *) echo "Invalid pipeline: ${pipeline}" >&2; exit 2 ;; esac
     export APPTAINERENV_HD_MPI_PIPELINE="${pipeline}"
+    profiles=baseline
+    if [[ "${pipeline}" == async ]]; then profiles="${VALIDATE_PROFILES:-baseline optimized}"; fi
+    for profile in ${profiles}; do
+    for writer in ${VALIDATE_WRITERS:-legacy direct}; do
+    export APPTAINERENV_HD_MPI_ASYNC_PROFILE="${profile}"
+    export APPTAINERENV_HD_MPI_CHECKPOINT_WRITER="${writer}"
+    configuration="${pipeline}-${profile}-${writer}"
     python3 "${SOURCE}/tools/test_phase_bench.py" --wrapper "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" \
-        --basis "${RUN}/tests/input.basis" --root "${RUN}/tests/${pipeline}/phase-bench"
+        --basis "${RUN}/tests/input.basis" --root "${RUN}/tests/${configuration}/phase-bench"
     if [[ "${PHASE_BENCH_ONLY:-0}" != 1 ]]; then
         python3 "${SOURCE}/tools/test_mpi_bkz.py" --wrapper "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" \
-            --basis "${RUN}/tests/input.basis" --root "${RUN}/tests/${pipeline}"
+            --basis "${RUN}/tests/input.basis" --root "${RUN}/tests/${configuration}"
     fi
+    done
+    done
 done
 echo "PASS: distributed BKZ validation source=${SOURCE_COMMIT} run=${RUN}"
