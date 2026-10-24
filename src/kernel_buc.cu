@@ -270,6 +270,8 @@ static __device__ __forceinline__ void _sbuc_2_gbuc(uint32_t *bgbuc_num, uint32_
             int pos = atomicAdd(&bgbuc_num[bias * 4 + (lid & 3) * 8 + lid / 4], b_size);
             b_size = max(min(out_max_size - pos, b_size), 0);
             sbuc_tmp[bias * 4 + (lid & 3) * 8 + lid / 4] = pos | (b_size << 26);
+            // Other lanes read different bytes of the same counter word.
+            __syncwarp();
             if ((lid & 3) == 0) sbuc_num[bias + lid / 4] = 0;
         }
         __syncwarp();
@@ -293,6 +295,8 @@ static __device__ __forceinline__ void _sbuc_2_gbuc(uint32_t *bgbuc_num, uint32_
             b_size = max(min(out_max_size - pos, b_size), 0);
             sbuc_tmp[bias + (lid & 1) * 8 + lid / 2] = pos | (b_size << 26);
         }
+        // Finish every lane's byte-sized read before clearing whole words.
+        __syncwarp();
         if (lid < 4) sbuc_num[bias / 4 + lid] = 0;
         __syncwarp();
         for (int i = 0; i < 16; i++) {
@@ -428,6 +432,8 @@ __global__ void _bucket_kernel(uint32_t *__restrict__ out, int out_max_size, int
 
     /// clear buckets
     _buffer_init<layer>(sbuc_num, sh_vec, tid, batchsize);
+    // Initialization and prefetch use different cross-warp partitions.
+    __syncthreads();
     
     /// for the first iter
     if (layer == 2) {
@@ -551,6 +557,10 @@ __global__ void _bucket_kernel(uint32_t *__restrict__ out, int out_max_size, int
 
         if (layer == 1) _store_pad16(vec_pad16 + CSD16 * (ind + batchVecs / traits::ldWarps * wid),
                         sh_vec + CSD16 * (batchVecs / traits::ldWarps) * wid + curr_vec_bias, lid, CSD16);
+
+        // The next iteration reuses the old tile for prefetch/unpacking.
+        // All warps must finish reading it before any warp can overwrite it.
+        __syncthreads();
 
         ind            += stride;
         wgvld_src      += CSD * stride / 8;

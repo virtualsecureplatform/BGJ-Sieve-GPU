@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <vector>
 
-template<int batch, int dim, int layer = 0> void probe(int csd, int count) {
+template<int batch, int dim, int layer = 0> void probe(int csd, int count, bool dense = false) {
     int8_t *centers, *vectors, *padded;
     uint64_t *indices;
     int32_t *norms, *n;
@@ -19,9 +19,13 @@ template<int batch, int dim, int layer = 0> void probe(int csd, int count) {
     std::vector<uint64_t> host_indices(vec_cap,uint64_t(100)<<32);
     CHECK_CUDA_ERR(cudaMemcpy(indices,host_indices.data(),vec_cap*sizeof(uint64_t),cudaMemcpyHostToDevice));
     CHECK_CUDA_ERR(cudaMemset(padded,0,vec_cap*dim));
-    CHECK_CUDA_ERR(cudaMemset(centers, 0, batch * dim));
-    CHECK_CUDA_ERR(cudaMemset(vectors, 0, vec_cap * dim));
+    CHECK_CUDA_ERR(cudaMemset(centers, dense ? 1 : 0, batch * dim));
+    CHECK_CUDA_ERR(cudaMemset(vectors, dense ? 1 : 0, vec_cap * dim));
     CHECK_CUDA_ERR(cudaMemset(norms, 1, vec_cap * sizeof(int32_t)));
+    if (dense) {
+        std::vector<int32_t> dense_norms(vec_cap, csd);
+        CHECK_CUDA_ERR(cudaMemcpy(norms,dense_norms.data(),vec_cap*sizeof(int32_t),cudaMemcpyHostToDevice));
+    }
     CHECK_CUDA_ERR(cudaMemset(out, 0, batch * ((layer ? 2 : 1)*cap+1) * sizeof(uint32_t)));
     CHECK_CUDA_ERR(cudaMemcpy(n, &count, sizeof(int32_t), cudaMemcpyHostToDevice));
     constexpr int shared = layer == 0 ? buc_traits_t::l0_shmem :
@@ -36,7 +40,10 @@ template<int batch, int dim, int layer = 0> void probe(int csd, int count) {
     CHECK_CUDA_ERR(cudaDeviceSynchronize());
     std::vector<uint32_t> sizes(batch);
     CHECK_CUDA_ERR(cudaMemcpy(sizes.data(), out, batch*sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    if (layer == 0) for (auto size : sizes) assert(size == 0);
+    if (layer == 0) for (auto size : sizes) {
+        if (dense && count) assert(size > 0);
+        else assert(size == 0);
+    }
     CHECK_CUDA_ERR(cudaFree(out)); CHECK_CUDA_ERR(cudaFree(n));
     CHECK_CUDA_ERR(cudaFree(norms)); CHECK_CUDA_ERR(cudaFree(vectors));
     CHECK_CUDA_ERR(cudaFree(centers));
@@ -54,5 +61,8 @@ template<int dim> void matrix(int csd) {
 int main() {
     matrix<128>(127); matrix<128>(128);
     for (int csd : {129,132,133,143,144}) matrix<144>(csd);
-    puts("PASS: bucket center/tail matrix, all three layers, 637 launches");
+    // Nonzero buckets exercise counter resets and repeated tile reuse.
+    probe<64,144>(133,65,true);
+    probe<64,144>(133,buc_traits_t::taskVecs,true);
+    puts("PASS: bucket center/tail matrix plus dense CSD133, all three layers, 639 launches");
 }
