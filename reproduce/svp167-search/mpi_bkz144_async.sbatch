@@ -114,17 +114,19 @@ run_step
 if [[ "${mode}" == phase || "${mode}" == checkpoint-bench ]]; then
     [[ "${solver_rc}" == 75 && -s "${RUN_ROOT}/LATEST-BKZ" ]]
     if [[ "${mode}" == phase ]]; then
-        python3 - "${RUN_ROOT}" <<'PY'
+        python3 - "${RUN_ROOT}" "${PHASE_TARGET_CSD:-133}" <<'PY'
 import sys
 from pathlib import Path
 root = Path(sys.argv[1]); sequence = int((root/'LATEST-BKZ').read_text())
+target = int(sys.argv[2])
+assert 1 <= target <= 144
 states = [(root/('generation-%d/rank%d/STATE' % (sequence,rank))).read_text().split()
           for rank in (0,1)]
-assert all(int(state[9]) == 133 and int(state[11]) == 1 for state in states)
+assert all(int(state[9]) == target and int(state[11]) == (2 if target == 144 else 1) for state in states)
 assert states[0][6:] == states[1][6:]
-print('PASS: verified CSD133 phase checkpoint')
+print('PASS: verified CSD%d phase checkpoint' % target)
 PY
-        echo "PASS: CSD133 source=${SOURCE_COMMIT} root=${RUN_ROOT}"
+        echo "PASS: CSD${PHASE_TARGET_CSD:-133} source=${SOURCE_COMMIT} root=${RUN_ROOT}"
     else
         echo "PASS: paired checkpoint measurements source=${SOURCE_COMMIT} root=${RUN_ROOT}"
     fi
