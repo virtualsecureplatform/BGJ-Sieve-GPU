@@ -690,14 +690,15 @@ struct pwc_manager_tmpl {
         if (_compact_vec_norm || _num_chunks || count < 0 || count > _max_cached_chunks)
             throw std::runtime_error("invalid exact restore cache reservation");
         wait_work();
-        for (long id = 0; id < count; ++id) {
+        try { for (long id = 0; id < count; ++id) {
             if (_cached_chunks[id].id != -1)
                 throw std::runtime_error("nonempty exact restore cache");
             __malloc_chunk(&_cached_chunks[id]);
             _cached_chunks[id].id = id;
             _cached_chunks[id].size = 0;
             _chunk_status[id] = _ck_caching | _ck_writing | chunk_status_t(id);
-        }
+            _num_chunks = id+1;
+        } } catch (...) { abort_exact_restore(); throw; }
         _num_chunks = count;
         _last_cache = count ? count-1 : 0;
     }
@@ -706,6 +707,14 @@ struct pwc_manager_tmpl {
             _chunk_status[id] != (_ck_caching | _ck_writing | chunk_status_t(id)))
             throw std::runtime_error("invalid exact restore slot");
         return &_cached_chunks[id];
+    }
+    void abort_exact_restore() noexcept {
+        // Workers must already be joined. Leave clean, empty slots that the
+        // ordinary destructor can release without waiting on a writer.
+        for (long id = 0; id < _num_chunks; ++id) {
+            _cached_chunks[id].size = 0;
+            _chunk_status[id] = _ck_caching | chunk_status_t(id);
+        }
     }
     void publish_exact_restore() {
         for (long id = 0; id < _num_chunks; ++id) {

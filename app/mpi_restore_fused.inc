@@ -68,6 +68,10 @@ void restore_pool_fused(Pool_hd_t &pool, const state_t &state, const fs::path &s
                 (unsigned long long)(io.second-before_io.second)); fflush(stdout);
         }
     }),mutex,cv,done};
+    struct reservation_t {
+        pwc_manager_t *manager; bool published=false;
+        ~reservation_t(){if(!published) manager->abort_exact_restore();}
+    } reservation{pool.pwc_manager};
     pool.pwc_manager->prepare_exact_restore(items.size());
     std::vector<std::atomic<uint64_t>> histogram(UidTable::ut_split);
     for(auto &v:histogram) v.store(0);
@@ -125,6 +129,7 @@ void restore_pool_fused(Pool_hd_t &pool, const state_t &state, const fs::path &s
         }
     },uid_threads);
     pool.pwc_manager->publish_exact_restore();
+    reservation.published=true;
     const auto io=process_io();
     printf("[MPI-RESTORE] rank=%d stage=loaded seconds=%.6f chunks=%zu vectors=%llu source_bytes=%llu logical_read=%llu logical_write=%llu physical_read=%llu physical_write=%llu\n",
         rank,std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count(),items.size(),
