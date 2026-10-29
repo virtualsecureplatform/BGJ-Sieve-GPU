@@ -556,6 +556,8 @@ void restore_pool_exact(Pool_hd_t &pool, const state_t &s) {
 // substitutes a source revision or accepts a mismatched identity.
 int import_checkpoint(task_config_t &task, const fs::path &source_root,
                       uint64_t sequence, const std::string &source_commit) {
+    const auto restore_start = std::chrono::steady_clock::now();
+    const auto restore_io_start = process_io();
     const char *target_commit = getenv("HD_SOURCE_COMMIT");
     require(target_commit && strlen(target_commit) == 40, "import requires target source revision");
     require(source_commit == "c970044a5bb715bc6ac69c76e47d49fa75a27c25" ||
@@ -608,6 +610,13 @@ int import_checkpoint(task_config_t &task, const fs::path &source_root,
         else restore_pool_exact(pool,saved);
         printf("[MPI-IMPORT] rank=%d stage=pool-check\n",rank); fflush(stdout);
         require(pool.check(3) == 0, "import vector/UID/norm/score validation");
+        if (fused_restore_enabled()) {
+            const auto io = process_io();
+            printf("[MPI-RESTORE-READY] rank=%d seconds=%.6f physical_read=%llu vectors=%llu\n",
+                   rank,std::chrono::duration<double>(std::chrono::steady_clock::now()-restore_start).count(),
+                   (unsigned long long)(io.first-restore_io_start.first),(unsigned long long)saved.local_vectors);
+            fflush(stdout);
+        }
         MPI_Barrier(MPI_COMM_WORLD);
         const uint64_t new_identity = identity(task);
         uint64_t identities[2];
