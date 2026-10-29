@@ -38,6 +38,9 @@ static long __swc_runtime_max_cached_chunks(Pool_hd_t *p) {
     if(p && mpi_sieve_active() && bounded_shared_arena()) {
         const long bound=__swc_phase_pool_chunks(p);
         const long reserve=256+8*p->num_threads();
+        // Commit staged arena pages only within the existing profile limit.
+        const long profile_limit=PWC_DEFAULT_MAX_CACHED_CHUNKS+SWC_DEFAULT_MAX_CACHED_CHUNKS+256;
+        _ensure_regular_chunk_capacity(std::min(profile_limit,bound+bound+1336+reserve));
         const long capacity=bounded_solution_slots(_regular_chunk_capacity(),bound,reserve,bound+1336);
         printf("[SHARED-ARENA] csd=%ld arena=%ld pool=%ld solutions=%ld auxiliary=%ld\n",
             p->CSD,_regular_chunk_capacity(),bound,capacity,reserve);
