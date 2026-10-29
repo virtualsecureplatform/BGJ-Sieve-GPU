@@ -507,7 +507,25 @@ struct pipeline_t {
         check(MPI_Irecv(&peer_done, sizeof(peer_done), MPI_BYTE, 1-g_rank, 5130,
                         MPI_COMM_WORLD, &done_recv));
         uint64_t iterations = 0;
+        auto last_diagnostic = start;
         for (;;) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now-last_diagnostic >= std::chrono::seconds(60)) {
+                fprintf(stderr, "[MPI-PIPELINE-PROGRESS] rank=%d wave=%llu pending=%llu queued=%llu batches=%llu sent=%llu/%llu applied=%llu/%llu done=%d/%d export=%d finalized=%d owned=%d active=%ld\n",
+                    g_rank, (unsigned long long)base,
+                    (unsigned long long)g_pipeline_pending.load(),
+                    (unsigned long long)g_candidate_queued_bytes.load(),
+                    (unsigned long long)g_ready_batches.load(),
+                    (unsigned long long)sent[0], (unsigned long long)sent[1],
+                    (unsigned long long)applied[0], (unsigned long long)applied[1],
+                    int(published_done), int(received_done), next_export,
+                    finalized.load(), owned, long(bwc->num_active()));
+                for (int c=0; c<2; ++c) for (int k=0; k<2; ++k)
+                    fprintf(stderr, "[MPI-PIPELINE-SLOT] rank=%d channel=%d lane=%d tx=%d tx_worked=%d charged=%zu rx=%d rx_worked=%d\n",
+                        g_rank,c,k,tx[c][k].state,int(tx[c][k].worked.load()),
+                        tx[c][k].charged,rx[c][k].state,int(rx[c][k].worked.load()));
+                last_diagnostic = now;
+            }
             if (error.load()) throw std::runtime_error("pipeline worker failed (CRC/cache/protocol)");
             for (int k = 0; k < 2; ++k) for (int channel = 0; channel < 2; ++channel) {
                 const int c = (channel + iterations) % 2;

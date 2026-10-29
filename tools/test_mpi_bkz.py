@@ -15,6 +15,7 @@ def main():
     parser.add_argument('--basis', type=Path, required=True)
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--cache-pressure-only', action='store_true')
+    parser.add_argument('--backpressure-only', action='store_true')
     args = parser.parse_args()
     if not os.environ.get('SLURM_JOB_ID'):
         parser.error('requires a two-node Slurm allocation')
@@ -32,19 +33,42 @@ def main():
             '--output', str(root/'out.basis')]
         command = launch + ['--input', str(args.basis)] + output + [
             '--checkpoint-root', str(root), '--mpi-frame-mib', str(frame_mib)] + options
-        result = subprocess.run(command, env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, timeout=1200)
-        root.mkdir(exist_ok=True)
-        with (root/'test.log').open('ab') as log:
-            log.write(result.stdout)
+        # Keep output visible during stalls and preserve it on timeout. Use a
+        # sibling path because checkpoint imports require a nonexistent root.
+        launch_log = args.root / (name + '.launch.log')
+        try:
+            with launch_log.open('ab') as log:
+                result = subprocess.run(command, env=env, stdout=log,
+                                        stderr=subprocess.STDOUT, timeout=1200)
+        finally:
+            root.mkdir(exist_ok=True)
+            shutil.copyfile(str(launch_log), str(root/'test.log'))
+        with launch_log.open('rb') as log:
+            log.seek(max(0, log.seek(0, 2)-4000))
+            diagnostic_tail = log.read().decode(errors='replace')
         if expected is None:
-            assert result.returncode != 0, result.stdout.decode(errors='replace')[-4000:]
+            assert result.returncode != 0, diagnostic_tail
         else:
-            assert result.returncode == expected, (result.returncode, result.stdout.decode(errors='replace')[-4000:])
+            assert result.returncode == expected, (result.returncode, diagnostic_tail)
         print('PASS: %s returncode=%d' % (name, result.returncode), flush=True)
         return root
 
     pump = ['--task', 'pump', '--ind_l', '0', '--ind_r', '80', '--SSD', '58', '--MSD', '60', '--DS']
+
+    def backpressure():
+        pressure = run('candidate-backpressure', pump, {
+            'APPTAINERENV_HD_MPI_CANDIDATE_QUEUE_KIB': '1',
+            'APPTAINERENV_HD_MPI_BKZ_STOP_AFTER': 'top'}, 75)
+        diagnostics = (pressure/'test.log').read_text()
+        for diagnostic in pressure.glob('rank*/rank.err'):
+            diagnostics += diagnostic.read_text()
+        assert '[MPI-CANDIDATE-BACKPRESSURE]' in diagnostics
+
+    if args.backpressure_only:
+        if args.cache_pressure_only:
+            parser.error('choose only one focused test')
+        backpressure()
+        return
 
     def cache_pressure():
         cache = run('pipeline-cache-pressure', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': '1',
@@ -102,13 +126,7 @@ def main():
             logs += diagnostic.read_text()
         assert 'checksum mismatch' in logs, logs[-4000:]
     run('control-mismatch', pump, {'APPTAINERENV_HD_MPI_CONTROL_TEST': 'mismatch'}, expected=None)
-    pressure = run('candidate-backpressure', pump, {
-        'APPTAINERENV_HD_MPI_CANDIDATE_QUEUE_KIB': '1',
-        'APPTAINERENV_HD_MPI_BKZ_STOP_AFTER': 'top'}, 75)
-    diagnostics = (pressure/'test.log').read_text()
-    for diagnostic in pressure.glob('rank*/rank.err'):
-        diagnostics += diagnostic.read_text()
-    assert '[MPI-CANDIDATE-BACKPRESSURE]' in diagnostics
+    backpressure()
     for kind in ('pool', 'bucket', 'sol', 'uid'):
         forbidden = run('forbidden-' + kind, pump, {'APPTAINERENV_HD_MPI_SPILL_TEST': kind}, expected=None)
         logs = (forbidden/'test.log').read_text()

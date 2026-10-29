@@ -64,6 +64,16 @@ apptainer exec --bind "${MPI_BASE}" "${MPI_SIF}" "${GENERATOR}" 80 0 > "${RUN}/t
 FPLLL="${MPI_BASE}/deps/fplll-b0e38e31085e"
 apptainer exec --bind "${MPI_BASE}" "${MPI_SIF}" env OMP_NUM_THREADS=1 LD_LIBRARY_PATH="${FPLLL}/lib" \
     "${FPLLL}/bin/fplll" -a potlll -m heuristic -f mpfr -p 256 "${RUN}/tests/input.raw" > "${RUN}/tests/input.basis"
+if [[ "${BACKPRESSURE_ONLY:-0}" == 1 ]]; then
+    export APPTAINERENV_HD_MPI_PIPELINE=async
+    for profile in ${VALIDATE_PROFILES:-baseline optimized}; do
+        export APPTAINERENV_HD_MPI_ASYNC_PROFILE="${profile}"
+        python3 "${SOURCE}/tools/test_mpi_bkz.py" --wrapper "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" \
+            --basis "${RUN}/tests/input.basis" --root "${RUN}/tests/backpressure-${profile}" --backpressure-only
+    done
+    echo "PASS: focused backpressure validation source=${SOURCE_COMMIT} run=${RUN}"
+    exit 0
+fi
 case " ${VALIDATE_PIPELINES:-legacy} " in
     *" async "*)
         export APPTAINERENV_HD_MPI_PIPELINE=async
