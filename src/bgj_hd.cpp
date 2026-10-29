@@ -35,6 +35,14 @@ static long __swc_phase_pool_chunks(Pool_hd_t *p) {
 }
 
 static long __swc_runtime_max_cached_chunks(Pool_hd_t *p) {
+    if(p && mpi_sieve_active() && bounded_shared_arena()) {
+        const long bound=__swc_phase_pool_chunks(p);
+        const long reserve=256+8*p->num_threads();
+        const long capacity=bounded_solution_slots(_regular_chunk_capacity(),bound,reserve,bound+1336);
+        printf("[SHARED-ARENA] csd=%ld arena=%ld pool=%ld solutions=%ld auxiliary=%ld\n",
+            p->CSD,_regular_chunk_capacity(),bound,capacity,reserve);
+        return capacity;
+    }
     long base = SWC_DEFAULT_MAX_CACHED_CHUNKS;
     const char *no_spill = getenv("HD_FAIL_ON_SPILL");
     if (p && no_spill && atoi(no_spill)) {

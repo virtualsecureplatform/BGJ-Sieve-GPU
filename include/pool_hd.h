@@ -1,6 +1,7 @@
 #ifndef __POOL_HD_H
 #define __POOL_HD_H
 #include <stdexcept>
+#include <vector>
 
 #include "lattice.h"
 #include "sampler.h"
@@ -401,6 +402,7 @@ struct Pool_hd_t {
     // setup
     int set_basis(Lattice_QP *L);
     int set_num_threads(long num_threads);
+    long num_threads() const { return _num_threads; }
     int set_sieving_context(long ind_l, long ind_r);
     int set_boost_depth(long esd);
 
@@ -448,7 +450,7 @@ struct Pool_hd_t {
     int mpi_trim_exact(long target);
     int mpi_compact_dense();
     void mpi_reset_append_hint() { _mpi_append_hint = 0; }
-    int mpi_append_records(const uint8_t *records, long count, int record_size);
+    int mpi_append_records(const uint8_t *records, long count, int record_size, long excluded_chunk = -1);
     /// @brief try to recover the pool from disk
     int load(long log_level = 0);
     // Reconstruct quantized records in the current basis, dropping invalid
@@ -685,6 +687,47 @@ struct pwc_manager_tmpl {
 
     /// @brief create a empty chunk, return the chunk_id
     long create_chunk();
+    long allocated_cache_chunks() const {
+        long n=0;
+        for(long i=0;i<_max_cached_chunks;++i) n+=_cached_chunks[i].vec!=nullptr;
+        return n;
+    }
+    // Phase-owner only. No data moves, evictions, or flushes; dirty queue IDs
+    // remain logical chunk IDs. All callers must have joined GPU/CPU users.
+    void rebalance_cache_quiescent(long limit) {
+        if(limit<1 || limit>long(_ck_cache_id_mask)+1 || wait_work())
+            throw std::runtime_error("invalid quiescent cache rebalance");
+        std::vector<chunk_t> live;
+        live.reserve(resident_chunks());
+        for(long i=0;i<_max_cached_chunks;++i) {
+            const auto &chunk=_cached_chunks[i];
+            if(chunk.id<-1) throw std::runtime_error("transient cache descriptor during rebalance");
+            if(chunk.id<0) continue;
+            const auto state=_chunk_status[chunk.id];
+            if((state&(_ck_loading|_ck_syncing|_ck_reading|_ck_writing)) ||
+               !(state&_ck_caching) || (state&_ck_cache_id_mask)!=i)
+                throw std::runtime_error("busy/inconsistent cache rebalance");
+            live.push_back(chunk);
+        }
+        if(long(live.size())>limit) throw std::runtime_error("cache rebalance would evict live data");
+        const long capacity=std::max(limit,_max_cached_chunks);
+        chunk_t *replacement=(chunk_t*)calloc(capacity,sizeof(chunk_t));
+        if(!replacement) throw std::bad_alloc();
+        for(long i=0;i<capacity;++i) replacement[i].id=-1;
+        long reclaimed=0;
+        for(long i=0;i<_max_cached_chunks;++i)
+            if(_cached_chunks[i].id==-1 && _cached_chunks[i].vec) {
+                __free_chunk(&_cached_chunks[i]); ++reclaimed;
+            }
+        for(size_t i=0;i<live.size();++i) {
+            replacement[i]=live[i];
+            _chunk_status[live[i].id]=(_chunk_status[live[i].id]&~_ck_cache_id_mask)|chunk_status_t(i);
+        }
+        free(_cached_chunks); _cached_chunks=replacement;
+        _cached_chunks_capacity=capacity; _max_cached_chunks=limit;
+        _last_cache=live.empty()?0:long(live.size())-1;
+        printf("[CACHE-REBALANCE] live=%zu reclaimed=%ld limit=%ld\n",live.size(),reclaimed,limit);
+    }
     // Quiescent exact restore only: allocate slots without scheduling disk reads.
     void prepare_exact_restore(long count) {
         if (_compact_vec_norm || _num_chunks || count < 0 || count > _max_cached_chunks)

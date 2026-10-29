@@ -15,7 +15,7 @@ git -C "${SLURM_SUBMIT_DIR}" archive "${SOURCE_COMMIT}" | tar -x -C "${RUN}/sour
 SOURCE="${RUN}/source"
 apptainer exec --bind "${MPI_BASE}" "${MPI_SIF}" bash -s -- "${SOURCE}" "${RUN}" <<'SH'
 set -euo pipefail
-for name in bounded_task_queue wire_crc32c; do
+for name in bounded_task_queue wire_crc32c shared_arena_budget; do
     g++ -std=c++17 -O1 -g -pthread -msse4.2 -fsanitize=address,undefined \
         "$1/tests/test_${name}.cpp" -o "$2/test-${name}"
     timeout 240 "$2/test-${name}"

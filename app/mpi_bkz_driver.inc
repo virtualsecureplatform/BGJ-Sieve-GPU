@@ -561,7 +561,8 @@ int import_checkpoint(task_config_t &task, const fs::path &source_root,
     const char *target_commit = getenv("HD_SOURCE_COMMIT");
     require(target_commit && strlen(target_commit) == 40, "import requires target source revision");
     require(source_commit == "c970044a5bb715bc6ac69c76e47d49fa75a27c25" ||
-            source_commit == "21fad5dbbae768d698e82d319c348ed081b7fe4b" || source_commit == target_commit,
+            source_commit == "21fad5dbbae768d698e82d319c348ed081b7fe4b" ||
+            source_commit == "dd03c18bada90a6cd13e3b8149b39fc1f7f2b84d" || source_commit == target_commit,
             "unreviewed checkpoint source revision");
     const fs::path source = fs::canonical(source_root), target = fs::weakly_canonical(root);
     auto nested = [](const fs::path &a, const fs::path &b) {

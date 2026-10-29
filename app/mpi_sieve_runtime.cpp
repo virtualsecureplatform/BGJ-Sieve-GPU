@@ -869,7 +869,10 @@ int mpi_sieve_prune_pool(Pool_hd_t *pool, long target_global_size) {
     return 0;
 }
 
+#include "mpi_redistribute_bounded.inc"
+
 int mpi_sieve_redistribute_pool(Pool_hd_t *pool) {
+    if(bounded_shared_arena()) return redistribute_bounded(pool);
     const int stride = pool->CSD + 14;
     const long original_chunks = pool->pwc_manager->num_chunks();
     pool->mpi_reset_append_hint();

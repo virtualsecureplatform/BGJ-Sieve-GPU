@@ -6,6 +6,7 @@
 #include "../include/bgj_hd_device.h"
 #include "../include/mpi_sieve.h"
 #include "../include/bounded_task_queue.h"
+#include "../include/sieve_cache_budget.h"
 #include <strings.h>
 
 #if ENABLE_PROFILING
@@ -87,6 +88,14 @@ int Pool_hd_t::_bgj_Sieve_hd(int bgj) {
     if (pwc_manager->max_cached_chunks() > pwc_manager_t::pwc_default_max_cached_chunks) {
         pwc_manager->wait_work();
         pwc_manager->set_max_cached_chunks(pwc_manager_t::pwc_default_max_cached_chunks);
+    }
+    if (mpi_sieve_active() && bounded_shared_arena()) {
+        const char *ratio_env=getenv("HD_SIZE_RATIO");
+        const double ratio=ratio_env?atof(ratio_env):BGJ1_SIZE_RATIO;
+        if(!std::isfinite(ratio) || ratio<=0) throw std::runtime_error("invalid pool ratio");
+        const long vectors=long(ratio*pow(4./3.,CSD*.5))/mpi_sieve_world();
+        const long bound=std::max(pwc_manager->num_chunks(),(vectors+chunk_max_nvecs-1)/chunk_max_nvecs);
+        pwc_manager->rebalance_cache_quiescent(std::max(1L,bound));
     }
     bwc_manager_t *bwc_manager = new bwc_manager_t(this);
     swc_manager_t *swc_manager = new swc_manager_t(this);
@@ -5189,7 +5198,9 @@ int Reducer_t::_adaptive_reduce_limit(int device_ptr) {
         _num_sol_chunks_slimit <= 0 || workers <= 1) return workers;
 
     const long using_chunks = _swc->num_using();
-    int pressure_pct = (int)(100 * using_chunks / _num_sol_chunks_slimit);
+    const long pressure_limit=mpi_sieve_active() && bounded_shared_arena() ?
+        std::min(_num_sol_chunks_slimit,_swc->max_cached_chunks()) : _num_sol_chunks_slimit;
+    int pressure_pct = (int)(100 * using_chunks / pressure_limit);
     if (pressure_pct > 100) pressure_pct = 100;
 
     if (_smooth_backpressure) {

@@ -977,13 +977,14 @@ int Pool_hd_t::mpi_trim_exact(long target) {
 }
 
 int Pool_hd_t::mpi_append_records(const uint8_t *records, long count,
-                                  int record_size) {
+                                  int record_size, long excluded_chunk) {
     const int expected = CSD + 14;
     if (count < 0 || record_size != expected) return -1;
     if (count == 0) return 0;
     if (!records) return -1;
     long pos = 0;
     while (pos < count) {
+        if (_mpi_append_hint == excluded_chunk) ++_mpi_append_hint;
         bool created = false;
         long cid;
         if (_mpi_append_hint < pwc_manager->num_chunks()) {

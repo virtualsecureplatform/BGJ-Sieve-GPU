@@ -2,6 +2,21 @@
 #define BGJ_SIEVE_CACHE_BUDGET_H
 
 #include <algorithm>
+#include <stdexcept>
+#include <cstdlib>
+#include <cstring>
+
+inline bool bounded_shared_arena() {
+    const char *p=std::getenv("HD_MPI_SHARED_ARENA_POLICY");
+    if(p && std::strcmp(p,"legacy") && std::strcmp(p,"bounded"))
+        throw std::invalid_argument("invalid HD_MPI_SHARED_ARENA_POLICY");
+    return p && !std::strcmp(p,"bounded");
+}
+inline long bounded_solution_slots(long arena, long pool, long auxiliary, long preferred) {
+    if(pool<0 || auxiliary<0 || pool>arena || auxiliary>arena-pool || arena-pool-auxiliary<512)
+        throw std::runtime_error("shared arena cannot hold pool and minimum solution queue");
+    return std::min(preferred,arena-pool-auxiliary);
+}
 
 // PWC and SWC allocate from the same regular-chunk arena. At a fixed sieve
 // dimension the pool cannot grow beyond its iterator target (or the existing
