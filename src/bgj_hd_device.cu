@@ -5199,7 +5199,7 @@ int Reducer_t::_adaptive_reduce_limit(int device_ptr) {
 
     const long using_chunks = _swc->num_using();
     const long pressure_limit=mpi_sieve_active() && bounded_shared_arena() ?
-        std::min(_num_sol_chunks_slimit,_swc->max_cached_chunks()) : _num_sol_chunks_slimit;
+        std::min(long(_num_sol_chunks_slimit),_swc->max_cached_chunks()) : _num_sol_chunks_slimit;
     int pressure_pct = (int)(100 * using_chunks / pressure_limit);
     if (pressure_pct > 100) pressure_pct = 100;
 
