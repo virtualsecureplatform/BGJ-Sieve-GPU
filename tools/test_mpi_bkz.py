@@ -151,13 +151,29 @@ def main():
         '--import-generation',str(seq),'--import-source-commit',source_commit],expected=None)
     run('verified-import',pump+['--import-checkpoint',str(root),
         '--import-generation',str(seq),'--import-source-commit',source_commit],expected=None)
-    for corruption in ('missing','corrupt'):
+    for corruption in ('missing','corrupt','pool-corrupt','duplicate-inventory','unlisted-pool','pool-symlink'):
         bad = args.root/('import-source-'+corruption)
         shutil.copytree(root,bad)
         path = bad/('generation-%d/rank1/full.qp' % seq)
         if corruption == 'missing': path.unlink()
-        else:
+        elif corruption == 'corrupt':
             with path.open('ab') as stream: stream.write(b'corrupt')
+        else:
+            shard=bad/('generation-%d/rank1'%seq)
+            chunk=next(p for p in (shard/'pool').rglob('*') if p.is_file())
+            if corruption=='pool-corrupt':
+                with chunk.open('r+b') as stream:
+                    stream.seek(20); byte=stream.read(1); stream.seek(20)
+                    stream.write(bytes([byte[0]^1]))
+            elif corruption=='duplicate-inventory':
+                inventory=shard/'FILES'
+                with inventory.open('a') as stream: stream.write(inventory.read_text().splitlines()[0]+'\n')
+            elif corruption=='unlisted-pool':
+                (chunk.parent/'unexpected').write_bytes(b'not inventoried')
+            else:
+                content=chunk.read_bytes(); chunk.unlink()
+                target=shard/'symlink-target'; target.write_bytes(content)
+                chunk.symlink_to(target.resolve())
         run('import-reject-'+corruption,pump+['--import-checkpoint',str(bad),
             '--import-generation',str(seq),'--import-source-commit',source_commit],expected=None)
     if os.environ.get('APPTAINERENV_HD_MPI_CHECKPOINT_WRITER') == 'direct':

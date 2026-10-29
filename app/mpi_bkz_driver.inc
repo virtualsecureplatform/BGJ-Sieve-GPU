@@ -186,6 +186,8 @@ void inventory(const fs::path &dir, bool verify, const snapshot_hashes_t *known 
             ++count;
         }
         require(in.eof() && count >= 2, "incomplete snapshot inventory");
+        require(seen.count("STATE") && seen.count("full.qp"), "missing basis/state inventory");
+        require(!fs::exists(dir/"local.qp") || seen.count("local.qp"), "unverified local basis");
         checkpoint_parallel(items.size(), [&](size_t i) {
             const auto &entry = items[i];
             require(fs::is_regular_file(dir/entry.path) && fs::file_size(dir/entry.path) == entry.size &&
