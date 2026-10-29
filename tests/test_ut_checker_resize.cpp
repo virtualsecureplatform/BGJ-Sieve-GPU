@@ -177,6 +177,16 @@ int main() {
             for (long type : {ut_checker_t::type_sieve,ut_checker_t::type_check,
                               ut_checker_t::type_shrink,ut_checker_t::type_others})
                 exercise(type,pool,solutions);
+            // Bounded redistribution can leave exactly one cache slot.
+            // Construction must still permit a nonempty checker batch.
+            pool.pwc_manager->set_max_cached_chunks(1);
+            solutions.set_max_cached_chunks(1);
+            for (long type : {ut_checker_t::type_sieve,ut_checker_t::type_others}) {
+                ut_checker_t checker(type,&pool,pool.uid_table,
+                    type == ut_checker_t::type_sieve ? (pwc_manager_t *)&solutions : pool.pwc_manager);
+                require(checker._max_holding == 1,"one-slot cache produced invalid checker capacity");
+                check_storage(checker);
+            }
         }
         require(allocator_calls.load() > 0,"test allocator wrapper did not intercept arena startup");
         puts("PASS: all executable UID-checker resize regressions");

@@ -1090,11 +1090,11 @@ ut_checker_t::ut_checker_t(long type, Pool_hd_t *p, UidTable *uid_table, pwc_man
     {
         long exp_max_holding = (type == type_shrink || type == type_check) ? default_max_uids : default_max_chunks;
         if (type == type_sieve) {
-            long swc_limit = _swc_manager->max_cached_chunks() * 0.9;
+            long swc_limit = std::max(1L, long(_swc_manager->max_cached_chunks() * 0.9));
             if (exp_max_holding > swc_limit) exp_max_holding = swc_limit;
         }
         if (type == type_others) {
-            long pwc_limit = _pwc_manager->max_cached_chunks() * 0.9;
+            long pwc_limit = std::max(1L, long(_pwc_manager->max_cached_chunks() * 0.9));
             if (exp_max_holding > pwc_limit) exp_max_holding = pwc_limit;
         }
         const int rc = exp_max_holding > std::numeric_limits<int>::max() ? -1 :
