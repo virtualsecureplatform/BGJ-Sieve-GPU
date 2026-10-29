@@ -2487,7 +2487,12 @@ bool Bucketer_t::_mpi_service_solutions(bool allow_start) {
     // Called only after materialization, while reducers read copied buckets.
     // Reset only with all previous insertion workers joined by the counter.
     buc_iter->reset();
-    const int threshold = _mpi_replace_th;
+    // Pressure sweeps must retire solutions even after every pool score has
+    // improved below the wave's original replacement floor. Reusing that
+    // floor can circulate the same tails forever and exhaust all SWC permits.
+    // A zero floor visits every destination; _batch still replaces only with
+    // a strictly better candidate and removes the UIDs of rejected solutions.
+    const int threshold = 0;
     _mpi_insert_workers.store(_num_threads, std::memory_order_release);
     for (int tid = 0; tid < _num_threads; ++tid)
         _buc_pool[tid]->push([this, tid, threshold] {
