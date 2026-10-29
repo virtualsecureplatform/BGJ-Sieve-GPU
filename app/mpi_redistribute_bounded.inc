@@ -46,6 +46,10 @@ static int redistribute_bounded(Pool_hd_t *pool) {
         std::vector<uint8_t> incoming;
         if(exchange_bytes(outgoing.data(),outgoing.size(),incoming,tag_pool_count,tag_pool_data,pool->CSD,epoch++)) return -1;
         if(incoming.size()%stride) return -1;
+        for(size_t offset=0;offset<incoming.size();offset+=stride) {
+            uint64_t uid; memcpy(&uid,incoming.data()+offset,8);
+            if(pool->uid_table->normalize(uid)%2!=uint64_t(g_rank)) return -1;
+        }
         const uint64_t before=pool->pwc_manager->num_vec();
         pool->mpi_reset_append_hint();
         // Never normalize or append into the chunk whose export scan is paused.
@@ -57,6 +61,8 @@ static int redistribute_bounded(Pool_hd_t *pool) {
         if(mpi_sieve_min_int(cid==original?1:0)) break;
     }
     if(pool->mpi_retain_owner(g_rank,g_world) || pool->mpi_compact_dense()) return -1;
+    if(exported!=owners[1-g_rank] || uint64_t(pool->pwc_manager->num_vec())!=owners[g_rank]+received-duplicates)
+        return -1;
     pool->pwc_manager->rebalance_cache_quiescent(std::max(1L,pool->pwc_manager->num_chunks()));
     printf("[BOUNDED-REDISTRIBUTE] rank=%d original_chunks=%ld cap=%ld exported=%llu received=%llu duplicates=%llu final_vectors=%ld\n",
         g_rank,original,needed,(unsigned long long)exported,(unsigned long long)received,
