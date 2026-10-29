@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <memory>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <mutex>
@@ -121,9 +122,9 @@ fs::path generation(uint64_t seq, int rank) {
     return root / ("generation-" + std::to_string(seq)) / ("rank" + std::to_string(rank));
 }
 // Each snapshot is immutable; verify every file before loading a checkpoint.
-template<class Work> void checkpoint_parallel(size_t count, Work work) {
+template<class Work> void checkpoint_parallel(size_t count, Work work, int override_workers = 0) {
     const char *setting = getenv("HD_MPI_CHECKPOINT_THREADS");
-    const int requested = setting ? atoi(setting) : 4;
+    const int requested = override_workers ? override_workers : (setting ? atoi(setting) : 4);
     require(requested >= 1 && requested <= 8, "checkpoint threads must be in [1,8]");
     const size_t workers = std::min<size_t>(count, requested);
     std::atomic<size_t> next{0}; std::atomic<bool> failed{false};
@@ -160,15 +161,27 @@ void copy_pool_tree(const fs::path &source, const fs::path &destination) {
     });
 }
 using snapshot_hashes_t = std::map<std::string, std::pair<uint64_t, uint64_t>>;
+bool fused_restore_enabled() {
+    const char *mode = getenv("HD_MPI_CHECKPOINT_READER");
+    require(!mode || !strcmp(mode,"legacy") || !strcmp(mode,"fused"), "invalid checkpoint reader");
+    return mode && !strcmp(mode,"fused"); // Opt-in until full-size validation passes.
+}
 void inventory(const fs::path &dir, bool verify, const snapshot_hashes_t *known = nullptr) {
     if (verify) {
         std::ifstream in(dir / "FILES"); std::string name; uint64_t size, hash; size_t count = 0;
         struct item { fs::path path; uint64_t size, hash; };
         std::vector<item> items;
+        std::set<std::string> seen;
         while (in >> std::quoted(name) >> size >> hash) {
             fs::path relative(name);
-            require(!relative.is_absolute() && name.find("..") == std::string::npos,
+            require(!name.empty() && !relative.is_absolute() && name.find("..") == std::string::npos,
                     "unsafe snapshot path");
+            require(seen.insert(name).second, "duplicate snapshot inventory path");
+            fs::path component = dir;
+            for (const auto &part : relative) {
+                component /= part;
+                require(!fs::is_symlink(component), "snapshot contains symlink");
+            }
             items.push_back({relative, size, hash});
             ++count;
         }
@@ -176,7 +189,8 @@ void inventory(const fs::path &dir, bool verify, const snapshot_hashes_t *known 
         checkpoint_parallel(items.size(), [&](size_t i) {
             const auto &entry = items[i];
             require(fs::is_regular_file(dir/entry.path) && fs::file_size(dir/entry.path) == entry.size &&
-                    file_hash(dir/entry.path) == entry.hash, "snapshot checksum mismatch: " + entry.path.string());
+                    ((fused_restore_enabled() && entry.path.begin()->string()=="pool") ||
+                     file_hash(dir/entry.path) == entry.hash), "snapshot checksum mismatch: " + entry.path.string());
         });
     } else {
         std::vector<fs::path> files;
@@ -534,13 +548,16 @@ void restore_pool_exact(Pool_hd_t &pool, const state_t &s) {
             mpi_sieve_rank(), (unsigned long long)total, chunks.size());
 }
 
+#include "mpi_restore_fused.inc"
+
 // Explicit, narrowly reviewed record-preserving import. Normal resume never
 // substitutes a source revision or accepts a mismatched identity.
 int import_checkpoint(task_config_t &task, const fs::path &source_root,
                       uint64_t sequence, const std::string &source_commit) {
     const char *target_commit = getenv("HD_SOURCE_COMMIT");
     require(target_commit && strlen(target_commit) == 40, "import requires target source revision");
-    require(source_commit == "c970044a5bb715bc6ac69c76e47d49fa75a27c25" || source_commit == target_commit,
+    require(source_commit == "c970044a5bb715bc6ac69c76e47d49fa75a27c25" ||
+            source_commit == "21fad5dbbae768d698e82d319c348ed081b7fe4b" || source_commit == target_commit,
             "unreviewed checkpoint source revision");
     const fs::path source = fs::canonical(source_root), target = fs::weakly_canonical(root);
     auto nested = [](const fs::path &a, const fs::path &b) {
@@ -578,14 +595,15 @@ int import_checkpoint(task_config_t &task, const fs::path &source_root,
     exact_equivalent(integers(input), *full);
     printf("[MPI-IMPORT] rank=%d stage=copy-and-restore vectors=%llu csd=%ld\n",rank,
            (unsigned long long)saved.local_vectors,saved.csd); fflush(stdout);
-    copy_pool_tree(src/"pool", ".pool");
+    if (!fused_restore_enabled()) copy_pool_tree(src/"pool", ".pool");
     {
         Pool_hd_t pool(local.get());
         require(pool.set_sieving_context(saved.left,saved.right) == 0, "import context");
         pool.set_num_threads(configured_pool_threads()); pool.set_boost_depth(0);
         pool.basis_hash = saved.basis_hash; pool.pwc_manager->set_pool(&pool);
         require(pool.uid_table->reset_hash_function(pool.CSD,saved.coeff) == 0, "import UID coefficients");
-        restore_pool_exact(pool,saved);
+        if (fused_restore_enabled()) restore_pool_fused(pool,saved,src);
+        else restore_pool_exact(pool,saved);
         printf("[MPI-IMPORT] rank=%d stage=pool-check\n",rank); fflush(stdout);
         require(pool.check(3) == 0, "import vector/UID/norm/score validation");
         MPI_Barrier(MPI_COMM_WORLD);
@@ -710,7 +728,7 @@ int mpi_bkz_run(void *opaque) {
         require(top >= 40 && start >= 40, "invalid local sieve dimension");
         // Scratch is mutable and rank-local. Snapshots are never cache backing files.
         fs::remove_all(".pool"); fs::create_directories(".pool/0"); fs::create_directories(".pool/1");
-        if (restored) copy_pool_tree(restored_dir/"pool", ".pool");
+        if (restored && !fused_restore_enabled()) copy_pool_tree(restored_dir/"pool", ".pool");
         {
             Pool_hd_t pool(local.get());
             require(pool.set_sieving_context(restored ? s.left : local->NumRows()-start,
@@ -719,7 +737,8 @@ int mpi_bkz_run(void *opaque) {
             if (restored) {
                 pool.basis_hash = s.basis_hash; pool.pwc_manager->set_pool(&pool);
                 require(pool.uid_table->reset_hash_function(pool.CSD, s.coeff) == 0, "restore UID coefficients");
-                restore_pool_exact(pool, s);
+                if (fused_restore_enabled()) restore_pool_fused(pool,s,restored_dir);
+                else restore_pool_exact(pool, s);
                 const long loaded_vectors = pool.pwc_manager->num_vec();
                 require(loaded_vectors == (long)s.local_vectors,
                         "pool recovery count mismatch: expected=" + std::to_string(s.local_vectors) +

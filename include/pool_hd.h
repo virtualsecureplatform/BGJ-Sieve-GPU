@@ -1,5 +1,6 @@
 #ifndef __POOL_HD_H
 #define __POOL_HD_H
+#include <stdexcept>
 
 #include "lattice.h"
 #include "sampler.h"
@@ -684,6 +685,35 @@ struct pwc_manager_tmpl {
 
     /// @brief create a empty chunk, return the chunk_id
     long create_chunk();
+    // Quiescent exact restore only: allocate slots without scheduling disk reads.
+    void prepare_exact_restore(long count) {
+        if (_compact_vec_norm || _num_chunks || count < 0 || count > _max_cached_chunks)
+            throw std::runtime_error("invalid exact restore cache reservation");
+        wait_work();
+        for (long id = 0; id < count; ++id) {
+            if (_cached_chunks[id].id != -1)
+                throw std::runtime_error("nonempty exact restore cache");
+            __malloc_chunk(&_cached_chunks[id]);
+            _cached_chunks[id].id = id;
+            _cached_chunks[id].size = 0;
+            _chunk_status[id] = _ck_caching | _ck_writing | chunk_status_t(id);
+        }
+        _num_chunks = count;
+        _last_cache = count ? count-1 : 0;
+    }
+    chunk_t *exact_restore_slot(long id) {
+        if (id < 0 || id >= _num_chunks ||
+            _chunk_status[id] != (_ck_caching | _ck_writing | chunk_status_t(id)))
+            throw std::runtime_error("invalid exact restore slot");
+        return &_cached_chunks[id];
+    }
+    void publish_exact_restore() {
+        for (long id = 0; id < _num_chunks; ++id) {
+            if (_cached_chunks[id].size <= 0 || _cached_chunks[id].size > Pool_hd_t::chunk_max_nvecs)
+                throw std::runtime_error("incomplete exact restore");
+            _chunk_status[id] = _ck_caching | chunk_status_t(id);
+        }
+    }
     /// @brief try to prefetch a chunk
     int prefetch(long chunk_id);
     /// @brief will stall until the chunk is ready
