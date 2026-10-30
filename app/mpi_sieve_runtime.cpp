@@ -156,6 +156,8 @@ int exchange_bytes(const uint8_t *send_data, uint64_t send_bytes,
     return 0;
 }
 
+void service_legacy_solutions();
+
 int commit_candidates(const std::vector<uint8_t> &records, int csd,
                       swc_manager_t *swc, ut_checker_t *ut) {
     const int stride = csd + 14;
@@ -173,6 +175,7 @@ int commit_candidates(const std::vector<uint8_t> &records, int csd,
     chunk_t *dst = nullptr;
     for (long i = 0; i < count; ++i) {
         if (!dst) {
+            service_legacy_solutions();
             dst = swc->fetch_for_write();
             if (!dst) return -1;
             // Returned partial SWC chunks can contain holes after UID dedup.
@@ -203,6 +206,16 @@ int commit_candidates(const std::vector<uint8_t> &records, int csd,
 }
 
 #include "mpi_sieve_pipeline.inc"
+
+// Legacy receives apply on the coordinator rather than an independent worker.
+// Drain pressure before acquiring another solution chunk, and join insertion
+// work before the coordinator can reset the iterator for materialization.
+void service_legacy_solutions() {
+    if (g_async_mode || !g_pipeline_callbacks.service) return;
+    g_pipeline_callbacks.service(g_pipeline_callbacks.context, true);
+    while (g_pipeline_callbacks.service(g_pipeline_callbacks.context, false))
+        usleep(1000);
+}
 
 int make_dir(const std::string &path) {
     if (path.empty()) return -1;
@@ -650,6 +663,7 @@ int mpi_sieve_flush_candidates(int csd, swc_manager_t *swc,
         if (g_pipeline_pending.load()) MPI_Abort(MPI_COMM_WORLD, 2);
         return 0; // Async exchange owns the complete wave, including its tail.
     }
+    service_legacy_solutions();
     std::vector<uint8_t> outgoing;
     {
         std::lock_guard<std::mutex> lock(g_candidate_mutex);

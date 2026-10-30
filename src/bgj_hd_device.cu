@@ -2480,7 +2480,7 @@ int Bucketer_t::run() {
 
 bool Bucketer_t::_mpi_service_solutions(bool allow_start) {
     if (_mpi_insert_workers.load(std::memory_order_acquire)) return true;
-    if (!allow_start || (++_mpi_service_ticks & 1023)) return false;
+    if (!allow_start || (mpi_sieve_async() && (++_mpi_service_ticks & 1023))) return false;
     if (_swc->num_using() < _swc->max_cached_chunks() / 2) return false;
     _ut_checker->trigger_batch();
     if (!_swc->num_ready() && !buc_iter->num_reading_sol) return false;
