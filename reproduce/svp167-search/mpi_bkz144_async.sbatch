@@ -14,6 +14,27 @@ export MPI_BASE="/LARGE0/gr20116/${USER}/BGJ-Sieve-GPU"
 export MPI_SIF="${MPI_BASE}/bgj-sieve-gpu-cuda13.3.sif"
 SOURCE="${VALIDATED_BUILD}/source"
 BASIS="${MPI_BASE}/runs/svp167-search/potlll-simulation-8744618/seed-38/result.basis"
+OUTPUT="${RUN_ROOT}/tour1.basis"
+if [[ -n "${PREVIOUS_TOUR_ROOT:-}" ]]; then
+    BASIS="${PREVIOUS_TOUR_ROOT}/tour1.basis"
+    OUTPUT="${RUN_ROOT}/tour2.basis"
+    # A deliberately paused predecessor also exits successfully. Require its
+    # completed final pump, not merely an afterok Slurm dependency.
+    python3 - "${PREVIOUS_TOUR_ROOT}" "${RUN_ROOT}" <<'PY'
+import sys
+from pathlib import Path
+previous, current = map(Path, sys.argv[1:])
+assert previous.resolve() != current.resolve(), 'tours require separate checkpoint roots'
+assert (previous/'tour1.basis').is_file(), 'previous tour has not published its final basis'
+sequence = int((previous/'LATEST-BKZ').read_text())
+states = [(previous/('generation-%d/rank%d/STATE' % (sequence, rank))).read_text().split()
+          for rank in (0, 1)]
+assert all(s[0] == 'BGJ_MPI_BKZ_V2' and int(s[2]) == sequence and
+           int(s[6]) == 27 and int(s[11]) == 4 for s in states), 'previous tour is incomplete'
+assert states[0][3:5] == states[1][3:5] and states[0][6:] == states[1][6:], 'rank cursor disagreement'
+print('PASS: predecessor completed all four BKZ pumps; starting second tour')
+PY
+fi
 # Fail closed if any executable input differs from the validated revision.
 while IFS= read -r path; do
     git -C "${SLURM_SUBMIT_DIR}" show "${SOURCE_COMMIT}:${path}" | cmp - "${SOURCE}/${path}"
@@ -67,14 +88,14 @@ PY
         export APPTAINERENV_HD_MPI_ASYNC_PROFILE="${release[0]}"
         export APPTAINERENV_HD_MPI_CHECKPOINT_WRITER="${release[1]}"
         unset IMPORT_FROM IMPORT_GENERATION IMPORT_SOURCE_COMMIT
-        if [[ ! -f "${RUN_ROOT}/LATEST-BKZ" ]]; then
+        if [[ ! -f "${RUN_ROOT}/LATEST-BKZ" && -z "${PREVIOUS_TOUR_ROOT:-}" ]]; then
             export IMPORT_FROM="${release[2]}" IMPORT_GENERATION="${release[3]}" IMPORT_SOURCE_COMMIT="${release[4]}"
         fi
         ;;
     *) echo "Unknown RUN_MODE=${mode}" >&2; exit 2 ;;
 esac
 echo "source=${SOURCE_COMMIT}; validated_build=${VALIDATED_BUILD}; runtime=${MPI_HOST_RUNTIME}"
-echo "run=${RUN_ROOT}; input=${BASIS}; output=${RUN_ROOT}/tour1.basis"
+echo "run=${RUN_ROOT}; input=${BASIS}; output=${OUTPUT}"
 echo "One BKZ tour: BSD=144 D4F=23 jump=9 starts=0,9,18,27; dual hash disabled."
 echo "Per node: PWC=260GiB BWC=128GiB SWC=16GiB; HBM BWC=12GiB/GPU."
 echo "Async pinned-host RDMA; spills forbidden, durable phase checkpoint writes allowed."
@@ -87,7 +108,7 @@ srun --mpi=pmix_v2 --immediate=60 --nodes=2 --ntasks=2 --gpus=8 --gres=gpu:4 \
     --ntasks-per-node=1 --cpus-per-task=128 --cpu-bind=none --kill-on-bad-exit=1 \
     "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" \
     --input "${BASIS}" --task bkz --BSD 144 --D4F 23 --JUMP 9 --BDH 0 --STI 0 \
-    --output "${RUN_ROOT}/tour1.basis" --checkpoint-root "${RUN_ROOT}" \
+    --output "${OUTPUT}" --checkpoint-root "${RUN_ROOT}" \
     --resume auto --mpi-frame-mib 256 "$@" &
 STEP_PID=$!
 wait "${STEP_PID}"
@@ -139,7 +160,7 @@ if [[ "${solver_rc}" == 75 && -s "${RUN_ROOT}/LATEST-BKZ" ]]; then
     exit 0
 fi
 [[ "${solver_rc}" == 0 ]] || exit "${solver_rc}"
-test -s "${RUN_ROOT}/tour1.basis"
+test -s "${OUTPUT}"
 apptainer exec --bind "${MPI_BASE}" "${MPI_SIF}" python3 \
-    "${SOURCE}/tools/check_basis_det_mod.py" "${BASIS}" "${RUN_ROOT}/tour1.basis"
-echo "PASS: one BKZ-144 tour completed; no second tour automatically launched."
+    "${SOURCE}/tools/check_basis_det_mod.py" "${BASIS}" "${OUTPUT}"
+echo "PASS: one BKZ-144 tour completed."
