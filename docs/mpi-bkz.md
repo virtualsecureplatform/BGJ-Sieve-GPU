@@ -200,3 +200,28 @@ MPI phase benchmarks now emit one-minute local heartbeats with bucket/ownership
 exchange counters, pending candidate bytes, transferred bytes and processed pool
 chunks. The heartbeat thread never calls MPI. Counter movement distinguishes
 slow transport from a true progress deadlock; GPU utilization alone cannot.
+
+## Checkpoints between completed pumps
+
+`HD_MPI_BKZ_CHECKPOINT_POLICY=phase` remains the default. The opt-in `pump`
+policy applies to `--task bkz`: it skips the initial and per-sieve pool
+snapshots and publishes only the full basis and cursor after each completed,
+exactly verified pump. These small snapshots retain the V2 format, checksums,
+fsync, atomic publication, and current/previous generation retention. Working
+pool caches are discarded when the pump ends or stops; ordinary sieve and
+context-transition scratch I/O is unchanged.
+
+An interrupted first pump restarts from the immutable input basis. Subsequent
+interruptions restart from the last completed pump, repeating the unfinished
+pump. Policies have distinct run identities and cannot be switched on resume.
+The original input basis must remain available. `HD_MPI_BKZ_STOP_AFTER=pump`
+provides a diagnostic pause after durable publication.
+
+Submit validation with `PUMP_CHECKPOINTS_ONLY=1`. It checks missing phase
+snapshots, interrupted-first-pump rollback, completed-pump recovery, both
+publication fault points, corrupt basis rejection, and default-policy
+compatibility. `POLICY_BASE_RELEASE_REPORT` optionally supplies the existing
+sieve qualification; only after these tests pass is a source-bound
+`pump-checkpoint-release.json` emitted. The tour launcher applies its recorded
+policy, reader, writer, and arena configuration. Fresh pump-policy tours start
+from their input basis and do not import a pool snapshot.

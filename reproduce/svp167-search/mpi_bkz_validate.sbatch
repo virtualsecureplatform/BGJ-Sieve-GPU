@@ -60,10 +60,41 @@ export APPTAINERENV_HD_POOL_BUFFER_CACHE=0 APPTAINERENV_HD_CACHE_WAIT_TIMEOUT_S=
 export APPTAINERENV_HD_BGJ2_REDUCER_THREADS=16 APPTAINERENV_HD_BUCKET_THREADS=16
 export APPTAINERENV_HD_BGJ3_MIN_CSD=177
 GENERATOR="${MPI_BASE}/deps/ntl-9.3.0-svp-generator/bin/svp_challenge_generator"
-apptainer exec --bind "${MPI_BASE}" "${MPI_SIF}" "${GENERATOR}" 80 0 > "${RUN}/tests/input.raw"
+fixture_dim=80
+if [[ "${PUMP_CHECKPOINTS_ONLY:-0}" == 1 ]]; then fixture_dim=104; fi
+apptainer exec --bind "${MPI_BASE}" "${MPI_SIF}" "${GENERATOR}" "${fixture_dim}" 0 > "${RUN}/tests/input.raw"
 FPLLL="${MPI_BASE}/deps/fplll-b0e38e31085e"
 apptainer exec --bind "${MPI_BASE}" "${MPI_SIF}" env OMP_NUM_THREADS=1 LD_LIBRARY_PATH="${FPLLL}/lib" \
     "${FPLLL}/bin/fplll" -a potlll -m heuristic -f mpfr -p 256 "${RUN}/tests/input.raw" > "${RUN}/tests/input.basis"
+if [[ "${PUMP_CHECKPOINTS_ONLY:-0}" == 1 ]]; then
+    export APPTAINERENV_HD_MPI_PIPELINE=async APPTAINERENV_HD_MPI_ASYNC_PROFILE=baseline
+    export APPTAINERENV_HD_MPI_CHECKPOINT_WRITER=legacy
+    python3 "${SOURCE}/tools/test_mpi_bkz.py" --wrapper "${SOURCE}/reproduce/svp167-search/mpi_rank.sh" \
+        --basis "${RUN}/tests/input.basis" --root "${RUN}/tests/pump-checkpoints" --pump-checkpoints-only
+    echo "PASS: pump-checkpoint validation source=${SOURCE_COMMIT} run=${RUN}"
+    if [[ -n "${POLICY_BASE_RELEASE_REPORT:-}" ]]; then
+        python3 - "${POLICY_BASE_RELEASE_REPORT}" "${RUN}" "${SOURCE_COMMIT}" <<'PY'
+import hashlib, json, os, sys
+from pathlib import Path
+base_path, run = map(Path, sys.argv[1:3])
+base = json.loads(base_path.read_text())
+assert base['passed'] is True and base['async_profile'] == 'baseline' and base['checkpoint_writer'] == 'legacy'
+for env, field in (('APPTAINERENV_HD_MPI_SHARED_ARENA_POLICY', 'arena_policy'),
+                   ('APPTAINERENV_HD_MPI_CHECKPOINT_READER', 'checkpoint_reader')):
+    assert os.environ.get(env, 'legacy') == base.get(field, 'legacy')
+report = dict(base)
+for key in ('checkpoint_root', 'checkpoint_generation'):
+    report.pop(key, None)  # Pump-only fresh tours start from their input basis.
+report.update(source_commit=sys.argv[3], checkpoint_policy='pump',
+    qualification='pump-boundary checkpoint/recovery validation; sieve capacity qualified by base evidence',
+    base_release_report=str(base_path), base_release_sha256=hashlib.sha256(base_path.read_bytes()).hexdigest(),
+    policy_validation_root=str(run/'tests/pump-checkpoints'))
+(run/'pump-checkpoint-release.json').write_text(json.dumps(report, indent=2)+'\n')
+print('PASS: pump-only release report created from completed validation')
+PY
+    fi
+    exit 0
+fi
 if [[ "${BACKPRESSURE_ONLY:-0}" == 1 ]]; then
     export APPTAINERENV_HD_MPI_PIPELINE=async
     for profile in ${VALIDATE_PROFILES:-baseline optimized}; do

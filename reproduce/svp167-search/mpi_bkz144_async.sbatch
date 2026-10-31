@@ -80,15 +80,25 @@ report = json.load(open(sys.argv[1]))
 assert report['source_commit'] == sys.argv[2] and report['passed'] is True
 assert report['async_profile'] in ('baseline','optimized')
 assert report['checkpoint_writer'] in ('legacy','direct')
+policy = report.get('checkpoint_policy', 'phase')
+reader = report.get('checkpoint_reader', 'legacy')
+arena = report.get('arena_policy', 'legacy')
+assert policy in ('phase', 'pump') and reader in ('legacy', 'fused') and arena in ('legacy', 'bounded')
 for field in ('async_profile','checkpoint_writer','checkpoint_root','checkpoint_generation','source_commit'):
-    print(report[field])
+    print(report.get(field, '') if policy == 'pump' else report[field])
+print(policy)
+print(reader)
+print(arena)
 PY
         )
-        [[ "${#release[@]}" == 5 ]]
+        [[ "${#release[@]}" == 8 ]]
         export APPTAINERENV_HD_MPI_ASYNC_PROFILE="${release[0]}"
         export APPTAINERENV_HD_MPI_CHECKPOINT_WRITER="${release[1]}"
+        export APPTAINERENV_HD_MPI_BKZ_CHECKPOINT_POLICY="${release[5]}"
+        export APPTAINERENV_HD_MPI_CHECKPOINT_READER="${release[6]}"
+        export APPTAINERENV_HD_MPI_SHARED_ARENA_POLICY="${release[7]}"
         unset IMPORT_FROM IMPORT_GENERATION IMPORT_SOURCE_COMMIT
-        if [[ ! -f "${RUN_ROOT}/LATEST-BKZ" && -z "${PREVIOUS_TOUR_ROOT:-}" ]]; then
+        if [[ ! -f "${RUN_ROOT}/LATEST-BKZ" && -z "${PREVIOUS_TOUR_ROOT:-}" && "${release[5]}" == phase ]]; then
             export IMPORT_FROM="${release[2]}" IMPORT_GENERATION="${release[3]}" IMPORT_SOURCE_COMMIT="${release[4]}"
         fi
         ;;

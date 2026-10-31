@@ -22,6 +22,25 @@ std::atomic<int> live_phase{0};
 void require(bool ok, const std::string &message) {
     if (!ok) throw std::runtime_error("[MPI-BKZ] " + message);
 }
+bool pump_checkpoints_only() {
+    const char *policy = getenv("HD_MPI_BKZ_CHECKPOINT_POLICY");
+    require(!policy || !strcmp(policy, "phase") || !strcmp(policy, "pump"),
+            "invalid checkpoint policy; expected phase or pump");
+    return policy && !strcmp(policy, "pump");
+}
+// With pump checkpoints the full basis/input is the recovery source, and the
+// working pool is disposable. Drop its dirty cache before the ordinary pool
+// destructor can flush it (also on a cooperative stop or an exception).
+struct disposable_pump_pool_t {
+    Pool_hd_t *pool;
+    ~disposable_pump_pool_t() {
+        if (!pool) return;
+        pool->pwc_manager->wait_work();
+        for (long id = 0; id < pool->pwc_manager->num_chunks(); ++id)
+            if (pool->pwc_manager->chunk_size(id) <= Pool_hd_t::chunk_max_nvecs)
+                pool->pwc_manager->release_del(id);
+    }
+};
 uint64_t hash_bytes(uint64_t h, const void *data, size_t n) {
     const auto *p = static_cast<const unsigned char *>(data);
     for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ULL; }
@@ -402,6 +421,9 @@ uint64_t identity(task_config_t &t, const char *source_commit = nullptr) {
         out << ' ' << key << '=' <<
             (source_commit && !strcmp(key, "HD_SOURCE_COMMIT") ? source_commit :
              (getenv(key) ? getenv(key) : ""));
+    // Preserve every existing phase-policy identity, including absent/default
+    // settings. A pump-only root must never be resumed as a phase-policy root.
+    if (pump_checkpoints_only()) out << " checkpoint_policy=pump";
     auto text = out.str(); return hash_bytes(1469598103934665603ULL, text.data(), text.size());
 }
 NTL::mat_ZZ integers(Lattice_QP &basis) {
@@ -466,6 +488,7 @@ bool pause(const state_t &s) {
     const char *after = getenv("HD_MPI_BKZ_STOP_AFTER");
     bool requested = (limit && completed_phases.load() >= atol(limit)) ||
         (after && !strcmp(after, "top") && s.next == 2) ||
+        (after && !strcmp(after, "pump") && s.next == 4) ||
         (after && !strcmp(after, "first-down") && s.next == 2 && s.cursor > 0);
     return mpi_sieve_global_u64(requested ? 1 : 0) || mpi_sieve_should_stop();
 }
@@ -675,6 +698,10 @@ int mpi_bkz_run(void *opaque) {
     auto &t = *static_cast<task_config_t *>(opaque);
     require(!fs::exists(root/"LATEST"), "cannot mix version1 final-sieve and BKZ checkpoints");
     const bool bkz = t.task == task_config_t::task_bkz;
+    const bool pump_only = pump_checkpoints_only();
+    require(!pump_only || bkz, "pump checkpoint policy requires --task bkz");
+    require(!pump_only || !getenv("HD_MPI_CHECKPOINT_BENCHMARK"),
+            "checkpoint benchmark requires phase checkpoint policy");
     require((bkz ? t.bkz_dual_hash_ratio == 0 : !t.enable_dual_hash),
             "distributed dual-hash insertion is unsupported; use --BDH 0");
     const long max_dim = bkz ? t.bkz_sieving_dim : t.max_sieving_dim;
@@ -714,11 +741,18 @@ int mpi_bkz_run(void *opaque) {
         state_t saved = decode(restored_dir/"STATE");
         require(saved.identity == s.identity && saved.sequence == seq, "incompatible checkpoint");
         s = saved; full = load_basis(restored_dir/"full.qp");
+        require(!pump_only || s.next == 4, "pump policy requires a completed-pump checkpoint");
     } else {
         require(!fs::exists(root/"LATEST-BKZ"), "--resume none requires a fresh checkpoint root");
         s.pump = bkz ? t.bkz_start_index : (t.ind_l < 0 ? 0 : t.ind_l);
     }
     heartbeat_t heartbeat;
+    if (!mpi_sieve_rank()) {
+        printf("[MPI-BKZ] checkpoint_policy=%s; %s\n", pump_only ? "pump" : "phase",
+               pump_only ? "interrupted pumps restart from the last completed basis or input" :
+                           "pool snapshots at phase boundaries");
+        fflush(stdout);
+    }
     for (;;) {
         const long begin = s.pump;
         const long end = bkz ? std::min(full->NumRows(), begin + max_dim + t.bkz_dim_for_free) :
@@ -743,6 +777,7 @@ int mpi_bkz_run(void *opaque) {
         if (restored && !fused_restore_enabled()) copy_pool_tree(restored_dir/"pool", ".pool");
         {
             Pool_hd_t pool(local.get());
+            disposable_pump_pool_t disposable{pump_only ? &pool : nullptr};
             require(pool.set_sieving_context(restored ? s.left : local->NumRows()-start,
                                             local->NumRows()) == 0, "set context");
             pool.set_num_threads(configured_pool_threads()); pool.set_boost_depth(0);
@@ -766,7 +801,7 @@ int mpi_bkz_run(void *opaque) {
                 require(pool.sampling(target/2 + 4096) == 0 &&
                         mpi_sieve_partition_pool(&pool, target) == 0, "initial sampling");
                 // Skip orphaned generations left by an interrupted publication.
-                commit(s, *full, local.get(), &pool);
+                if (!pump_only) commit(s, *full, local.get(), &pool);
             }
             restored = false;
             for (;;) {
@@ -804,13 +839,16 @@ int mpi_bkz_run(void *opaque) {
                     }
                 }
                 live_csd.store(pool.CSD);
-                srand((unsigned)(s.identity ^ (s.sequence+1) ^ mpi_sieve_rank()));
+                const uint64_t seed_sequence = s.sequence + 1 +
+                    (pump_only ? completed_phases.load() : 0);
+                srand((unsigned)(s.identity ^ seed_sequence ^ mpi_sieve_rank()));
                 int ret = _sieve(&pool);
                 if (mpi_sieve_should_stop()) return 75; // Never publish a stopped, partial sieve.
                 if ((ret == -1 && pool.CSD < 80) || pool.CSD == 80)
                     require(pool.check_dim_lose() == 0, "dimension loss");
                 s.next = pool.down_sieve_flag ? (pool.CSD < 60 ? 3 : 2) : (pool.CSD < top ? 1 : 2);
-                commit(s, *full, local.get(), &pool); ++completed_phases;
+                if (!pump_only) commit(s, *full, local.get(), &pool);
+                ++completed_phases;
                 if (pause(s)) return 75;
             }
             if (local->NumRows() < 90) local->LLL_DEEP_QP(0.99);
@@ -821,6 +859,7 @@ int mpi_bkz_run(void *opaque) {
             MPI_Barrier(MPI_COMM_WORLD);
         }
         s.next = 4; commit(s, *full, nullptr, nullptr);
+        if (pump_only && pause(s)) return 75;
         if (last) break;
         s.pump += t.bkz_jump_step; s.next = 0; s.cursor = 0;
     }

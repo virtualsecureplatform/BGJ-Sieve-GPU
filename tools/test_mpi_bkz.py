@@ -16,6 +16,7 @@ def main():
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--cache-pressure-only', action='store_true')
     parser.add_argument('--backpressure-only', action='store_true')
+    parser.add_argument('--pump-checkpoints-only', action='store_true')
     args = parser.parse_args()
     if not os.environ.get('SLURM_JOB_ID'):
         parser.error('requires a two-node Slurm allocation')
@@ -54,6 +55,80 @@ def main():
         return root
 
     pump = ['--task', 'pump', '--ind_l', '0', '--ind_r', '80', '--SSD', '58', '--MSD', '60', '--DS']
+
+    if args.pump_checkpoints_only:
+        bkz = ['--task', 'bkz', '--BSD', '60', '--D4F', '20', '--BDH', '0',
+               '--JUMP', '9', '--STI', '0', '--STOP_INDEX', '18']
+        policy = {'APPTAINERENV_HD_MPI_BKZ_CHECKPOINT_POLICY': 'pump'}
+
+        def check_basis_snapshots(root, expected_pump):
+            sequence = int((root/'LATEST-BKZ').read_text())
+            for generation in root.glob('generation-*'):
+                for rank in (0, 1):
+                    shard = generation/('rank%d' % rank)
+                    if not (shard/'STATE').exists():
+                        continue  # Orphaned rank snapshot after injected failure.
+                    state = (shard/'STATE').read_text().split()
+                    assert int(state[11]) == 4, state
+                    assert not (shard/'pool').exists() and not (shard/'local.qp').exists(), shard
+                    assert (shard/'full.qp').stat().st_size > 0
+                    assert sum(p.stat().st_size for p in shard.rglob('*') if p.is_file()) < 2*1024**2
+            states = [(root/('generation-%d/rank%d/STATE' % (sequence,r))).read_text().split()
+                      for r in (0, 1)]
+            assert all(int(s[6]) == expected_pump and int(s[11]) == 4 for s in states)
+            assert states[0][3:5] == states[1][3:5] and states[0][6:] == states[1][6:]
+            return sequence
+
+        # The validation launcher supplies a 104-row fixture. BKZ starts at
+        # CSD95, so this also covers dirty-pool extensions with no phase flush.
+        extended_bkz = ['--task', 'bkz', '--BSD', '98', '--D4F', '6', '--BDH', '0',
+                        '--JUMP', '9', '--STI', '0', '--STOP_INDEX', '9']
+        extended = run('pump-policy-extend', extended_bkz, dict(policy,
+                       APPTAINERENV_HD_MPI_BKZ_MAX_PHASES='2'), 75)
+        assert not (extended/'LATEST-BKZ').exists() and not list(extended.glob('generation-*'))
+        run('pump-policy-extend', extended_bkz, policy)
+        assert check_basis_snapshots(extended, 0) == 1
+
+        run('invalid-checkpoint-policy', bkz, {
+            'APPTAINERENV_HD_MPI_BKZ_CHECKPOINT_POLICY': 'invalid'}, expected=None)
+        run('pump-policy-unsupported-task', pump, policy, expected=None)
+        # The first pump can restart from the immutable input without a snapshot.
+        early = run('pump-policy-midphase', bkz, dict(policy,
+                    APPTAINERENV_HD_MPI_BKZ_MAX_PHASES='1'), 75)
+        assert not (early/'LATEST-BKZ').exists()
+        assert not list(early.glob('generation-*'))
+        run('pump-policy-midphase', bkz, policy)
+        assert check_basis_snapshots(early, 9) == 2
+        # Completed-pump resume must skip the completed pump and needs no pool.
+        boundary = run('pump-policy-resume', bkz, dict(policy,
+                       APPTAINERENV_HD_MPI_BKZ_STOP_AFTER='pump'), 75)
+        assert check_basis_snapshots(boundary, 0) == 1
+        original = hashlib.sha256((boundary/'generation-1/rank0/full.qp').read_bytes()).hexdigest()
+        run('pump-policy-resume', bkz, {'APPTAINERENV_HD_MPI_BKZ_CHECKPOINT_POLICY': 'phase'}, expected=None)
+        run('pump-policy-resume', bkz, policy)
+        assert check_basis_snapshots(boundary, 9) == 2
+        assert hashlib.sha256((boundary/'generation-1/rank0/full.qp').read_bytes()).hexdigest() == original
+        run('pump-policy-resume', bkz, policy)
+        assert check_basis_snapshots(boundary, 9) == 2
+        # Both publication failures retain a usable completed-pump generation.
+        for fault in ('after-rank-snapshot', 'before-publish'):
+            name = 'pump-policy-' + fault
+            root = run(name, bkz, dict(policy, APPTAINERENV_HD_MPI_BKZ_STOP_AFTER='pump'), 75)
+            run(name, bkz, dict(policy, APPTAINERENV_HD_MPI_BKZ_FAULT=fault), expected=None)
+            assert check_basis_snapshots(root, 0) == 1
+            run(name, bkz, policy)
+            assert check_basis_snapshots(root, 9) == 3
+        bad = args.root/'pump-policy-corrupt'
+        shutil.copytree(boundary, bad)
+        with (bad/'generation-2/rank1/full.qp').open('ab') as stream:
+            stream.write(b'corrupt')
+        run('pump-policy-corrupt', bkz, policy, expected=None)
+        # Default per-phase publication and its explicit spelling stay compatible.
+        phase = run('phase-policy-default', bkz)
+        assert any((p/'rank0/pool').is_dir() for p in phase.glob('generation-*'))
+        run('phase-policy-default', bkz, {'APPTAINERENV_HD_MPI_BKZ_CHECKPOINT_POLICY': 'phase'})
+        print('PASS: pump-only checkpoints, rollback, resume, publication failures and default compatibility', flush=True)
+        return
 
     def backpressure():
         pressure = run('candidate-backpressure', pump, {
